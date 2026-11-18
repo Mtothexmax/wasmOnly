@@ -200,7 +200,7 @@ export async function perf(s, opts = {}) {
   const phases = {};
   for (const k of ['game_fixed', 'physics', 'update', 'engine', 'render']) phases[k] = r2(avg(sample.ph.map((p) => p[k])));
   const gpuLast = sample.gpu.at(-1) ?? null;
-  const gpu = gpuLast ? Object.fromEntries(['cull', 'shadow', 'opaque', 'blend', 'hiz', 'total'].map((k) => [k, r2(gpuLast[k])])) : null;
+  const gpu = gpuLast ? Object.fromEntries(['cull', 'shadow', 'opaque', 'blend', 'hiz', 'post', 'total', 'frame'].map((k) => [k, r2(gpuLast[k])])) : null;
   const res = {
     frames: d.length,
     fps: r2(1000 / avg(sample.dts)),
@@ -226,7 +226,7 @@ export async function perf(s, opts = {}) {
   res.missed_frames_pct = missedPct;
   const gpuT = gpu?.total ?? 0, cpuT = res.engine_cpu_ms;
   const budget = vsync;
-  const bigGpu = gpu ? Object.entries(gpu).filter(([k]) => !['total', 'samples'].includes(k)).sort((x, y) => y[1] - x[1])[0] : null;
+  const bigGpu = gpu ? Object.entries(gpu).filter(([k]) => !['total', 'frame', 'samples'].includes(k)).sort((x, y) => y[1] - x[1])[0] : null;
   const bigCpu = Object.entries(phases).sort((x, y) => y[1] - x[1])[0];
   const gpuTxt = gpu ? `GPU ${r2(gpuT)} ms (biggest '${bigGpu[0]}' ${bigGpu[1]} ms at ${res.canvas.join('x')}, MSAA 4x)` : 'GPU unknown';
   const cpuTxt = `engine CPU ${cpuT} ms (biggest '${bigCpu[0]}' ${bigCpu[1]} ms)`;

@@ -32,8 +32,9 @@ pub(crate) struct PostTargets {
     pub msaa: GpuTextureView,
     pub depth: GpuTextureView,
     pub hdr_view: GpuTextureView,
-    /// Copy of the resolved opaque scene for water refraction/reflection: (copy texture, its view, the hdr texture it is copied from).
-    pub scene_color: (GpuTexture, GpuTextureView, GpuTexture),
+    /// The resolved opaque scene for water refraction/reflection (resolve target of the opaque pass
+    /// while water is visible; the blend pass samples it and resolves the final image into `hdr_view`).
+    pub scene_color: GpuTextureView,
     bloom_views: Vec<GpuTextureView>,
     bloom_sizes: Vec<(u32, u32)>,
     params: GpuBuffer,
@@ -76,9 +77,9 @@ fn nums(v: &[u32]) -> Vec<js_sys::Number> {
     v.iter().map(|x| js_sys::Number::from(*x)).collect()
 }
 
-fn fullscreen(device: &GpuDevice, module: &GpuShaderModule, layout: &GpuPipelineLayout, fs_entry: &str, target: GpuColorTargetState, constants: Option<&js_sys::Object>, label: &str) -> Result<GpuRenderPipeline, String> {
+fn fullscreen(device: &GpuDevice, module: &GpuShaderModule, layout: &GpuPipelineLayout, vs_entry: &str, fs_entry: &str, target: GpuColorTargetState, constants: Option<&js_sys::Object>, label: &str) -> Result<GpuRenderPipeline, String> {
     let vs = GpuVertexState::new(module);
-    vs.set_entry_point("vs_full");
+    vs.set_entry_point(vs_entry);
     let fs = GpuFragmentState::new(module, &[JsNullable::wrap(target)]);
     fs.set_entry_point(fs_entry);
     if let Some(c) = constants {
@@ -121,49 +122,54 @@ impl Post {
         crate::debug::report_shader_errors(&module, "post.wgsl");
 
         let frag = gpu_shader_stage::FRAGMENT;
-        let tex = |b: u32| {
-            let e = GpuBindGroupLayoutEntry::new(b, frag);
+        // the composite vertex shader also reads the scene (lens-flare sun visibility, once per frame)
+        let both = gpu_shader_stage::FRAGMENT | gpu_shader_stage::VERTEX;
+        let tex_v = |b: u32, vis: u32| {
+            let e = GpuBindGroupLayoutEntry::new(b, vis);
             let t = GpuTextureBindingLayout::new();
             t.set_sample_type(GpuTextureSampleType::Float);
             e.set_texture(&t);
             e
         };
-        let samp = || {
-            let e = GpuBindGroupLayoutEntry::new(1, frag);
+        let tex = |b: u32| tex_v(b, frag);
+        let samp_v = |vis: u32| {
+            let e = GpuBindGroupLayoutEntry::new(1, vis);
             let s = GpuSamplerBindingLayout::new();
             s.set_type(GpuSamplerBindingType::Filtering);
             e.set_sampler(&s);
             e
         };
-        let uni = || {
-            let e = GpuBindGroupLayoutEntry::new(2, frag);
+        let samp = || samp_v(frag);
+        let uni_v = |vis: u32| {
+            let e = GpuBindGroupLayoutEntry::new(2, vis);
             let b = GpuBufferBindingLayout::new();
             b.set_type(GpuBufferBindingType::Uniform);
             e.set_buffer(&b);
             e
         };
+        let uni = || uni_v(frag);
         let bgl_post = device.create_bind_group_layout(&GpuBindGroupLayoutDescriptor::new(&[tex(0), samp(), uni()])).map_err(js_err)?;
         let depth_e = GpuBindGroupLayoutEntry::new(4, frag);
         let dt = GpuTextureBindingLayout::new();
         dt.set_sample_type(GpuTextureSampleType::Depth);
         dt.set_multisampled(true);
         depth_e.set_texture(&dt);
-        let bgl_comp = device.create_bind_group_layout(&GpuBindGroupLayoutDescriptor::new(&[tex(0), samp(), uni(), tex(3), depth_e])).map_err(js_err)?;
+        let bgl_comp = device.create_bind_group_layout(&GpuBindGroupLayoutDescriptor::new(&[tex_v(0, both), samp_v(both), uni_v(both), tex(3), depth_e])).map_err(js_err)?;
         let layout_post = device.create_pipeline_layout(&GpuPipelineLayoutDescriptor::new(&[JsNullable::wrap(bgl_post.clone())]));
         let layout_comp = device.create_pipeline_layout(&GpuPipelineLayoutDescriptor::new(&[JsNullable::wrap(bgl_comp.clone())]));
 
-        let prefilter = fullscreen(device, &module, &layout_post, "fs_prefilter", GpuColorTargetState::new(HDR_FORMAT), None, "bloom-prefilter")?;
-        let down = fullscreen(device, &module, &layout_post, "fs_down", GpuColorTargetState::new(HDR_FORMAT), None, "bloom-down")?;
+        let prefilter = fullscreen(device, &module, &layout_post, "vs_full", "fs_prefilter", GpuColorTargetState::new(HDR_FORMAT), None, "bloom-prefilter")?;
+        let down = fullscreen(device, &module, &layout_post, "vs_full", "fs_down", GpuColorTargetState::new(HDR_FORMAT), None, "bloom-down")?;
         let up_t = GpuColorTargetState::new(HDR_FORMAT);
         up_t.set_blend(&additive_blend());
-        let up = fullscreen(device, &module, &layout_post, "fs_up", up_t, None, "bloom-up")?;
+        let up = fullscreen(device, &module, &layout_post, "vs_full", "fs_up", up_t, None, "bloom-up")?;
         let gamma = |on: bool| {
             let o = js_sys::Object::new();
             let _ = js_sys::Reflect::set(&o, &"GAMMA_OUT".into(), &(if on { 1.0 } else { 0.0 }).into());
             o
         };
-        let composite_canvas = fullscreen(device, &module, &layout_comp, "fs_composite", GpuColorTargetState::new(canvas_format), Some(&gamma(true)), "composite")?;
-        let composite_srgb = fullscreen(device, &module, &layout_comp, "fs_composite", GpuColorTargetState::new(GpuTextureFormat::Rgba8unormSrgb), Some(&gamma(false)), "composite-rtt")?;
+        let composite_canvas = fullscreen(device, &module, &layout_comp, "vs_composite", "fs_composite", GpuColorTargetState::new(canvas_format), Some(&gamma(true)), "composite")?;
+        let composite_srgb = fullscreen(device, &module, &layout_comp, "vs_composite", "fs_composite", GpuColorTargetState::new(GpuTextureFormat::Rgba8unormSrgb), Some(&gamma(false)), "composite-rtt")?;
 
         // --- sky (opaque pass, far plane, depth less-equal) ---
         let sky_src = format!("{common}\n{}", include_str!("shaders/sky.wgsl"));
@@ -285,10 +291,9 @@ impl Post {
         let msaa = tex(HDR_FORMAT, (w, h), RA, samples, 1, "msaa-hdr")?.create_view().map_err(js_err)?;
         // TEXTURE_BINDING: Hi-Z, water and particles read this frame's depth
         let depth = tex(depth_format, (w, h), RA | TB, samples, 1, "msaa-depth")?.create_view().map_err(js_err)?;
-        let hdr_tex = tex(HDR_FORMAT, (w, h), RA | TB | gpu_texture_usage::COPY_SRC, 1, 1, "hdr")?;
-        let hdr_view = hdr_tex.create_view().map_err(js_err)?;
-        let sc = tex(HDR_FORMAT, (w, h), TB | gpu_texture_usage::COPY_DST, 1, 1, "scene-color")?;
-        let scene_color = (sc.clone(), sc.create_view().map_err(js_err)?, hdr_tex);
+        let hdr_view = tex(HDR_FORMAT, (w, h), RA | TB, 1, 1, "hdr")?.create_view().map_err(js_err)?;
+        // resolve target of the opaque pass when water is visible (refraction + SSR read it)
+        let scene_color = tex(HDR_FORMAT, (w, h), RA | TB, 1, 1, "scene-color")?.create_view().map_err(js_err)?;
         // bloom starts at quarter resolution (the glow is soft; half res costs ~4x for no visible gain)
         let (bw, bh) = ((w / 4).max(1), (h / 4).max(1));
         let mips = (32 - bw.min(bh).max(1).leading_zeros()).saturating_sub(2).clamp(1, MAX_BLOOM_MIPS);

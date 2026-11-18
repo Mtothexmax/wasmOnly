@@ -52,22 +52,30 @@ struct Wave {
     crest: f32,
 }
 
+// Per-wave constants, evaluated when the shader is compiled: direction (wind angle 0.65 + spread),
+// wave number, weight, sqrt(g * wave number) for the dispersion.
+const WAVE_DIR = array<vec2f, 8>(
+    vec2f(cos(0.65), sin(0.65)), vec2f(cos(1.07), sin(1.07)), vec2f(cos(0.10), sin(0.10)), vec2f(cos(1.70), sin(1.70)),
+    vec2f(cos(-0.55), sin(-0.55)), vec2f(cos(0.87), sin(0.87)), vec2f(cos(0.35), sin(0.35)), vec2f(cos(2.75), sin(2.75)));
+const WAVE_LEN = array<f32, 8>(1.0, 1.37, 1.83, 2.6, 3.4, 4.7, 6.3, 8.9);
+const WAVE_WGT = array<f32, 8>(1.0, 0.72, 0.52, 0.36, 0.25, 0.17, 0.11, 0.07);
+const WAVE_SPEED = array<f32, 8>(
+    sqrt(9.81 * 1.0), sqrt(9.81 * 1.37), sqrt(9.81 * 1.83), sqrt(9.81 * 2.6),
+    sqrt(9.81 * 3.4), sqrt(9.81 * 4.7), sqrt(9.81 * 6.3), sqrt(9.81 * 8.9));
+
 fn gerstner(p: vec2f, t: f32, amp: f32, scale: f32, chop: f32, fp: f32) -> Wave {
-    let ang = array<f32, 8>(0.0, 0.42, -0.55, 1.05, -1.2, 0.22, -0.3, 2.1);
-    let len = array<f32, 8>(1.0, 1.37, 1.83, 2.6, 3.4, 4.7, 6.3, 8.9);
-    let wgt = array<f32, 8>(1.0, 0.72, 0.52, 0.36, 0.25, 0.17, 0.11, 0.07);
     var disp = vec3f(0.0);
     var nx = 0.0;
     var nz = 0.0;
     var ny = 0.0;
+    let ts = sqrt(scale) * t; // sqrt(g * len * scale) * t = WAVE_SPEED * sqrt(scale) * t
     for (var k = 0; k < 8; k++) {
-        let a0 = 0.65 + ang[k];
-        let d = vec2f(cos(a0), sin(a0));
-        let f = len[k] * scale;
-        let a = amp * wgt[k] * (1.0 - smoothstep(0.6, 2.2, f * fp));
+        let d = WAVE_DIR[k];
+        let f = WAVE_LEN[k] * scale;
+        let a = amp * WAVE_WGT[k] * (1.0 - smoothstep(0.6, 2.2, f * fp));
         if (a <= 0.0) { continue; }
         let q = min(chop, 1.0 / (8.0 * f * a + 1e-5)); // no loops at the crests
-        let ph = f * dot(d, p) - sqrt(9.81 * f) * t + f32(k) * 1.7;
+        let ph = f * dot(d, p) - WAVE_SPEED[k] * ts + f32(k) * 1.7;
         let s = sin(ph);
         let c = cos(ph);
         disp += vec3f(d.x * q * a * c, a * s, d.y * q * a * c);
@@ -148,15 +156,25 @@ fn cascade_shadow(world: vec3f, n: vec3f, k: u32) -> f32 {
     let lp = g.cascades[k] * vec4f(biased, 1.0);
     let ndc = lp.xyz / lp.w;
     let uv = ndc.xy * vec2f(0.5, -0.5) + vec2f(0.5);
-    let texel = 1.0 / vec2f(textureDimensions(shadow_map));
-    var sum = 0.0;
-    for (var y = -1; y <= 1; y++) {
-        for (var x = -1; x <= 1; x++) {
-            sum += textureSampleCompareLevel(shadow_map, shadow_sampler, uv + vec2f(f32(x), f32(y)) * texel, i32(k), ndc.z - 0.0008);
-        }
-    }
-    let inside = all(uv >= vec2f(0.0)) && all(uv <= vec2f(1.0)) && ndc.z <= 1.0;
-    return select(1.0, sum / 9.0, inside);
+    if (any(uv < vec2f(0.0)) || any(uv > vec2f(1.0)) || ndc.z > 1.0) { return 1.0; }
+    // 3x3 PCF of bilinear comparison taps = a 4x4 texel footprint with the separable weights
+    // (1-f, 1, 1, f). Two bilinear taps per axis reproduce exactly that (weights 2-f and 1+f, each
+    // placed between its two texels), so 4 taps give the same result as the 9 they replace.
+    let size = vec2f(textureDimensions(shadow_map));
+    let st = uv * size - 0.5;
+    let base = floor(st);
+    let f = st - base;
+    let wa = 2.0 - f;
+    let wb = 1.0 + f;
+    let ua = (base - 0.5 + 1.0 / wa) / size;
+    let ub = (base + 1.5 + f / wb) / size;
+    let z = ndc.z - 0.0008;
+    let layer = i32(k);
+    var sum = wa.x * wa.y * textureSampleCompareLevel(shadow_map, shadow_sampler, ua, layer, z);
+    sum += wb.x * wa.y * textureSampleCompareLevel(shadow_map, shadow_sampler, vec2f(ub.x, ua.y), layer, z);
+    sum += wa.x * wb.y * textureSampleCompareLevel(shadow_map, shadow_sampler, vec2f(ua.x, ub.y), layer, z);
+    sum += wb.x * wb.y * textureSampleCompareLevel(shadow_map, shadow_sampler, ub, layer, z);
+    return sum / 9.0;
 }
 
 // Cascaded shadow maps: cascade by view depth, blended over the last 15% of each cascade, faded
@@ -285,6 +303,7 @@ fn terrain_albedo(i: VsOut, d: Deriv, inst: Instance) -> vec3f {
     let scale = 0.5 * (1.0 - 2.0 * pad);
     var c = vec3f(0.0);
     for (var k = 0; k < 4; k++) {
+        if (w[k] < 0.002) { continue; } // layer not present here: skip its (anisotropic) tap
         let tile = max(inst.maps[k], 0.01);
         let q = vec2f(f32(k % 2), f32(k / 2)) * 0.5 + vec2f(0.5 * pad);
         let uv = q + fract(i.world.xz / tile) * scale;
@@ -339,8 +358,13 @@ fn shade(i: VsOut, front: bool, d: Deriv, face_n: vec3f) -> Surface {
         let c = floor(i.world.x * checker) + floor(i.world.z * checker);
         albedo *= select(1.0, 0.78, (i32(c) & 1) == 0);
     }
+    // The sun term is brdf * n_l * shadow: surfaces facing away from the sun (n_l = 0) and unlit / UI
+    // surfaces never use the shadow term, so they skip the shadow-map taps (debug view 2 shows it).
+    let l_sun = normalize(-g.sun_dir.xyz);
     var shadow = 1.0;
-    if (g.counts.y == 1u) { shadow = shadow_factor(i.world, n); }
+    if (g.counts.y == 1u && ((dot(n, l_sun) > 0.0 && inst.params.z < 0.5) || g.counts.z == 2u)) {
+        shadow = shadow_factor(i.world, n);
+    }
 
     if (inst.params.z > 1.5) { // ui surface (world panels): texture as-is, alpha-tested
         if (ALPHA_TEST && tex.a < 0.5) { discard; }
@@ -353,7 +377,6 @@ fn shade(i: VsOut, front: bool, d: Deriv, face_n: vec3f) -> Surface {
     let metallic = select(inst.emissive_metallic.a, 0.0, is_terrain);
     let rough = clamp(inst.params.x, 0.04, 1.0);
     var color = vec3f(0.0);
-    let l_sun = normalize(-g.sun_dir.xyz);
     color += brdf(n, v, l_sun, albedo, metallic, rough) * g.sun_color.rgb * g.sun_dir.w * shadow;
     color += cluster_lights(i.clip, i.world, n, v, albedo, metallic, rough);
     let hemi = mix(g.ground_color.rgb, g.sky_color.rgb, n.y * 0.5 + 0.5);
@@ -421,15 +444,55 @@ fn vnoise(p: vec2f) -> f32 {
     return mix(mix(hash2(i), hash2(i + vec2f(1.0, 0.0)), u.x), mix(hash2(i + vec2f(0.0, 1.0)), hash2(i + vec2f(1.0, 1.0)), u.x), u.y);
 }
 
+// Forward differences of vnoise over a step `e` in x and in y, i.e. (vnoise(p + (e, 0)) - vnoise(p)) / e
+// and the same for y, from the four corner hashes of the cell of p (one noise lookup instead of
+// three; the smoothstep weights have zero slope at the cell borders, so clamping the step at a
+// border changes nothing visible).
+fn vnoise_grad(p: vec2f, e: f32) -> vec2f {
+    let i = floor(p);
+    let f = fract(p);
+    let a = hash2(i);
+    let b = hash2(i + vec2f(1.0, 0.0));
+    let c = hash2(i + vec2f(0.0, 1.0));
+    let d = hash2(i + vec2f(1.0, 1.0));
+    let u = f * f * (3.0 - 2.0 * f);
+    let fe = min(f + e, vec2f(1.0));
+    let ue = fe * fe * (3.0 - 2.0 * fe);
+    let h0 = mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+    let hx = mix(mix(a, b, ue.x), mix(c, d, ue.x), u.y);
+    let hy = mix(mix(a, b, u.x), mix(c, d, u.x), ue.y);
+    return vec2f(hx - h0, hy - h0) / e;
+}
+
 // Screen-space reflection: march the reflected ray through the opaque depth buffer (geometric
 // steps, then bisection). Returns (colour, confidence); confidence fades at the screen border and
 // with distance, the caller falls back to the sky.
 fn ssr(origin: vec3f, r: vec3f) -> vec4f {
+    // Only the part of the ray inside the bounds of the opaque scene can hit anything: rays that
+    // miss them (open sea reflecting the sky) cost nothing, the others skip the steps outside.
+    let rs = select(r, vec3f(1e-6), abs(r) < vec3f(1e-6));
+    let ta = (g.scene_min.xyz - origin) / rs;
+    let tb = (g.scene_max.xyz - origin) / rs;
+    let t_lo = min(ta, tb);
+    let t_hi = max(ta, tb);
+    let t_in = max(max(t_lo.x, t_lo.y), t_lo.z);
+    let t_out = min(min(t_hi.x, t_hi.y), t_hi.z);
+    if (t_out < max(t_in, 0.0)) { return vec4f(0.0); }
+    // the clip position is linear in t: two matrix products for the whole march
+    let c0 = g.view_proj * vec4f(origin, 1.0);
+    let cd = g.view_proj * vec4f(r, 0.0);
     var t = 0.35;
     var prev = 0.0;
     let max_t = 400.0;
     for (var s = 0; s < 22; s++) {
-        let c = g.view_proj * vec4f(origin + r * t, 1.0);
+        if (prev > t_out) { break; } // left the scene bounds
+        if (t < t_in) { // not there yet: same step sequence, no depth lookups
+            prev = t;
+            t = t * 1.3 + 0.25;
+            if (t > max_t) { break; }
+            continue;
+        }
+        let c = c0 + cd * t;
         if (c.w <= g.time.y) { break; }
         let uv = vec2f(c.x / c.w * 0.5 + 0.5, 0.5 - c.y / c.w * 0.5);
         if (any(uv < vec2f(0.0)) || any(uv > vec2f(1.0))) { break; }
@@ -441,7 +504,7 @@ fn ssr(origin: vec3f, r: vec3f) -> vec4f {
             var huv = uv;
             for (var b = 0; b < 5; b++) {
                 let mid = 0.5 * (lo + hi);
-                let cm = g.view_proj * vec4f(origin + r * mid, 1.0);
+                let cm = c0 + cd * mid;
                 let um = vec2f(cm.x / cm.w * 0.5 + 0.5, 0.5 - cm.y / cm.w * 0.5);
                 let dm = linear_depth(textureLoad(scene_depth, vec2i(clamp(um, vec2f(0.0), vec2f(0.9999)) * g.screen.xy), 0));
                 if (cm.w > dm) { hi = mid; huv = um; } else { lo = mid; }
@@ -491,10 +554,9 @@ fn water(i: VsOut, d: Deriv) -> vec4f {
     for (var k = 0; k < 3; k++) {
         let f = scales[k] * inst.maps.w;
         let q = base * f + drift[k] * t * sqrt(f) * 0.9;
-        let e = 0.05;
-        let h0 = vnoise(q);
-        let gx = (vnoise(q + vec2f(e, 0.0)) - h0) / e;
-        let gz = (vnoise(q + vec2f(0.0, e)) - h0) / e;
+        let gr = vnoise_grad(q, 0.05);
+        let gx = gr.x;
+        let gz = gr.y;
         let fade = 1.0 - smoothstep(0.5, 2.0, f * fp * 6.28);
         r += vec2f(gx, gz) * f * 0.03 * fade * (inst.maps.y / max(inst.maps.y, 0.02) * 0.6 + 0.4);
     }

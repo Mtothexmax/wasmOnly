@@ -242,6 +242,10 @@ pub struct RenderSettings {
     pub gpu_culling: bool,
     /// Hi-Z occlusion culling inside the GPU culling pass (previous frame's depth).
     pub occlusion_culling: bool,
+    /// Hi-Z occlusion culling only runs when the opaque candidates add up to at least this many
+    /// triangles: building the depth pyramid costs a fixed ~0.4 ms of GPU time at 1440p, more than
+    /// culling a small scene can save (early-Z already rejects the hidden fragments).
+    pub occlusion_min_triangles: u32,
     /// World-space offset added to the camera position (flicker detection: tiny shifts between
     /// screenshots reveal z-fighting and shimmering).
     pub camera_jitter: Vec3,
@@ -364,6 +368,7 @@ impl Default for RenderSettings {
             light_cluster_far: 400.0,
             gpu_culling: true,
             occlusion_culling: true,
+            occlusion_min_triangles: 100_000,
             camera_jitter: Vec3::ZERO,
             freeze_time: false,
             depth_jitter: 0.0,
@@ -498,6 +503,8 @@ struct Globals {
     sky_params: [f32; 4],
     skybox: [f32; 4],
     misc: [f32; 4],
+    scene_min: [f32; 4],
+    scene_max: [f32; 4],
 }
 
 /// Sky resources shared by every view: the atmosphere LUT (rendered per view), its sampler, the
@@ -597,6 +604,11 @@ pub struct Renderer {
     bgl0_t: GpuBindGroupLayout,
     bind0_t: Option<GpuBindGroup>,
     sky_gpu: SkyGpu,
+    /// Inputs of the last sky-LUT render (sun, moon, intensities); the LUT is only redrawn when they change.
+    sky_lut_key: [f32; 10],
+    /// Per-frame instance lists, kept between frames for their allocations.
+    scratch_raws: Vec<InstanceRaw>,
+    scratch_data: Vec<InstanceRaw>,
     skybox: Option<TextureId>,
     /// Derived sky / day-night state (sun, moon, daylight, night), see `crate::sky`.
     pub sky: crate::sky::SkyState,
@@ -623,6 +635,10 @@ pub struct Renderer {
     color_sampler: GpuSampler,
     msaa_view: Option<GpuTextureView>,
     depth_view: Option<GpuTextureView>,
+    /// Desktop GPU (AMD / NVIDIA / Intel: immediate-mode rendering) as opposed to a tile-based
+    /// mobile GPU. Decides the load/store ops of the multisampled scene target: clears and discards
+    /// are free on tilers, loads and stores are free on immediate-mode GPUs.
+    pub immediate_gpu: bool,
     /// Post-processing, sky and particle pipelines.
     pub(crate) post: crate::post::Post,
     /// GPU grass on the terrain (settings: `renderer.grass.settings`).
@@ -687,6 +703,13 @@ impl Renderer {
             .map_err(js_err)?
             .as_option()
             .ok_or("navigator.gpu.requestAdapter() returned null (no suitable GPU)")?;
+        let vendor = js_sys::Reflect::get(adapter.as_ref(), &"info".into())
+            .ok()
+            .and_then(|i| js_sys::Reflect::get(&i, &"vendor".into()).ok())
+            .and_then(|v| v.as_string())
+            .unwrap_or_default()
+            .to_lowercase();
+        let immediate_gpu = matches!(vendor.as_str(), "amd" | "nvidia" | "intel");
         let gpu_cull_supported = adapter.features().has(crate::gpu_cull::FEATURE);
         let timing_supported = adapter.features().has(crate::gpu_timing::FEATURE);
         let dd = GpuDeviceDescriptor::new();
@@ -1087,6 +1110,9 @@ impl Renderer {
             bgl0_t,
             bind0_t: None,
             sky_gpu,
+            sky_lut_key: [0.0; 10],
+            scratch_raws: vec![],
+            scratch_data: vec![],
             skybox: None,
             sky: Default::default(),
             globals_buf,
@@ -1094,6 +1120,7 @@ impl Renderer {
             visible_buf,
             cull,
             timing,
+            immediate_gpu,
             gpu_culling_supported: gpu_cull_supported,
             instance_cap,
             bind0,
@@ -2050,7 +2077,7 @@ impl Renderer {
         };
         let shader_t = self.shader_time();
         let s = &self.settings;
-        let globals = Globals {
+        let mut globals = Globals {
             view_proj: view_proj.to_cols_array_2d(),
             cascades,
             camera_pos: cam_pos.extend(1.0).into(),
@@ -2084,10 +2111,9 @@ impl Renderer {
                 self.skybox.is_some() as u32 as f32,
             ],
             misc: [s.water_ssr as u32 as f32, s.water_refraction.max(0.0), s.water_caustics.max(0.0), s.atmosphere_intensity.max(0.0)],
+            scene_min: [0.0; 4], // set after the instance pass
+            scene_max: [0.0; 4],
         };
-        self.queue
-            .write_buffer_with_u32_and_u8_slice(&self.globals_buf, 0, bytemuck::bytes_of(&globals))
-            .map_err(js_err)?;
 
         // --- Instances -------------------------------------------------------------------------
         // Buffer layout: [opaque/mask candidates sorted by (sides, texture, mesh)]
@@ -2098,22 +2124,29 @@ impl Renderer {
         let gpu = main && self.settings.gpu_culling && self.cull.is_some();
         let planes = frustum_planes(&view_proj);
         let cam_fwd_n = cam_fwd.normalize_or(Vec3::NEG_Z);
-        // (double_sided, texture, mesh, instance, bounds, model index)
-        // (pipeline 0..3, texture key, mesh, instance, bounds, model index); opaque pipelines sort first
-        let mut visible: Vec<(u8, u32, u32, InstanceRaw, [f32; 4], u32)> = vec![];
-        // (view depth, double_sided, texture, mesh, instance, model index)
-        let mut blended: Vec<(f32, bool, u32, u32, InstanceRaw, u32)> = vec![];
+        // Per accepted instance (index `mi`): its GPU record and bounding sphere. The lists below
+        // only hold small sort keys + `mi`, so sorting never moves the 192-byte records.
+        let mut raws: Vec<InstanceRaw> = std::mem::take(&mut self.scratch_raws);
+        raws.clear();
+        let mut bounds: Vec<[f32; 4]> = Vec::with_capacity(raws.capacity());
+        // (pipeline 0..3 << 56 | texture key << 28 | mesh, mi); opaque pipelines sort first
+        let mut visible: Vec<(u64, u32)> = Vec::with_capacity(raws.capacity());
+        // (view depth, double_sided, texture, mesh, mi)
+        let mut blended: Vec<(f32, bool, u32, u32, u32)> = vec![];
         let mut has_water = false;
-        // (alpha-tested, texture, mesh, instance, model index, bounding sphere)
-        let mut casters: Vec<(bool, u32, u32, InstanceRaw, u32, Vec3, f32)> = vec![];
-        // Model matrices; normal matrices (inverse-transpose) are computed afterwards with the job system.
-        let mut models: Vec<Mat4> = vec![];
+        // (alpha-tested << 63 | texture key << 32 | mesh, mi)
+        let mut casters: Vec<(u64, u32)> = Vec::with_capacity(raws.capacity());
         let fallback_mat = Material::default();
         // Material bind groups are keyed by (base, normal, height); `tex` below is an index into key_list.
-        let mut key_ids: std::collections::HashMap<(u32, u32, u32), u32> = std::collections::HashMap::new();
+        let mut key_ids: crate::scene::FxMap<(u32, u32, u32), u32> = Default::default();
         let mut key_list: Vec<(u32, u32, u32)> = vec![];
         let mut culled = 0u32;
         let mut lod_counts = [0u32; 4];
+        // World bounds of everything that can be in the opaque depth buffer (water SSR skips rays
+        // that never enter them).
+        let (mut scene_min, mut scene_max) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+        let shadows_on = self.settings.shadows;
+        let lod_bias = self.settings.lod_bias.max(0.01);
         for (g, mr, lod) in world.query::<(&GlobalTransform, &MeshRenderer, Option<&Lod>)>().iter() {
             if layers & (1u32 << (mr.layer & 31)) == 0 {
                 continue;
@@ -2122,7 +2155,7 @@ impl Renderer {
             let scale = model.x_axis.truncate().length().max(model.y_axis.truncate().length()).max(model.z_axis.truncate().length());
             let mut mesh_id = mr.mesh;
             if let Some(lod) = lod {
-                match lod.pick((model.w_axis.truncate() - cam_pos).length() / scale.max(1e-4) / self.settings.lod_bias.max(0.01)) {
+                match lod.pick((model.w_axis.truncate() - cam_pos).length() / scale.max(1e-4) / lod_bias) {
                     Some((level, m)) => {
                         mesh_id = m;
                         lod_counts[level.min(3)] += 1;
@@ -2135,15 +2168,30 @@ impl Renderer {
             }
             let Some(mesh) = self.meshes.get(mesh_id.0 as usize).filter(|m| m.index_count > 0) else { continue };
             let mat = self.materials.get(mr.material.0 as usize).unwrap_or(&fallback_mat);
+            let is_blend = mat.alpha_mode == AlphaMode::Blend;
+            let is_mask = matches!(mat.alpha_mode, AlphaMode::Mask(_));
+            let center = model.transform_point3(mesh.bounds_center);
+            let radius = mesh.bounds_radius * scale;
+            let casts = mr.cast_shadows && !is_blend && shadows_on;
+            let in_frustum = planes.iter().all(|p| p.truncate().dot(center) + p.w >= -radius);
+            let drawn = if is_blend { in_frustum } else { gpu || in_frustum };
+            if !drawn {
+                culled += 1;
+                if !casts {
+                    continue; // neither drawn nor a shadow caster: no GPU record needed
+                }
+            }
             let shading = if mat.terrain { -1.0 } else if mat.water { 3.0 } else if mat.ui { 2.0 } else if mat.unlit { 1.0 } else { 0.0 };
             let alpha = match mat.alpha_mode {
                 AlphaMode::Opaque => 0.0,
                 AlphaMode::Mask(c) => c.clamp(0.001, 1.0),
                 AlphaMode::Blend => -1.0,
             };
+            // Normal matrix = inverse transpose of the upper 3x3 (the shaders only use that part).
+            let normal = Mat4::from_mat3(glam::Mat3::from_mat4(model).inverse().transpose());
             let raw = InstanceRaw {
                 model: model.to_cols_array_2d(),
-                normal: [[0.0; 4]; 4], // filled below (jobs::par_map)
+                normal: normal.to_cols_array_2d(),
                 base_color: mat.base_color.into(),
                 emissive_metallic: if mat.terrain {
                     mat.terrain_params
@@ -2175,68 +2223,83 @@ impl Renderer {
                 key_list.push(key);
                 key_list.len() as u32 - 1
             });
-            let mi = models.len() as u32;
-            models.push(model);
-            let is_blend = mat.alpha_mode == AlphaMode::Blend;
-            let is_mask = matches!(mat.alpha_mode, AlphaMode::Mask(_));
-            let center = model.transform_point3(mesh.bounds_center);
-            let radius = mesh.bounds_radius * scale;
-            if mr.cast_shadows && !is_blend && self.settings.shadows {
-                casters.push((is_mask, if is_mask { tex } else { 0 }, mesh_id.0, raw, mi, center, radius));
+            let mi = raws.len() as u32;
+            raws.push(raw);
+            bounds.push([center.x, center.y, center.z, radius]);
+            if casts {
+                casters.push(((is_mask as u64) << 63 | (if is_mask { tex as u64 } else { 0 }) << 32 | mesh_id.0 as u64, mi));
             }
-            let in_frustum = planes.iter().all(|p| p.truncate().dot(center) + p.w >= -radius);
+            if !drawn {
+                continue;
+            }
             if is_blend {
-                if in_frustum {
-                    has_water |= mat.water;
-                    blended.push(((center - cam_pos).dot(cam_fwd_n), mat.double_sided, tex, mesh_id.0, raw, mi));
-                } else {
-                    culled += 1;
-                }
-            } else if gpu || in_frustum {
-                let pipe = (if is_mask || mat.ui { 2 } else { 0 }) + mat.double_sided as u8;
-                visible.push((pipe, tex, mesh_id.0, raw, [center.x, center.y, center.z, radius], mi));
+                has_water |= mat.water;
+                blended.push(((center - cam_pos).dot(cam_fwd_n), mat.double_sided, tex, mesh_id.0, mi));
             } else {
-                culled += 1;
+                let pipe = (if is_mask || mat.ui { 2 } else { 0 }) + mat.double_sided as u64;
+                visible.push((pipe << 56 | (tex as u64) << 28 | mesh_id.0 as u64, mi));
+                scene_min = scene_min.min(center - radius);
+                scene_max = scene_max.max(center + radius);
             }
         }
-        let normals = crate::jobs::par_map(&models, |m| m.inverse().transpose().to_cols_array_2d());
-        for v in visible.iter_mut() {
-            v.3.normal = normals[v.5 as usize];
-        }
-        for b in blended.iter_mut() {
-            b.4.normal = normals[b.5 as usize];
-        }
-        for c in casters.iter_mut() {
-            c.3.normal = normals[c.4 as usize];
-        }
-        visible.sort_by_key(|v| (v.0, v.1, v.2));
+        // (key, mi) order = (pipeline, texture, mesh), then spawn order within a batch
+        visible.sort_unstable();
         if self.settings.reverse_draw_order {
             visible.reverse();
         }
         blended.sort_by(|a, b| b.0.total_cmp(&a.0)); // far -> near
-        casters.sort_by_key(|c| (c.0, c.1, c.2));
+        casters.sort_unstable();
         // per cascade: the casters whose bounding sphere touches the cascade's light-space box
-        let cascade_casters: Vec<Vec<usize>> = cascade_boxes
+        let cascade_casters: Vec<Vec<u32>> = cascade_boxes
             .iter()
             .map(|(lv, r, depth)| {
-                (0..casters.len())
+                (0..casters.len() as u32)
                     .filter(|&i| {
-                        let (c, rad) = (casters[i].5, casters[i].6);
-                        let p = lv.transform_point3(c);
+                        let b = bounds[casters[i as usize].1 as usize];
+                        let rad = b[3];
+                        let p = lv.transform_point3(Vec3::new(b[0], b[1], b[2]));
                         p.x.abs() <= r + rad && p.y.abs() <= r + rad && -p.z >= -rad && -p.z <= depth + rad
                     })
                     .collect()
             })
             .collect();
 
-        // Opaque batches: runs of equal (sides, texture, mesh) -> one (indirect) draw each.
+        // Opaque batches: runs of equal (pipeline, texture, mesh) -> one (indirect) draw each.
         let mut batches: Vec<(u8, u32, u32, u32, u32)> = vec![]; // (pipeline, texture, mesh, first, count)
+        // nearest distance of a batch's instances to the camera (bounding sphere surface, then centre)
+        let mut batch_near: Vec<(f32, f32)> = vec![];
         for (i, v) in visible.iter().enumerate() {
+            let (pipe, tex, mesh_id) = ((v.0 >> 56) as u8, ((v.0 >> 28) & 0x0fff_ffff) as u32, (v.0 & 0x0fff_ffff) as u32);
+            let b = bounds[v.1 as usize];
+            let d = (Vec3::new(b[0], b[1], b[2]) - cam_pos).length();
+            let near_d = ((d - b[3]).max(0.0), d);
             match batches.last_mut() {
-                Some(b) if b.0 == v.0 && b.1 == v.1 && b.2 == v.2 => b.4 += 1,
-                _ => batches.push((v.0, v.1, v.2, i as u32, 1)),
+                Some(b) if b.0 == pipe && b.1 == tex && b.2 == mesh_id => {
+                    b.4 += 1;
+                    let n = batch_near.last_mut().unwrap();
+                    if near_d < *n {
+                        *n = near_d;
+                    }
+                }
+                _ => {
+                    batches.push((pipe, tex, mesh_id, i as u32, 1));
+                    batch_near.push(near_d);
+                }
             }
         }
+        // Draw order: per pipeline roughly front to back, so early-Z rejects hidden fragments before
+        // they are shaded (the instance buffer keeps the batch layout; only the draw sequence changes).
+        let mut draw_order: Vec<u32> = (0..batches.len() as u32).collect();
+        draw_order.sort_by(|&a, &b| {
+            let (na, nb) = (batch_near[a as usize], batch_near[b as usize]);
+            batches[a as usize].0.cmp(&batches[b as usize].0).then(na.0.total_cmp(&nb.0)).then(na.1.total_cmp(&nb.1))
+        });
+        if self.settings.reverse_draw_order {
+            draw_order.reverse();
+        }
+        // Hi-Z occlusion culling pays off only with enough geometry behind the occluders.
+        let candidate_tris: u64 = batches.iter().map(|b| (self.meshes[b.2 as usize].index_count / 3) as u64 * b.4 as u64).sum();
+        let use_hiz = gpu && self.settings.occlusion_culling && candidate_tris >= self.settings.occlusion_min_triangles as u64;
         // Blended runs: only *adjacent* equal keys merge, so the back-to-front order is kept.
         let blend_base = visible.len() as u32;
         let mut blend_runs: Vec<(bool, u32, u32, u32, u32)> = vec![];
@@ -2247,20 +2310,38 @@ impl Renderer {
             }
         }
 
+        // Globals (written after the instance pass: they carry the scene bounds)
+        if scene_min.x <= scene_max.x {
+            // padded by the SSR hit tolerance
+            globals.scene_min = (scene_min - 1.0).extend(0.0).into();
+            globals.scene_max = (scene_max + 1.0).extend(0.0).into();
+        } else {
+            globals.scene_min = [1.0, 1.0, 1.0, 0.0];
+            globals.scene_max = [-1.0, -1.0, -1.0, 0.0];
+        }
+        self.queue
+            .write_buffer_with_u32_and_u8_slice(&self.globals_buf, 0, bytemuck::bytes_of(&globals))
+            .map_err(js_err)?;
+
         let shadow_instances: usize = cascade_casters.iter().map(|c| c.len()).sum();
         let total = (visible.len() + blended.len() + shadow_instances) as u32;
         self.ensure_instance_capacity(total.max(1))?;
-        let mut data: Vec<InstanceRaw> = Vec::with_capacity(total as usize);
-        data.extend(visible.iter().map(|v| v.3));
-        data.extend(blended.iter().map(|b| b.4));
+        let mut data: Vec<InstanceRaw> = std::mem::take(&mut self.scratch_data);
+        data.clear();
+        data.reserve(total as usize);
+        data.extend(visible.iter().map(|v| raws[v.1 as usize]));
+        data.extend(blended.iter().map(|b| raws[b.4 as usize]));
         let mut cascade_base = vec![];
         for list in &cascade_casters {
             cascade_base.push(data.len() as u32);
-            data.extend(list.iter().map(|&i| casters[i].3));
+            data.extend(list.iter().map(|&i| raws[casters[i as usize].1 as usize]));
         }
         if !data.is_empty() {
             self.queue.write_buffer_with_u32_and_u8_slice(&self.instance_buf, 0, bytemuck::cast_slice(&data)).map_err(js_err)?;
         }
+        // keep the allocations for the next frame
+        self.scratch_raws = raws;
+        self.scratch_data = data;
         // visible_ids: identity for the CPU-drawn ranges (all opaque on the CPU path, blended always).
         let id_from = if gpu { blend_base } else { 0 };
         let id_to = blend_base + blended.len() as u32;
@@ -2297,7 +2378,7 @@ impl Renderer {
                     GpuBindGroupEntry::new_with_gpu_buffer(6, &self.light_bufs.lights),
                     GpuBindGroupEntry::new_with_gpu_buffer(7, &self.light_bufs.grid),
                     GpuBindGroupEntry::new_with_gpu_buffer(8, &self.light_bufs.indices),
-                    GpuBindGroupEntry::new_with_gpu_texture_view(9, &scene_color.1),
+                    GpuBindGroupEntry::new_with_gpu_texture_view(9, &scene_color),
                     GpuBindGroupEntry::new_with_gpu_texture_view(10, &self.sky_gpu.lut_view),
                     GpuBindGroupEntry::new(11, &self.sky_gpu.sampler),
                     GpuBindGroupEntry::new_with_gpu_texture_view(12, &self.sky_gpu.skybox_view),
@@ -2338,7 +2419,15 @@ impl Renderer {
         let encoder = self.device.create_command_encoder();
 
         // --- Sky-view LUT (atmosphere), only when the atmosphere sky is on ---------------------
-        if self.settings.sky_mode == 1 {
+        // Its only inputs are the sun and moon directions and three intensities, so it is redrawn only
+        // when one of them changed (a fixed time of day costs nothing).
+        let lut_key = [
+            globals.sky_sun[0], globals.sky_sun[1], globals.sky_sun[2],
+            globals.sky_moon[0], globals.sky_moon[1], globals.sky_moon[2], globals.sky_moon[3],
+            globals.misc[3], globals.sky_sun_color[3], 1.0,
+        ];
+        if self.settings.sky_mode == 1 && lut_key != self.sky_lut_key {
+            self.sky_lut_key = lut_key;
             let att = GpuRenderPassColorAttachment::new_with_gpu_texture_view(GpuLoadOp::Clear, GpuStoreOp::Store, &self.sky_gpu.lut_view);
             let desc = GpuRenderPassDescriptor::new(&[JsNullable::wrap(att)]);
             desc.set_label("sky-lut");
@@ -2351,13 +2440,13 @@ impl Renderer {
 
         // --- GPU culling (compute) ----------------------------------------------------------
         if gpu {
-            let occlusion = self.settings.occlusion_culling;
+            let occlusion = use_hiz;
             if let Some(c) = self.cull.as_mut() {
                 c.ensure_capacity(&self.device, visible.len() as u32, batches.len() as u32)?;
                 let mut items = Vec::with_capacity(visible.len());
                 for (b, batch) in batches.iter().enumerate() {
                     for v in &visible[batch.3 as usize..(batch.3 + batch.4) as usize] {
-                        items.push(crate::gpu_cull::CullItem { center_radius: v.4, batch: b as u32, _pad: [0; 3] });
+                        items.push(crate::gpu_cull::CullItem { center_radius: bounds[v.1 as usize], batch: b as u32, _pad: [0; 3] });
                     }
                 }
                 let args: Vec<crate::gpu_cull::DrawArgs> = batches
@@ -2423,10 +2512,10 @@ impl Renderer {
                     let mut bound: Option<(bool, u32)> = None;
                     let mut i = 0usize;
                     while i < list.len() {
-                        let c0 = &casters[list[i]];
-                        let (mask, tex, mesh_id) = (c0.0, c0.1, c0.2);
+                        let key = casters[list[i] as usize].0;
+                        let (mask, tex, mesh_id) = (key >> 63 == 1, ((key >> 32) & 0x7fff_ffff) as u32, key as u32);
                         let mut j = i;
-                        while j < list.len() && casters[list[j]].0 == mask && casters[list[j]].1 == tex && casters[list[j]].2 == mesh_id {
+                        while j < list.len() && casters[list[j] as usize].0 == key {
                             j += 1;
                         }
                         if bound.map(|b| b.0) != Some(mask) {
@@ -2452,12 +2541,20 @@ impl Renderer {
         {
             let att = GpuRenderPassColorAttachment::new_with_gpu_texture_view(GpuLoadOp::Clear, GpuStoreOp::Store, &msaa);
             if has_water {
-                // water refracts and reflects the resolved opaque scene (copied below)
-                att.set_resolve_target_gpu_texture_view(&hdr_view);
+                // water refracts and reflects the opaque scene: resolved straight into the texture
+                // the blend pass samples (no extra full-screen copy)
+                att.set_resolve_target_gpu_texture_view(&scene_color);
             }
             let cc = self.settings.clear_color; // linear HDR target, alpha 1 = tonemapped
             let clear_a = if rtt.is_some_and(|i| self.rtts[i].opts.transparent) { 0.0 } else { 1.0 };
             att.set_clear_value_gpu_color_dict(&GpuColorDict::new(clear_a, cc.z as f64, cc.y as f64, cc.x as f64));
+            if self.immediate_gpu && self.settings.sky && clear_a == 1.0 {
+                // The sky pass at the end writes every sample no geometry covered, so nothing of
+                // the old content survives and the clear of the 4x HDR target (about 1 ms at 1440p
+                // on an integrated desktop GPU) is pure overhead. Tile-based GPUs keep the clear:
+                // there a load is what costs.
+                att.set_load_op(GpuLoadOp::Load);
+            }
             let datt = GpuRenderPassDepthStencilAttachment::new_with_gpu_texture_view(&depth);
             datt.set_depth_clear_value(1.0);
             datt.set_depth_load_op(GpuLoadOp::Clear);
@@ -2473,7 +2570,8 @@ impl Renderer {
             let mut bound_tex = u32::MAX;
             let mut bound_pipe = usize::MAX;
             let args_buf = self.cull.as_ref().filter(|_| gpu).map(|c| c.args_buf.clone());
-            for (b, &(two_sided, tex, mesh_id, first, count)) in batches.iter().enumerate() {
+            for &b in &draw_order {
+                let (two_sided, tex, mesh_id, first, count) = batches[b as usize];
                 let pi = two_sided as usize; // pipeline index 0..3
                 if pi != bound_pipe {
                     pass.set_pipeline(&self.pipelines[pi]);
@@ -2487,7 +2585,7 @@ impl Renderer {
                 pass.set_vertex_buffer(0, Some(&mesh.vb));
                 pass.set_index_buffer(&mesh.ib, GpuIndexFormat::Uint32);
                 match &args_buf {
-                    Some(args) => pass.draw_indexed_indirect_with_u32(args, b as u32 * 20),
+                    Some(args) => pass.draw_indexed_indirect_with_u32(args, b * 20),
                     None => pass.draw_indexed_with_instance_count_and_first_index_and_base_vertex_and_first_instance(mesh.index_count, count, 0, 0, first),
                 }
                 stats.draw_calls += 1;
@@ -2508,16 +2606,11 @@ impl Renderer {
             pass.end();
         }
 
-        if has_water {
-            let src = GpuTexelCopyTextureInfo::new(&scene_color.2);
-            let dst = GpuTexelCopyTextureInfo::new(&scene_color.0);
-            let size: Vec<Number> = [vw, vh].iter().map(|x| Number::from(*x)).collect();
-            encoder.copy_texture_to_texture_with_u32_sequence(&src, &dst, &size).map_err(js_err)?;
-        }
-
         // --- Blend pass: back to front, depth read-only *and* bound as a texture (water) -----
         {
-            let att = GpuRenderPassColorAttachment::new_with_gpu_texture_view(GpuLoadOp::Load, GpuStoreOp::Discard, &msaa);
+            // immediate-mode GPUs keep the samples (free there) so the next opaque pass can skip its clear
+            let store = if self.immediate_gpu { GpuStoreOp::Store } else { GpuStoreOp::Discard };
+            let att = GpuRenderPassColorAttachment::new_with_gpu_texture_view(GpuLoadOp::Load, store, &msaa);
             att.set_resolve_target_gpu_texture_view(&hdr_view);
             let datt = GpuRenderPassDepthStencilAttachment::new_with_gpu_texture_view(&depth);
             datt.set_depth_read_only(true);
@@ -2593,8 +2686,12 @@ impl Renderer {
         let mut readback = false;
         if gpu {
             if let Some(c) = self.cull.as_mut() {
-                let ts = self.timing.as_mut().filter(|_| main).and_then(|t| t.compute_writes(crate::gpu_timing::HIZ));
-                c.encode_hiz(&encoder, view_proj, ts);
+                if use_hiz {
+                    let ts = self.timing.as_mut().filter(|_| main).and_then(|t| t.compute_writes(crate::gpu_timing::HIZ));
+                    c.encode_hiz(&encoder, view_proj, ts);
+                } else {
+                    c.hiz_valid = false;
+                }
                 readback = c.encode_readback(&encoder);
             }
         }

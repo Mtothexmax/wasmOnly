@@ -17,7 +17,7 @@
 //                                                    (exit 1 on problems; --strict also fails on warnings)
 //   node tools/bridge.mjs flicker [--frames 6] [--jitter 0.2] [--threshold 48] [--out heat.png]
 //                                                    screenshots with flipped draw order + perturbed depth -> flickering regions
-//   node tools/bridge.mjs perf [--ms 3000] [--profile] frame times, engine CPU phases, GPU pass times,
+//   node tools/bridge.mjs perf [--ms 3000] [--profile] [--top 15] frame times, engine CPU phases, GPU pass times,
 //                                                    verdict (vsync/gpu/cpu-bound); --profile adds top CPU functions
 //   node tools/bridge.mjs run <script.txt|.json> [--out dir] [--keep-going]
 //   node tools/bridge.mjs run --commands "key Space; step 30; expect game_state.jumps == 1; screenshot a.png"
@@ -321,7 +321,7 @@ try {
       break;
     }
     case 'perf': {
-      out(await withSession((s) => perf(s, { ms: Number(opt('--ms', 3000)), profile: flag('--profile') }), true));
+      out(await withSession((s) => perf(s, { ms: Number(opt('--ms', 3000)), profile: flag('--profile'), top: Number(opt('--top', 15)) }), true));
       break;
     }
     case 'flicker': {

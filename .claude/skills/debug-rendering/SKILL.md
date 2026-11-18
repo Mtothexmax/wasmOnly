@@ -129,6 +129,10 @@ node tools/bridge.mjs call render '{"occlusion_culling":false}' # GPU frustum on
 - Object missing only with GPU culling on -> bounding sphere too small (mesh bounds/scale) or Hi-Z
   popping (occlusion uses the *previous* frame: objects revealed by a fast camera move appear 1 frame late).
 - `gpu_*` counters are an async readback (1-3 frames old); wait ~2 frames before asserting.
+- `gpu_occluded` is always 0 in a small scene: Hi-Z occlusion only runs from
+  `render {occlusion_min_triangles}` (default 100000) candidate triangles; set it to 0 to force it.
+- Opaque batches are drawn front to back per pipeline (nearest bounding sphere first) for early-Z;
+  `render {reverse_draw_order:true}` flips that too.
 - `triangles` on the GPU path is an upper bound (candidates); the exact count stays on the GPU.
 - `assets.texture_list` shows every texture with size, mip count and upload count.
 

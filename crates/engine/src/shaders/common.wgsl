@@ -40,6 +40,8 @@ struct Globals {
     sky_params: vec4f,     // x = mode (0 gradient, 1 atmosphere), y = cloud coverage, z = cloud offset, w = stars
     skybox: vec4f,         // x = blend (0 = procedural sky, 1 = skybox), y = rotation (rad), z = intensity, w = 1 if bound
     misc: vec4f,           // x = water SSR on, y = water refraction, z = water caustics, w = atmosphere intensity
+    scene_min: vec4f,      // xyz = world bounds of the opaque scene (padded); min > max = nothing drawn
+    scene_max: vec4f,
 }
 
 struct Instance {

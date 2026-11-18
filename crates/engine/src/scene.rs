@@ -191,34 +191,71 @@ pub fn propagate_transforms(world: &mut World) {
     if kids.is_empty() {
         return;
     }
-    let mut index: FxMap<Entity, usize> = FxMap::default();
-    index.reserve(kids.len());
+    // Entity id -> index into `kids` (a dense table instead of a hash map: this runs for thousands
+    // of children every frame). The generation is checked on lookup (`kids[i].0 == parent`).
+    const NONE: u32 = u32::MAX;
+    let table_len = kids.iter().map(|k| k.0.id()).max().unwrap_or(0) as usize + 1;
+    let mut slot: Vec<u32> = vec![NONE; table_len];
     for (i, k) in kids.iter().enumerate() {
-        index.insert(k.0, i);
+        slot[k.0.id() as usize] = i as u32;
     }
-    let mut result: Vec<Option<Mat4>> = vec![None; kids.len()];
-    fn resolve(i: usize, kids: &[(Entity, Entity, Mat4)], index: &FxMap<Entity, usize>, result: &mut [Option<Mat4>], world: &World, depth: u32) -> Mat4 {
-        if let Some(m) = result[i] {
-            return m;
+    let kid_index = |e: Entity| -> Option<usize> {
+        let i = *slot.get(e.id() as usize)?;
+        (i != NONE && kids[i as usize].0 == e).then_some(i as usize)
+    };
+    let mut result: Vec<Mat4> = vec![Mat4::IDENTITY; kids.len()];
+    let mut done: Vec<bool> = vec![false; kids.len()];
+    // Siblings are stored next to each other, so remembering the last root parent saves most
+    // world lookups.
+    let mut last_root: Option<(Entity, Mat4)> = None;
+    let mut chain: Vec<usize> = vec![];
+    for start in 0..kids.len() {
+        if done[start] {
+            continue;
         }
-        let (_, parent, local) = kids[i];
-        let pm = match index.get(&parent) {
-            Some(&pi) if depth < 64 => resolve(pi, kids, index, result, world, depth + 1),
-            Some(_) => Mat4::IDENTITY,
-            None => world.get::<&GlobalTransform>(parent).map(|g| g.0).unwrap_or(Mat4::IDENTITY),
+        // walk up until a resolved ancestor or a root, then multiply back down
+        chain.clear();
+        let mut i = start;
+        let mut pm = loop {
+            chain.push(i);
+            let parent = kids[i].1;
+            match kid_index(parent) {
+                Some(pi) if done[pi] => break result[pi],
+                Some(pi) if chain.len() < 64 && !chain.contains(&pi) => i = pi,
+                Some(_) => break Mat4::IDENTITY, // cycle or absurd depth
+                None => {
+                    break match last_root {
+                        Some((e, m)) if e == parent => m,
+                        _ => {
+                            let m = world.get::<&GlobalTransform>(parent).map(|g| g.0).unwrap_or(Mat4::IDENTITY);
+                            last_root = Some((parent, m));
+                            m
+                        }
+                    };
+                }
+            }
         };
-        let m = pm * local;
-        result[i] = Some(m);
-        m
+        for &c in chain.iter().rev() {
+            pm *= kids[c].2;
+            result[c] = pm;
+            done[c] = true;
+        }
     }
-    for i in 0..kids.len() {
-        resolve(i, &kids, &index, &mut result, world, 0);
+    let mut written = 0usize;
+    for (e, g) in world.query_mut::<hecs::With<(Entity, &mut GlobalTransform), (&Parent, &Transform)>>() {
+        if let Some(i) = kid_index(e) {
+            g.0 = result[i];
+            written += 1;
+        }
     }
-    for (i, k) in kids.iter().enumerate() {
-        let m = result[i].unwrap_or(Mat4::IDENTITY);
-        match world.get::<&mut GlobalTransform>(k.0) {
-            Ok(mut g) => g.0 = m,
-            Err(_) => missing.push((k.0, m)),
+    if written < kids.len() {
+        // children that have no GlobalTransform yet (just spawned)
+        for k in kids.iter() {
+            if world.get::<&GlobalTransform>(k.0).is_err() {
+                if let Some(i) = kid_index(k.0) {
+                    missing.push((k.0, result[i]));
+                }
+            }
         }
     }
     for (e, m) in missing {

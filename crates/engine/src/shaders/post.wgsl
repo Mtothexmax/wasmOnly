@@ -152,9 +152,8 @@ fn ghost(q: vec2f, center: vec2f, size: f32, ring: bool) -> f32 {
 
 // Classic game lens flare: glow + starburst at the sun, a faint halo ring, and a chain of coloured
 // hexagon/ring ghosts along the line from the sun through the screen centre.
-fn lens_flare(uv: vec2f) -> vec3f {
+fn lens_flare(uv: vec2f, vis: f32) -> vec3f {
     let aspect = p.c.w;
-    let vis = sun_visibility(aspect);
     if (vis <= 0.0) { return vec3f(0.0); }
     let k = p.d.z * vis;
     let sun = vec2f(p.d.x * aspect, p.d.y);
@@ -188,11 +187,35 @@ fn lens_flare(uv: vec2f) -> vec3f {
     return c * k;
 }
 
+struct CompOut {
+    @builtin(position) pos: vec4f,
+    @location(0) uv: vec2f,
+    // how much of the sun disk is visible: the same for every pixel, so it is sampled here (three
+    // vertices) instead of per pixel
+    @location(1) @interpolate(flat) sun_vis: f32,
+}
+
+@vertex
+fn vs_composite(@builtin(vertex_index) i: u32) -> CompOut {
+    let xy = vec2f(f32((i << 1u) & 2u), f32(i & 2u));
+    var o: CompOut;
+    o.pos = vec4f(xy * 2.0 - 1.0, 0.0, 1.0);
+    o.uv = vec2f(xy.x, 1.0 - xy.y);
+    o.sun_vis = 0.0;
+    if (p.d.z > 0.0) { o.sun_vis = sun_visibility(p.c.w); }
+    return o;
+}
+
+// 8 ring directions for depth darkening (45 degree steps); rotated per pixel by one angle
+const RING = array<vec2f, 8>(
+    vec2f(1.0, 0.0), vec2f(0.70710678, 0.70710678), vec2f(0.0, 1.0), vec2f(-0.70710678, 0.70710678),
+    vec2f(-1.0, 0.0), vec2f(-0.70710678, -0.70710678), vec2f(0.0, -1.0), vec2f(0.70710678, -0.70710678));
+
 // a = (exposure, bloom intensity, darkening strength, darkening radius in px at 1 m)
 // b = (near, far, bloom on, darkening range in m)
 // c = (vignette, saturation, transparent background (alpha = scene mask), aspect w/h)
 @fragment
-fn fs_composite(i: VsOut) -> @location(0) vec4f {
+fn fs_composite(i: CompOut) -> @location(0) vec4f {
     // the scene may be rendered smaller than the canvas (render_scale): sample by UV, read depth at
     // the matching scene pixel
     let raw = textureSampleLevel(src, samp, i.uv, 0.0);
@@ -214,10 +237,12 @@ fn fs_composite(i: VsOut) -> @location(0) vec4f {
             var n = 0.0;
             // rotated per pixel (interleaved gradient noise) so the ring pattern does not show
             let ign = fract(52.9829189 * fract(dot(vec2f(px), vec2f(0.06711056, 0.00583715))));
+            // direction k = RING[k] rotated by ign * 45 degrees (one sin/cos per pixel instead of 8)
+            let rot = vec2f(cos(ign * 0.785398), sin(ign * 0.785398));
             for (var k = 0; k < 8; k++) {
-                let ang = (f32(k) + ign) * 0.785398;
+                let dir = vec2f(RING[k].x * rot.x - RING[k].y * rot.y, RING[k].x * rot.y + RING[k].y * rot.x);
                 let rr = r * (0.5 + 0.5 * fract(f32(k) * 0.618 + ign));
-                let q = clamp(px + vec2i(vec2f(cos(ang), sin(ang)) * rr), vec2i(0), dims - 1);
+                let q = clamp(px + vec2i(dir * rr), vec2i(0), dims - 1);
                 let zq = textureLoad(depth_tex, q, 0);
                 let dq = select(lin_depth(zq), d, zq >= 1.0);
                 // ignore neighbours far in front (silhouettes against the background)
@@ -237,7 +262,7 @@ fn fs_composite(i: VsOut) -> @location(0) vec4f {
         c += bl * p.a.y * mask;
     }
     if (p.d.z > 0.0) {
-        c += lens_flare(i.uv);
+        c += lens_flare(i.uv, i.sun_vis);
     }
     var mapped = aces(c * p.a.x);
     // saturation

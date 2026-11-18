@@ -31,6 +31,13 @@ pub struct GpuTimes {
     pub post: f32,
     /// Sum of the measured passes (ms).
     pub total: f32,
+    /// First pass begin to last pass end (ms): also contains what runs between the timed passes
+    /// (texture copies, resolves, state transitions), so it is the better "whole frame" number.
+    pub frame: f32,
+    /// Begin and end of each pass in ms since the first pass began, in the order cull, shadow,
+    /// opaque, blend, hiz, post (latest measurement, not smoothed; 0 = pass not timed). Gaps
+    /// between one pass's end and the next one's begin are untimed GPU work.
+    pub timeline: [[f32; 2]; 6],
     /// Number of completed measurements so far.
     pub samples: u32,
 }
@@ -124,14 +131,18 @@ impl GpuTiming {
                     let words = js_sys::Uint32Array::new(&range);
                     let ts = |i: usize| words.get_index((i * 2) as u32) as f64 + words.get_index((i * 2 + 1) as u32) as f64 * 4_294_967_296.0;
                     let mut ms = [0.0f32; N];
+                    let (mut first, mut last_end) = (f64::MAX, 0.0f64);
                     for (slot, m) in ms.iter_mut().enumerate() {
                         if used[slot] {
                             let (a, b) = (ts(slot * 2), ts(slot * 2 + 1));
                             if b >= a && a > 0.0 {
                                 *m = ((b - a) / 1.0e6) as f32;
+                                first = first.min(a);
+                                last_end = last_end.max(b);
                             }
                         }
                     }
+                    let span = if last_end > first { ((last_end - first) / 1.0e6) as f32 } else { 0.0 };
                     let mut l = last.borrow_mut();
                     // light smoothing (timestamps are quantized)
                     let k = if l.samples == 0 { 1.0 } else { 0.2 };
@@ -143,6 +154,11 @@ impl GpuTiming {
                     l.hiz = mix(l.hiz, ms[HIZ]);
                     l.post = mix(l.post, ms[POST]);
                     l.total = l.cull + l.shadow + l.opaque + l.blend + l.hiz + l.post;
+                    l.frame = mix(l.frame, span);
+                    for slot in 0..N {
+                        let (a, b) = (ts(slot * 2), ts(slot * 2 + 1));
+                        l.timeline[slot] = if used[slot] && b >= a && a >= first { [((a - first) / 1.0e6) as f32, ((b - first) / 1.0e6) as f32] } else { [0.0; 2] };
+                    }
                     l.samples += 1;
                 }
                 buf.unmap();

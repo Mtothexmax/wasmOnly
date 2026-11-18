@@ -116,10 +116,19 @@ normal `cargo` output above it.
   (async readback, 1-3 frames old) and `lod_levels`. `render {gpu_culling:false}` switches to the CPU path.
 - **Frame rate / stutter:** `node tools/bridge.mjs perf [--ms 3000] [--profile]` measures real rAF intervals and
   returns `frame_ms` p50/p95/p99, `missed_frames_pct`, `cpu_phases` (game_fixed, physics, update, engine, render),
-  `gpu_ms` per pass (cull, shadow, opaque, blend, hiz; WebGPU timestamp queries) and a `verdict`
-  (smooth / gpu-bound / cpu-bound / stutter). `--profile` adds a CDP CPU profile (`top_self` functions).
+  `gpu_ms` per pass (cull, shadow, opaque, blend, hiz, post; WebGPU timestamp queries) and a `verdict`
+  (smooth / gpu-bound / cpu-bound / stutter). `--profile [--top 40]` adds a CDP CPU profile (`top_self` functions).
   Live values: `stats.time.phases`, `stats.render.gpu_ms`. When the *user* sees low fps, ask them to press ` while
   it happens: debug mode writes a `"kind":"perf"` line per second (p50/p95/max, slow frames, phases, GPU) into the log.
+- **GPU time, the honest number:** `gpu_ms.frame` = first pass begin to last pass end. It is larger than `total`
+  (the sum of the passes) because clears, MSAA resolves and copies run *between* the timed passes;
+  `gpu_ms.timeline` has begin/end per pass (cull, shadow, opaque, blend, hiz, post), so the gaps show them.
+  Integrated GPUs lower their clock when a frame is light: at 60 fps the milliseconds barely move when you remove
+  work. For A/B comparisons make the GPU the bottleneck first (fixed `render_scale`, then enlarge the canvas:
+  `bridge eval "document.querySelector('canvas').style.width='150vw'"` + the same for `height`/`150vh`; a reload
+  undoes it) and compare `gpu_ms.frame`.
+- **Hi-Z occlusion culling** only runs when the opaque candidates add up to `render {occlusion_min_triangles}`
+  (default 100000): below that the depth pyramid costs more than it saves (`gpu_occluded` stays 0, `gpu_ms.hiz` 0).
 
 ## Code map
 
