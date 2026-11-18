@@ -1,0 +1,17 @@
+[package]
+name = "asset-cook"
+version = "0.1.0"
+edition = "2021"
+description = "Native asset cooker: any Assimp format (OBJ, FBX, DAE, 3DS, ...) -> .glb for the WASM engine"
+
+# Own workspace: this tool is native-only (Assimp is C++), never built for wasm32.
+[workspace]
+
+[dependencies]
+russimp = { version = "3.2", features = ["prebuilt"] }
+serde_json = "1"
+
+# russimp-sys 2.0.2 pins bindgen 0.63, which emits opaque aiNode/aiScene with libclang >= 16.
+# The vendored copy only bumps bindgen (see vendor/russimp-sys/Cargo.toml).
+[patch.crates-io]
+russimp-sys = { path = "vendor/russimp-sys" }

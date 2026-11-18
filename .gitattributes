@@ -1,0 +1,8 @@
+# LF everywhere in the repo (Rust, WGSL, JS, Markdown); binaries untouched.
+* text=auto eol=lf
+*.glb binary
+*.png binary
+*.mp3 binary
+*.ogg binary
+*.wav binary
+*.wasm binary

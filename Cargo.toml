@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+members = ["crates/engine", "games/demo"]
+# tools/asset-cook is native-only (russimp/Assimp, C++) and lives in its own workspace.
+exclude = ["tools/asset-cook"]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+
+# Reproducible builds: stable toolchain pinned in rust-toolchain.toml; the threads backend
+# (engine feature `threads`, needs build-std + atomics) uses this pinned nightly. See tools/dev.mjs.
+[workspace.metadata.wasmonly]
+threads-toolchain = "nightly-2026-11-01"
+
+[workspace.dependencies]
+# wasm-bindgen MUST match the installed wasm-bindgen CLI exactly (see tools/build.mjs).
+wasm-bindgen = "=0.2.129"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3.106"
+web-sys = "0.3.106"
+glam = { version = "0.33", features = ["bytemuck", "serde"] }
+hecs = "0.11"
+rapier3d = "0.36"
+gltf = { version = "1.4", default-features = false, features = ["utils", "names", "KHR_materials_emissive_strength"] }
+bytemuck = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+console_error_panic_hook = "0.1"
+
+[profile.dev]
+opt-level = 1          # debug builds that still run at playable speed
+debug = true           # DWARF -> Chrome DevTools (C/C++ DevTools Support extension)
+
+[profile.dev.package."*"]
+opt-level = 3          # deps (rapier, glam) optimised even in dev
+debug = false          # DWARF only for engine + game code (keeps the dev .wasm small)
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

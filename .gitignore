@@ -1,0 +1,6 @@
+/target
+/tools/asset-cook/target
+/dist
+/.chrome-debug-profile
+/screenshot.png
+/logs
