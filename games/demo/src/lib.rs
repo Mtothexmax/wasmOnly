@@ -840,6 +840,7 @@ impl Screen<Data> for PlayScreen {
             ("reset", "Rebuild the tower and respawn the player."),
             ("teleport", "Move the player. args: {pos: [x,y,z]}"),
             ("shoot_at", "Fire a shot from the camera towards a world point. args: {target: [x,y,z]}"),
+            ("step_lab", "Character step-up lab: a low plate (edge at z -7) and `lanes` characters walking onto it from start distances spread over `start_spread` m. args: {height?: 0.152, radius?: 0.32, half_height?: 0.62, step_height?: 0.3, speed?: 3.2, lanes?: 16, start_spread?: 0.08}. Then step and call characters."),
             ("control", "Switch control between the physics ball and the character-controller walker. args: {walker: bool, pos?: [x,y,z] (place the walker, capsule centre)}"),
         ]
     }
@@ -875,6 +876,29 @@ impl Screen<Data> for PlayScreen {
                 let dir = (target - origin).normalize();
                 let e = self.shoot_from(ctx, origin, dir);
                 Ok(json!({"id": e.id()}))
+            }
+            "step_lab" => {
+                let f = |k: &str, d: f32| args.get(k).and_then(|v| v.as_f64()).map(|v| v as f32).unwrap_or(d);
+                let (h, r, hh, sh, speed) = (f("height", 0.152), f("radius", 0.32), f("half_height", 0.62), f("step_height", 0.3), f("speed", 3.2));
+                let lanes = args.get("lanes").and_then(|v| v.as_u64()).unwrap_or(16) as usize;
+                let dz = f("start_spread", 0.08); // start distances spread over this many metres
+                let spacing = (r * 2.0 + 0.6).max(1.0);
+                let width = lanes as f32 * spacing;
+                // plate along x (west of the terminal), top at y = h, near edge at z = -7
+                let x0 = -12.5;
+                let plate = ctx.spawn_cube("lab-plate", Vec3::new(x0 + width * 0.5, h * 0.5, -9.0), Vec3::new(width, h, 4.0), 0x8d99ae);
+                ctx.physics.add(&mut ctx.world, plate, RigidBodyBuilder::fixed(), ColliderBuilder::cuboid(width * 0.5, h * 0.5, 2.0));
+                let mut ids = vec![];
+                for i in 0..lanes {
+                    let z = -5.5 + i as f32 / lanes.max(2) as f32 * dz;
+                    let cc = CharacterController { radius: r, half_height: hh, step_height: sh, speed, ..Default::default() };
+                    let e = ctx.spawn_character("lab-hero", Vec3::new(x0 + spacing * (i as f32 + 0.5), 0.0, z), cc);
+                    if let Ok(mut c) = ctx.world.get::<&mut CharacterController>(e) {
+                        c.wish = Vec3::new(0.0, 0.0, -1.0);
+                    }
+                    ids.push(json!({"id": e.id(), "start_z": z}));
+                }
+                Ok(json!({"plate_top": h, "plate_edge_z": -7.0, "characters": ids}))
             }
             "control" => {
                 let on = args.get("walker").and_then(|v| v.as_bool()).unwrap_or(!self.walker_mode);

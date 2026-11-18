@@ -38,8 +38,14 @@ camera, a debug command, `debug_state`), `tests/smoke.txt`, `.mcp.json`, `CLAUDE
 Optional: `web/index.html` in your folder replaces the engine's page (keep the `#canvas`, `#ui .hud`
 structure and the `engine-ready` script).
 
-Only one dev server can use :8080 at a time (`--port` to change it; the bridge expects the page at
-`http://localhost:8080/`).
+Only one dev server can use :8080 at a time. A second project runs its own server and its **own debug
+Chrome** (shared Chrome tabs steal focus and frames from each other):
+`node <engine>/tools/dev.mjs watch --game-dir <dir> --port 8091`, then
+`node <engine>/tools/bridge.mjs launch --port 9223 --url http://localhost:8091/` and the same `--port 9223
+--url http://localhost:8091/` on every bridge command (or `CDP_PORT=9223 GAME_URL=http://localhost:8091/`).
+
+Detailed small models (figures, faces) seen from far cameras: `ctx.load_gltf_with(url, t, GltfOpts {
+auto_lod: false, ..Default::default() })`, `ctx.gltf_defaults.auto_lod = false`, or `render.lod_bias`.
 
 ## 3. Working rules (they prevented real bugs)
 

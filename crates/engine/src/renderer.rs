@@ -17,6 +17,8 @@ use web_sys::*;
 const SAMPLES: u32 = 4;
 const DEPTH_FORMAT: GpuTextureFormat = GpuTextureFormat::Depth24plus;
 const SHADOW_FORMAT: GpuTextureFormat = GpuTextureFormat::Depth32float;
+/// First automatic LOD switch at this multiple of the mesh's bounding radius (see `add_mesh_with_lods`).
+pub const AUTO_LOD_FACTOR: f32 = 40.0;
 /// Shadow cascades (layers of the shadow map array).
 const MAX_CASCADES: usize = 4;
 /// Uniform slot stride for per-cascade matrices (minUniformBufferOffsetAlignment).
@@ -281,6 +283,9 @@ pub struct RenderSettings {
     pub frame_budget_ms: f32,
     /// Lowest scale the adaptive resolution may pick.
     pub min_render_scale: f32,
+    /// Multiplies every LOD switch distance (2 = keep detail twice as far; top-down cameras far
+    /// from small models want > 1). Also lowers itself never: set it per game.
+    pub lod_bias: f32,
 }
 
 impl Default for RenderSettings {
@@ -330,6 +335,7 @@ impl Default for RenderSettings {
             auto_resolution: true,
             frame_budget_ms: 11.0,
             min_render_scale: 0.5,
+            lod_bias: 1.0,
         }
     }
 }
@@ -1346,7 +1352,9 @@ impl Renderer {
         let base = self.add_mesh(name, data);
         let (_, radius) = data.bounds();
         let mut meshes = vec![base];
-        let mut distances = vec![radius.max(0.25) * 12.0];
+        // Vertex clustering visibly deforms small detailed models (faces, caps), so the first
+        // switch happens late: at 40x the bounding radius (a 0.4 m head keeps full detail to 16 m).
+        let mut distances = vec![radius.max(0.25) * AUTO_LOD_FACTOR];
         for (i, r) in ratios.iter().enumerate() {
             let cells = (32.0 * r).round().max(2.0) as u32;
             let simple = data.simplify_cluster(cells);
@@ -1354,7 +1362,7 @@ impl Renderer {
                 continue;
             }
             meshes.push(self.add_mesh(&format!("{name}#lod{}", i + 1), &simple));
-            distances.push(radius.max(0.25) * 12.0 * 2f32.powi(i as i32 + 1));
+            distances.push(radius.max(0.25) * AUTO_LOD_FACTOR * 2f32.powi(i as i32 + 1));
         }
         distances.pop(); // last level has no upper bound
         (
@@ -1883,7 +1891,7 @@ impl Renderer {
             let scale = model.x_axis.truncate().length().max(model.y_axis.truncate().length()).max(model.z_axis.truncate().length());
             let mut mesh_id = mr.mesh;
             if let Some(lod) = lod {
-                match lod.pick((model.w_axis.truncate() - cam_pos).length() / scale.max(1e-4)) {
+                match lod.pick((model.w_axis.truncate() - cam_pos).length() / scale.max(1e-4) / self.settings.lod_bias.max(0.01)) {
                     Some((level, m)) => {
                         mesh_id = m;
                         lod_counts[level.min(3)] += 1;

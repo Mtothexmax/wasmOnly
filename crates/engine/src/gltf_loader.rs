@@ -18,6 +18,23 @@ use web_sys::{Blob, BlobPropertyBag, ImageBitmap, Response};
 /// glTF meshes with at least this many triangles get automatic LODs (vertex clustering).
 pub const AUTO_LOD_MIN_TRIANGLES: usize = 256;
 
+/// Per-load options for glTF models ([`Ctx::load_gltf_with`]); `ctx.gltf_defaults` applies to
+/// plain `load_gltf`.
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+pub struct GltfOpts {
+    /// Attach the automatic LOD chain (vertex-clustered levels) to big primitives. Off = always
+    /// full detail (small detailed models: characters, figures, props seen from far cameras).
+    pub auto_lod: bool,
+    /// Multiplies this model's LOD switch distances (on top of `render.lod_bias`).
+    pub lod_distance: f32,
+}
+
+impl Default for GltfOpts {
+    fn default() -> Self {
+        Self { auto_lod: true, lod_distance: 1.0 }
+    }
+}
+
 /// GPU-resident model, instantiable any number of times.
 #[derive(Clone, Debug)]
 pub struct ModelTemplate {
@@ -439,6 +456,7 @@ pub fn instantiate(ctx: &mut Ctx, root: Entity, model: &ModelTemplate) {
         return; // despawned while loading
     }
     let layer = ctx.world.get::<&crate::scene::RenderLayer>(root).map(|l| l.0).unwrap_or(0);
+    let opts = ctx.world.get::<&GltfOpts>(root).map(|o| *o).unwrap_or(ctx.gltf_defaults);
     let n_nodes = model.nodes.len();
     let mut node_entity: Vec<Option<Entity>> = vec![None; n_nodes];
     let mut node_prims: Vec<Vec<Entity>> = vec![vec![]; n_nodes];
@@ -462,8 +480,12 @@ pub fn instantiate(ctx: &mut Ctx, root: Entity, model: &ModelTemplate) {
             let mut mr = MeshRenderer::new(mesh, *mat);
             mr.layer = layer;
             let _ = ctx.world.insert_one(target, mr);
-            if let (Some(l), None) = (lod, &deform) {
-                let _ = ctx.world.insert_one(target, l.clone());
+            if let (Some(l), None, true) = (lod, &deform, opts.auto_lod) {
+                let mut l = l.clone();
+                for d in l.distances.iter_mut() {
+                    *d *= opts.lod_distance.max(0.01);
+                }
+                let _ = ctx.world.insert_one(target, l);
             }
             if let Some(src) = deform {
                 let weights = if n.morph_weights.len() == src.targets.len() { n.morph_weights.clone() } else { vec![0.0; src.targets.len()] };

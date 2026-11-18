@@ -46,6 +46,12 @@ pub struct Input {
     fixed_buttons_pressed: HashSet<MouseButton>,
     #[serde(skip)]
     in_fixed: bool,
+    /// Keys/buttons held through the AI API (`input {key, down:true}`): a window blur (another tab
+    /// or window taking focus) does not release them — test scripts stay deterministic. They are
+    /// released by `down:false` or `input {release_all:true}`.
+    pub api_keys: HashSet<String>,
+    #[serde(skip)]
+    api_buttons: HashSet<MouseButton>,
     /// Pointer position in CSS pixels relative to the canvas.
     pub pointer: Vec2,
     /// Accumulated movement since the last frame (CSS pixels; uses movementX/Y, works under pointer lock).
@@ -153,7 +159,36 @@ impl Input {
         self.wheel = 0.0;
         self.touch.end_frame();
     }
+    /// Marks a key as held/released by the AI API (see `api_keys`).
+    pub(crate) fn note_api_key(&mut self, code: &str, down: bool) {
+        if down {
+            self.api_keys.insert(code.to_string());
+        } else {
+            self.api_keys.remove(code);
+        }
+    }
+    pub(crate) fn note_api_button(&mut self, b: MouseButton, down: bool) {
+        if down {
+            self.api_buttons.insert(b);
+        } else {
+            self.api_buttons.remove(&b);
+        }
+    }
+    /// Window lost focus: release what the user held, keep what the AI API holds.
+    pub(crate) fn release_user(&mut self) {
+        let keys: Vec<String> = self.keys.iter().filter(|k| !self.api_keys.contains(*k)).cloned().collect();
+        for k in &keys {
+            self.keys.remove(k);
+        }
+        self.fixed_released.extend(keys.iter().cloned());
+        self.released.extend(keys);
+        let api_buttons = self.api_buttons.clone();
+        self.buttons.retain(|b| api_buttons.contains(b));
+        self.touch.release_all();
+    }
     pub(crate) fn release_all(&mut self) {
+        self.api_keys.clear();
+        self.api_buttons.clear();
         let keys: Vec<String> = self.keys.drain().collect();
         self.fixed_released.extend(keys.iter().cloned());
         self.released.extend(keys);

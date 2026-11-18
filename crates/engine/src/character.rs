@@ -82,6 +82,8 @@ pub struct CharacterController {
     /// Seconds the character has wanted to move but could not (see the "stuck" log warning).
     pub blocked_time: f32,
     pub stuck_reports: u32,
+    /// Times the step-up retry got the character over a low edge / seam.
+    pub step_ups: u32,
     #[serde(skip)]
     #[doc(hidden)]
     pub warn_cooldown: f32,
@@ -131,6 +133,7 @@ impl Default for CharacterController {
             jumps: 0,
             blocked_time: 0.0,
             stuck_reports: 0,
+            step_ups: 0,
             warn_cooldown: 0.0,
             airborne_presses: 0,
             since_ground: 10.0,
@@ -258,10 +261,52 @@ pub(crate) fn step_characters(ctx: &mut Ctx, dt: f32) {
         }
         let desired = Vec3::new(h.x, if vy > 0.0 { 0.0 } else { vy }, h.z) * dt;
         let pos = Pose::from_parts(t.translation, Quat::IDENTITY);
-        let moved = {
+        let mut moved = {
             let qp = pw.broad_phase.as_query_pipeline(pw.narrow_phase.query_dispatcher(), &pw.bodies, &pw.colliders, filter);
             kcc.move_shape(dt, &qp, &*shape, &pos, desired, |c| hits.push(c))
         };
+        // Step-up retry: a grounded character that wants to move but makes (almost) no horizontal
+        // progress has met a low edge or a seam between boxes. Its round bottom touches such an edge
+        // at a slope-like angle, so rapier's autostep (walls only) never triggers and certain
+        // approach positions end in zero motion (seen as a 1-in-3 stall on 5 cm plates). Retry as:
+        // lift by step_height (no slope limits), move horizontally, drop back with ground snapping.
+        // The better of the two results wins; deterministic for a given state.
+        let want_h = Vec3::new(desired.x, 0.0, desired.z);
+        let got_h = Vec3::new(moved.translation.x, 0.0, moved.translation.z);
+        if cc.step_height > 0.0 && vy <= 0.0 && cc.since_ground <= cc.coyote_time && want_h.length() > 1e-5 && got_h.length() < want_h.length() * 0.5 {
+            let qp = pw.broad_phase.as_query_pipeline(pw.narrow_phase.query_dispatcher(), &pw.bodies, &pw.colliders, filter);
+            let mut up = KinematicCharacterController::default();
+            up.offset = kcc.offset;
+            up.max_slope_climb_angle = std::f32::consts::FRAC_PI_2;
+            up.min_slope_slide_angle = std::f32::consts::FRAC_PI_2;
+            up.autostep = None;
+            up.snap_to_ground = None;
+            let lift = up.move_shape(dt, &qp, &*shape, &pos, Vec3::Y * cc.step_height, |_| {});
+            let p1 = Pose::from_parts(t.translation + lift.translation, Quat::IDENTITY);
+            let mut flat = kcc.clone();
+            flat.snap_to_ground = None;
+            flat.autostep = None;
+            let side = flat.move_shape(dt, &qp, &*shape, &p1, want_h, |_| {});
+            let side_h = Vec3::new(side.translation.x, 0.0, side.translation.z);
+            // only a real step: at least half the wanted distance, and it must land on ground
+            // (walls stay walls, ledges higher than step_height are not climbed)
+            if side_h.length() >= want_h.length() * 0.5 && side_h.length() > got_h.length() + 1e-4 {
+                let p2 = Pose::from_parts(p1.translation + side.translation, Quat::IDENTITY);
+                let mut down = kcc.clone();
+                down.autostep = None;
+                down.snap_to_ground = Some(CharacterLength::Absolute(cc.step_height + cc.snap_to_ground.max(0.05)));
+                let mut drop_hits = vec![];
+                let drop = down.move_shape(dt, &qp, &*shape, &p2, Vec3::NEG_Y * (lift.translation.y + 0.01), |c| drop_hits.push(c));
+                let climbed = lift.translation.y + drop.translation.y;
+                if drop.grounded && climbed <= cc.step_height + 0.01 {
+                    moved.translation = lift.translation + side.translation + drop.translation;
+                    moved.grounded = true;
+                    moved.is_sliding_down_slope = false;
+                    hits.extend(drop_hits);
+                    cc.step_ups += 1;
+                }
+            }
+        }
         if cc.push_mass > 0.0 && !hits.is_empty() {
             let mut qpm = pw.broad_phase.as_query_pipeline_mut(pw.narrow_phase.query_dispatcher(), &mut pw.bodies, &mut pw.colliders, filter);
             kcc.solve_character_collision_impulses(dt, &mut qpm, &*shape, cc.push_mass, &hits);
@@ -464,7 +509,7 @@ pub fn describe_characters(world: &hecs::World) -> serde_json::Value {
         .iter()
         .map(|(e, cc, t)| {
             serde_json::json!({"id": e.id(), "pos": t.translation.to_array(), "grounded": cc.grounded, "velocity": cc.velocity.to_array(),
-                "jumps": cc.jumps, "jump_held": cc.jump, "wish": cc.wish.to_array(), "blocked_time": cc.blocked_time, "stuck_reports": cc.stuck_reports,
+                "jumps": cc.jumps, "jump_held": cc.jump, "wish": cc.wish.to_array(), "blocked_time": cc.blocked_time, "stuck_reports": cc.stuck_reports, "step_ups": cc.step_ups,
                 "touching": cc.collisions.iter().map(|c| c.id()).collect::<Vec<_>>()})
         })
         .collect();

@@ -52,6 +52,7 @@ pub mod prelude {
     pub use crate::app::{run, Ctx, Game, Time};
     pub use crate::batch::Motion;
     pub use crate::geom::{MeshBuilder, Opening};
+    pub use crate::gltf_loader::GltfOpts;
     pub use crate::audio::synth::{self, Sfx, SfxPreset, Wave};
     pub use crate::audio::{Fx, MusicOpts, Play, SoundId, VoiceId};
     pub use crate::character::{CharacterController, ThirdPersonCamera};

@@ -1,7 +1,7 @@
 /target
 /tools/asset-cook/target
 /dist
-/.chrome-debug-profile
+/.chrome-debug-profile*
 /screenshot.png
 /logs
 /games/*/tests/shots

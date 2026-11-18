@@ -24,7 +24,10 @@
 //                                                    scripted test run (see tools/script.mjs), exit 1 on failure
 //   node tools/bridge.mjs mcp                        run as MCP server (stdio) — see .mcp.json
 //
-// Options: --port 9222 (CDP port), --url <page url to target/open>
+// Options: --port 9222 (CDP port), --url <page url to target/open>, --profile-dir <dir> (launch)
+//   Second agent / second game at the same time: its own Chrome, e.g.
+//   node tools/bridge.mjs launch --port 9223 --url http://localhost:8091/   (then pass the same --port/--url
+//   to every command, or set CDP_PORT=9223 GAME_URL=http://localhost:8091/ in the environment)
 
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
@@ -66,7 +69,9 @@ async function launch(url = PAGE_URL, headless = false) {
   }
   const chrome = findChrome();
   if (!chrome) throw new Error('Chrome not found; set CHROME=<path to chrome executable>');
-  const profile = path.join(ROOT, '.chrome-debug-profile');
+  // one profile per CDP port: two agents can each run their own debug Chrome (no focus fights:
+  // a tab of the other session taking focus would blur this page)
+  const profile = path.resolve(opt('--profile-dir') ?? path.join(ROOT, CDP_PORT === 9222 ? '.chrome-debug-profile' : `.chrome-debug-profile-${CDP_PORT}`));
   const args = [`--remote-debugging-port=${CDP_PORT}`, `--user-data-dir=${profile}`, '--no-first-run', '--autoplay-policy=no-user-gesture-required', '--no-default-browser-check',
     // keep rAF running when the window is occluded/in background, so agents see live frames
     '--disable-background-timer-throttling', '--disable-renderer-backgrounding', '--disable-backgrounding-occluded-windows',
@@ -230,8 +235,10 @@ async function status() {
   return { chrome: v.Browser, cdp: CDP, page, engine };
 }
 
-async function withSession(fn) {
+async function withSession(fn, front = false) {
   const s = await Session.open();
+  // long-running commands need live frames: a hidden tab (another tab in front) gets no rAF
+  if (front) await s.send('Page.bringToFront').catch(() => {});
   try { return await fn(s); } finally { s.close(); }
 }
 
@@ -243,10 +250,10 @@ async function runTool(name, a = {}) {
     case 'screenshot': return { content: [{ type: 'image', data: await withSession((s) => s.screenshot()), mimeType: 'image/png' }] };
     case 'reload': return text(await withSession((s) => s.reload()));
     case 'eval_js': return text(await withSession((s) => s.eval(a.expression)));
-    case 'run_script': return text(await withSession((s) => runScript(s, a.script, { stopOnFail: !a.keep_going, outDir: a.out_dir ?? ROOT })));
-    case 'perf': return text(await withSession((s) => perf(s, { ms: a.ms, profile: !!a.profile })));
-    case 'check': return text(await withSession((s) => check(s, { flicker: !!a.flicker, strict: !!a.strict })));
-    case 'flicker': return text(await withSession((s) => flicker(s, { frames: a.frames, threshold: a.threshold })));
+    case 'run_script': return text(await withSession((s) => runScript(s, a.script, { stopOnFail: !a.keep_going, outDir: a.out_dir ?? ROOT }), true));
+    case 'perf': return text(await withSession((s) => perf(s, { ms: a.ms, profile: !!a.profile }), true));
+    case 'check': return text(await withSession((s) => check(s, { flicker: !!a.flicker, strict: !!a.strict }), true));
+    case 'flicker': return text(await withSession((s) => flicker(s, { frames: a.frames, threshold: a.threshold }), true));
     default: throw new Error(`unknown tool ${name}`);
   }
 }
@@ -308,18 +315,18 @@ try {
     case 'wait': { const r = await withSession((s) => s.waitReady(Number(opt('--timeout', 20000)))); out(r); if (!r.ready) process.exitCode = 1; break; }
     case 'console': await consoleStream(Number(opt('--ms', 3000))); break;
     case 'check': {
-      const r = await withSession((s) => check(s, { flicker: flag('--flicker'), strict: flag('--strict'), out: opt('--out') }));
+      const r = await withSession((s) => check(s, { flicker: flag('--flicker'), strict: flag('--strict'), out: opt('--out') }), true);
       out(r);
       if (!r.ok) process.exitCode = 1;
       break;
     }
     case 'perf': {
-      out(await withSession((s) => perf(s, { ms: Number(opt('--ms', 3000)), profile: flag('--profile') })));
+      out(await withSession((s) => perf(s, { ms: Number(opt('--ms', 3000)), profile: flag('--profile') }), true));
       break;
     }
     case 'flicker': {
       const num = (n, d) => (opt(n) !== undefined ? Number(opt(n)) : d);
-      const r = await withSession((s) => flicker(s, { frames: num('--frames', 6), jitter: num('--jitter', 0.2), threshold: num('--threshold', 48), out: opt('--out') }));
+      const r = await withSession((s) => flicker(s, { frames: num('--frames', 6), jitter: num('--jitter', 0.2), threshold: num('--threshold', 48), out: opt('--out') }), true);
       out(r);
       if (r.flicker_cells > 0) process.exitCode = 1;
       break;
@@ -328,7 +335,7 @@ try {
       // node tools/bridge.mjs run tests/jump.txt   |   run --commands "key Space; step 30; expect game_state.jumps == 1"
       const src = opt('--commands') ?? fs.readFileSync(rest[0], 'utf8');
       const outDir = opt('--out') ?? (rest[0] ? path.dirname(path.resolve(rest[0])) : process.cwd());
-      const r = await withSession((s) => runScript(s, src, { stopOnFail: !flag('--keep-going'), outDir }));
+      const r = await withSession((s) => runScript(s, src, { stopOnFail: !flag('--keep-going'), outDir }), true);
       out(r);
       if (!r.passed) process.exitCode = 1;
       break;

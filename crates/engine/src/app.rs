@@ -126,6 +126,8 @@ pub struct Ctx {
     pub save: crate::save::Save,
     /// Scene membership of entities, see [`crate::screens`] (`begin_scene`, `unload_scene`).
     pub scenes: crate::screens::Scenes,
+    /// Options for `load_gltf` (automatic LOD on/off, LOD distance factor).
+    pub gltf_defaults: crate::gltf_loader::GltfOpts,
     /// Procedural generators (see [`crate::geom`]).
     pub generators: crate::geom::Generators,
     /// Streaming layers + floating origin settings (see [`crate::streaming`]).
@@ -181,8 +183,15 @@ impl Ctx {
 
     /// Spawns an empty root entity now and attaches the glTF model's nodes once loaded.
     pub fn load_gltf(&mut self, url: &str, t: Transform) -> Entity {
+        let opts = self.gltf_defaults;
+        self.load_gltf_with(url, t, opts)
+    }
+
+    /// `load_gltf` with options (e.g. `GltfOpts { auto_lod: false, ..Default::default() }` for
+    /// figures that must always be drawn at full detail).
+    pub fn load_gltf_with(&mut self, url: &str, t: Transform, opts: crate::gltf_loader::GltfOpts) -> Entity {
         let name = url.rsplit('/').next().unwrap_or(url).to_string();
-        let root = self.world.spawn((t, Name(name)));
+        let root = self.world.spawn((t, Name(name), opts));
         crate::gltf_loader::request(self, url, root);
         root
     }
@@ -299,6 +308,9 @@ impl Ctx {
     /// Keyboard edge from the DOM or the AI API ("same code path"). The debug-mode toggle key is
     /// consumed here and never reaches the game.
     pub fn key_event(&mut self, code: &str, key: &str, shift: bool, down: bool, source: &str) {
+        if source == "api" {
+            self.input.note_api_key(code, down);
+        }
         let (now, step, frame) = (log::now_ms(), self.time.step, self.time.frame);
         if crate::debugmode::is_toggle(code, key, shift) {
             if down {
@@ -337,6 +349,9 @@ impl Ctx {
 
     /// Mouse-button edge from the DOM or the AI API.
     pub fn button_event(&mut self, b: MouseButton, down: bool, source: &str) {
+        if source == "api" {
+            self.input.note_api_button(b, down);
+        }
         let changed = self.input.button(b) != down;
         if down {
             self.input.button_down(b);
@@ -475,6 +490,7 @@ async fn start<G: Game>(game: G) -> Result<(), String> {
         zcheck: Default::default(),
         save: Default::default(),
         scenes: Default::default(),
+        gltf_defaults: Default::default(),
         generators: Default::default(),
         streaming: Default::default(),
         terrain: None,
@@ -788,7 +804,7 @@ fn install_input(ctx: &Rc<RefCell<Ctx>>, canvas: &HtmlCanvasElement) -> Result<(
         "blur",
         web_sys::FocusEvent,
         |c: &mut Ctx, _ev: web_sys::FocusEvent| {
-            c.input.release_all();
+            c.input.release_user(); // keys held through the AI API stay held (deterministic tests)
             c.audio.set_focused(false);
         }
     );

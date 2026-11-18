@@ -73,7 +73,16 @@ normal `cargo` output above it.
   In big worlds use `zfight {radius: 150}` — a full check over ~1M triangles takes seconds.
 - **Characters:** `call characters` = every character controller (pos, grounded, velocity, jumps, held jump,
   wish, blocked time, touching entities); `{id, pos}` places one. "stuck"/"jump blocked" warnings in the log
-  name the blocking entity.
+  name the blocking entity. Low edges and seams between boxes (where rapier's autostep does not trigger) are
+  handled by a step-up retry (lift by `step_height`, move, drop); `step_ups` counts it. Step-up lab in the demo:
+  `step_lab {height, radius, half_height, step_height, speed, lanes, start_spread}` + `step` + `characters`.
+- **LOD:** glTF primitives with ≥ 256 triangles get vertex-clustered LODs (first switch at 40x their radius).
+  Per load: `ctx.load_gltf_with(url, t, GltfOpts { auto_lod: false, .. })` or `lod_distance`; for all loads:
+  `ctx.gltf_defaults`; globally: `render {lod_bias: 2}` (far cameras). `stats.render.lod_levels` shows the mix.
+- **Input in tests:** keys/buttons held through the API (`input {key, down:true}`) survive window blur; only
+  `down:false` or `release_all` releases them. Two agents at once: give each its own Chrome
+  (`bridge launch --port 9223 --url http://localhost:8091/`, then `--port/--url` or `CDP_PORT`/`GAME_URL` on
+  every command); `run`/`perf`/`check`/`flicker` bring their tab to the front (hidden tabs get no frames).
 - **Resolution:** `render {render_scale}` (0.25..1), `auto_resolution` (default on) adapts it to
   `frame_budget_ms` of GPU time; `stats.render` has `width/height` (scene) and `canvas`.
 - **Render settings:** `call render` lists every setting; set any by name (sky, fog_*, bloom*, exposure,

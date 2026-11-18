@@ -39,7 +39,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("entities", "List entities. args: {name?: substring, limit?: 200, with?: 'mesh'|'body'|'light'|'label'|'camera'}"),
     ("entity", "Full detail of one entity. args: {id}"),
     ("set", "Modify an entity. args: {id, pos?: [x,y,z], rot?: [deg x,y,z], scale?: [x,y,z], vel?: [x,y,z], color?: '#rrggbb'}"),
-    ("spawn", "Spawn a primitive or a glTF model. args: {shape: 'cube'|'sphere', pos, size?: 1, color?: '#rrggbb', body?: 'dynamic'|'fixed'|'none', name?} or {gltf: 'assets/x.glb', pos, size?: scale}"),
+    ("spawn", "Spawn a primitive or a glTF model. args: {shape: 'cube'|'sphere', pos, size?: 1, color?: '#rrggbb', body?: 'dynamic'|'fixed'|'none', name?} or {gltf: 'assets/x.glb', pos, size?: scale, auto_lod?: bool}"),
     ("despawn", "Remove entity and children. args: {id}"),
     ("pause", "Pause simulation (rendering continues)."),
     ("resume", "Resume simulation."),
@@ -430,7 +430,11 @@ pub(crate) fn handle<G: Game>(
             if let Some(url) = a.get("gltf").and_then(|v| v.as_str()) {
                 let pos = a.get("pos").and_then(v3).unwrap_or(Vec3::ZERO);
                 let scale = a.get("size").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
-                let e = ctx.load_gltf(url, Transform::from_translation(pos).with_scale(Vec3::splat(scale)));
+                let mut opts = ctx.gltf_defaults;
+                if let Some(v) = a.get("auto_lod").and_then(|v| v.as_bool()) {
+                    opts.auto_lod = v;
+                }
+                let e = ctx.load_gltf_with(url, Transform::from_translation(pos).with_scale(Vec3::splat(scale)), opts);
                 return Ok(json!({"id": e.id(), "loading": ctx.assets_pending() > 0}));
             }
             let shape = a.get("shape").and_then(|v| v.as_str()).unwrap_or("cube");
