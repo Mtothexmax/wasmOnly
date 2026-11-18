@@ -18,6 +18,7 @@ node tools/make-sample-assets.mjs   # einmalig: tree.glb, crate.glb, rock.obj er
 node tools/dev.mjs watch            # bauen, http://localhost:8080 ausliefern, bei Änderungen neu bauen und neu laden
 node tools/bridge.mjs launch        # Chrome mit Remote-Debugging (Port 9222) öffnen, stumm (--sound für Ton)
 node tools/bridge.mjs call stats    # Engine abfragen
+node tools/dev.mjs build --check    # Build + Check (Z-Fighting, Engine-Fehler) im Debug-Chrome
 ```
 
 Langsames Netz testen: `curl -X POST "http://localhost:8080/__throttle?kbps=48&match=assets/music"` drosselt
@@ -61,6 +62,7 @@ Chrome-Erweiterung „C/C++ DevTools Support (DWARF)“ setzt du Breakpoints dir
 | Threads | Optionales Backend: Web-Worker-Pool (rayon über `wasm-bindgen-rayon`), Shared Memory (SharedArrayBuffer), Atomics. Die Job-API `engine::jobs` ist in beiden Builds gleich | ✅ · Asset-Aufbereitung in Workern fehlt |
 | Build | `tools/dev.mjs` (cargo + wasm-bindgen, `wasm-opt` falls vorhanden). Toolchains festgelegt: Stable 1.99.0, Thread-Backend nightly-2026-11-01 | ✅ |
 | AI-Tooling | `window.engine.call`, strukturierte Logs, deterministisches Stepping, CDP-Bridge, MCP, `.claude/`-Skills | ✅ |
+| Z-Fighting / Flackern | `engine.call("zfight")` findet koplanare, überlappende Flächen verschiedener Objekte (läuft im Debug-Build automatisch nach Szenenänderungen und warnt im Log). `bridge flicker` vergleicht Screenshots mit umgekehrter Zeichenreihenfolge und verschobener Tiefenabbildung (Pixel bleiben stehen) und nennt die flackernden Objekte. `bridge check` / `dev.mjs build --check` ist der Build-Check (Exit-Code 1 bei Problemen) | ✅ |
 | Debug-Modus | Taste <kbd>`</kbd> (Taste links neben 1, auf deutschen Tastaturen <kbd>^</kbd> oder Shift+´): protokolliert jeden Tasten- und Mausdruck und einmal pro Sekunde die Kamera als JSON-Zeilen in `logs/debug-JJJJMMTT-hhmmss.log` (über den Dev-Server), zeigt ein DEBUG-Badge | ✅ |
 
 ## Architektur
@@ -155,5 +157,5 @@ die nur bindgen auf 0.72 anhebt (eingebunden über `[patch.crates-io]`).
 
 `engine.call("help")` listet alle Befehle. Die wichtigsten: `stats`, `entities`, `entity`, `set`,
 `spawn`, `despawn`, `pause`, `resume`, `step`, `time_scale`, `seed`, `input`, `logs`, `render`,
-`camera`, `raycast`, `pick`, `ui`, `debug_mode`, `music`, `panels`, `panel_click`, `audio`, `audio_play`, `audio_stop`, `audio_set`, `sfx`, `texgen`,
+`camera`, `raycast`, `pick`, `ui`, `debug_mode`, `music`, `zfight`, `panels`, `panel_click`, `audio`, `audio_play`, `audio_stop`, `audio_set`, `sfx`, `texgen`,
 `assets`, `game_state` und die eigenen Befehle des Spiels. Siehe [AGENTS.md](AGENTS.md).

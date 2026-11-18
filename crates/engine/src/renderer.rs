@@ -202,6 +202,16 @@ pub struct RenderSettings {
     pub gpu_culling: bool,
     /// Hi-Z occlusion culling inside the GPU culling pass (previous frame's depth).
     pub occlusion_culling: bool,
+    /// World-space offset added to the camera position (flicker detection: tiny shifts between
+    /// screenshots reveal z-fighting and shimmering).
+    pub camera_jitter: Vec3,
+    /// Freeze the shader clock (water animation) so consecutive screenshots are comparable.
+    pub freeze_time: bool,
+    /// Relative change of the camera near plane. Moves depth values only, never pixel positions:
+    /// the image stays identical except where two surfaces tie in depth (z-fighting flips).
+    pub depth_jitter: f32,
+    /// Draw opaque instances in reverse order (flicker scan: exact depth ties change their winner).
+    pub reverse_draw_order: bool,
     /// 0 = lit, 1 = normals, 2 = shadow term.
     pub debug_view: u32,
 }
@@ -219,6 +229,10 @@ impl Default for RenderSettings {
             shadow_extent: 30.0,
             gpu_culling: true,
             occlusion_culling: true,
+            camera_jitter: Vec3::ZERO,
+            freeze_time: false,
+            depth_jitter: 0.0,
+            reverse_draw_order: false,
             debug_view: 0,
         }
     }
@@ -329,6 +343,9 @@ impl Lod {
     }
 }
 
+/// CPU copy of a mesh: positions and triangle indices.
+pub type CpuMesh = (Vec<[f32; 3]>, Vec<u32>);
+
 pub struct GpuMesh {
     pub name: String,
     vb: GpuBuffer,
@@ -337,6 +354,9 @@ pub struct GpuMesh {
     pub vertex_count: u32,
     pub bounds_center: Vec3,
     pub bounds_radius: f32,
+    /// CPU copy (positions, indices) for analysis tools such as the z-fighting check; kept for
+    /// meshes up to 60k indices.
+    pub cpu: Option<std::rc::Rc<CpuMesh>>,
 }
 
 pub struct Renderer {
@@ -382,6 +402,7 @@ pub struct Renderer {
     mat_groups: std::collections::HashMap<(u32, u32, u32), GpuBindGroup>,
     /// Seconds since start (water animation).
     start_ms: f64,
+    frozen_time: Option<f32>,
     /// GPU texture objects parallel to `textures` (for updates + mip generation).
     tex_objects: Vec<TexInfo>,
     mip_pipeline: GpuRenderPipeline,
@@ -766,6 +787,7 @@ impl Renderer {
             flat_normal: None,
             mat_groups: std::collections::HashMap::new(),
             start_ms: crate::log::now_ms(),
+            frozen_time: None,
             tex_objects: vec![],
             mip_pipeline,
             mip_pipeline_linear,
@@ -1147,6 +1169,7 @@ impl Renderer {
             vertex_count: data.vertices.len() as u32,
             bounds_center: c,
             bounds_radius: r,
+            cpu: (data.indices.len() <= 60_000).then(|| std::rc::Rc::new((data.vertices.iter().map(|v| v.pos).collect(), data.indices.clone()))),
         });
         MeshId(self.meshes.len() as u32 - 1)
     }
@@ -1254,10 +1277,21 @@ impl Renderer {
             .iter()
             .next()
             .map(|(c, g)| {
-                let view = g.0.inverse();
-                let proj = Mat4::perspective_rh(c.fov_y_deg.to_radians(), aspect, c.near, c.far);
+                let view = (Mat4::from_translation(self.settings.camera_jitter) * g.0).inverse();
+                let proj = Mat4::perspective_rh(c.fov_y_deg.to_radians(), aspect, c.near * (1.0 + self.settings.depth_jitter), c.far);
                 (view, proj, g.translation())
             })
+    }
+
+    /// Seconds for shader animation; stops while `settings.freeze_time` is set.
+    fn shader_time(&mut self) -> f32 {
+        let now = ((crate::log::now_ms() - self.start_ms) / 1000.0) as f32;
+        if self.settings.freeze_time {
+            *self.frozen_time.get_or_insert(now)
+        } else {
+            self.frozen_time = None;
+            now
+        }
     }
 
     pub fn render(&mut self, world: &World) -> Result<(), String> {
@@ -1312,7 +1346,8 @@ impl Renderer {
             ground_color: s.ground_color.extend(1.0).into(),
             counts: [n_lights as u32, s.shadows as u32, s.debug_view, 0],
             point_lights,
-            time: [((crate::log::now_ms() - self.start_ms) / 1000.0) as f32, near, far, 0.0],
+            // near must match the projection (depth_jitter) or water depth would shift with it
+            time: [self.shader_time(), near * (1.0 + self.settings.depth_jitter), far, 0.0],
         };
         self.queue
             .write_buffer_with_u32_and_u8_slice(&self.globals_buf, 0, bytemuck::bytes_of(&globals))
@@ -1423,6 +1458,9 @@ impl Renderer {
             c.3.normal = normals[c.4 as usize];
         }
         visible.sort_by_key(|v| (v.0, v.1, v.2));
+        if self.settings.reverse_draw_order {
+            visible.reverse();
+        }
         blended.sort_by(|a, b| b.0.total_cmp(&a.0)); // far -> near
         casters.sort_by_key(|c| (c.0, c.1, c.2));
 

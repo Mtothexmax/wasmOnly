@@ -190,11 +190,14 @@ impl Game for Tumble {
             for k in 0..segments {
                 let a = k as f32 / segments as f32 * std::f32::consts::TAU;
                 let r = POND_R + 0.3;
-                let p = POND + Vec3::new(a.cos() * r, 0.28, a.sin() * r);
+                // Neighbouring stones overlap at their ends, so their faces must not share a plane
+                // (z-fighting, found by engine.call("zfight")): every other stone is taller and sits deeper.
+                let (bottom, top) = if k % 2 == 0 { (0.0, 0.56) } else { (-0.05, 0.64) };
+                let p = POND + Vec3::new(a.cos() * r, (bottom + top) * 0.5, a.sin() * r);
                 let rot = Quat::from_rotation_y(-a + std::f32::consts::FRAC_PI_2);
-                let t = Transform::from_translation(p).with_rotation(rot).with_scale(Vec3::new(1.02, 0.56, 0.6));
+                let t = Transform::from_translation(p).with_rotation(rot).with_scale(Vec3::new(1.02, top - bottom, 0.6 + (k % 2) as f32 * 0.04));
                 let e = ctx.spawn_mesh("pond-rim", ctx.renderer.builtin.cube, rim_mat, t);
-                ctx.physics.add(&mut ctx.world, e, RigidBodyBuilder::fixed(), ColliderBuilder::cuboid(0.51, 0.28, 0.3));
+                ctx.physics.add(&mut ctx.world, e, RigidBodyBuilder::fixed(), ColliderBuilder::cuboid(0.51, (top - bottom) * 0.5, 0.3));
             }
             let pebbles = ctx.generate_maps(&TexGen::new(TexPreset::Dirt).size(256).seed(21).scale(1.4), 3.0);
             let bed_mesh = ctx.renderer.add_mesh("pond-bed", &engine::mesh::MeshData::disk(POND_R + 0.1, 32, 64, 3.0));

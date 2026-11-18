@@ -25,6 +25,7 @@ pub mod scene;
 pub mod texgen;
 pub mod touch;
 pub mod ui;
+pub mod zfight;
 
 pub use app::{run, Ctx, Game, Time};
 pub use glam;

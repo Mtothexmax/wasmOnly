@@ -12,6 +12,11 @@
 //   node tools/bridge.mjs reload                     reload page, wait for engine-ready, report errors
 //   node tools/bridge.mjs wait [--timeout 20000]     wait until window.engine.ready
 //   node tools/bridge.mjs console [--ms 3000]        stream console/exception events for N ms
+//   node tools/bridge.mjs check [--flicker] [--strict] [--out heat.png]
+//                                                    build check: reload, assets, z-fighting, log errors
+//                                                    (exit 1 on problems; --strict also fails on warnings)
+//   node tools/bridge.mjs flicker [--frames 6] [--jitter 0.2] [--threshold 48] [--out heat.png]
+//                                                    screenshots with flipped draw order + perturbed depth -> flickering regions
 //   node tools/bridge.mjs mcp                        run as MCP server (stdio) — see .mcp.json
 //
 // Options: --port 9222 (CDP port), --url <page url to target/open>
@@ -21,6 +26,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { check, flicker } from './qa.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const argv = process.argv.slice(2);
@@ -192,6 +198,10 @@ const TOOLS = [
     inputSchema: { type: 'object', properties: { name: { type: 'string' }, args: { type: 'object' } }, required: ['name'] } },
   { name: 'screenshot', description: 'PNG screenshot of the game page.', inputSchema: { type: 'object', properties: {} } },
   { name: 'reload', description: 'Reload the page (e.g. after a rebuild) and wait for engine-ready; returns warnings/errors from the engine log.', inputSchema: { type: 'object', properties: {} } },
+  { name: 'check', description: 'Build check: reload, wait for assets, z-fighting test, engine warnings/errors (optionally a flicker scan). Returns ok + details.',
+    inputSchema: { type: 'object', properties: { flicker: { type: 'boolean' }, strict: { type: 'boolean' } } } },
+  { name: 'flicker', description: 'Flicker scan: several screenshots alternating draw order and depth mapping (time frozen, HUD hidden, pixels stay put); returns flickering regions with the entity under each (z-fighting, shadow acne, shimmering).',
+    inputSchema: { type: 'object', properties: { frames: { type: 'number' }, threshold: { type: 'number' } } } },
   { name: 'eval_js', description: 'Evaluate a JavaScript expression in the page (promises awaited, result returned by value).',
     inputSchema: { type: 'object', properties: { expression: { type: 'string' } }, required: ['expression'] } },
 ];
@@ -223,6 +233,8 @@ async function runTool(name, a = {}) {
     case 'screenshot': return { content: [{ type: 'image', data: await withSession((s) => s.screenshot()), mimeType: 'image/png' }] };
     case 'reload': return text(await withSession((s) => s.reload()));
     case 'eval_js': return text(await withSession((s) => s.eval(a.expression)));
+    case 'check': return text(await withSession((s) => check(s, { flicker: !!a.flicker, strict: !!a.strict })));
+    case 'flicker': return text(await withSession((s) => flicker(s, { frames: a.frames, threshold: a.threshold })));
     default: throw new Error(`unknown tool ${name}`);
   }
 }
@@ -258,7 +270,7 @@ function mcp() {
 
 // ------------------------------------------------------------------------------------------------
 const out = (v) => console.log(JSON.stringify(v, null, 2));
-const positional = argv.filter((a, i) => !a.startsWith('--') && !(i > 0 && argv[i - 1].startsWith('--') && !['--headless', '--release'].includes(argv[i - 1])));
+const positional = argv.filter((a, i) => !a.startsWith('--') && !(i > 0 && argv[i - 1].startsWith('--') && !['--headless', '--release', '--sound', '--flicker', '--strict'].includes(argv[i - 1])));
 const [cmd, ...rest] = positional;
 
 try {
@@ -283,9 +295,22 @@ try {
     case 'reload': { const r = await withSession((s) => s.reload()); out(r); if (!r.ready) process.exitCode = 1; break; }
     case 'wait': { const r = await withSession((s) => s.waitReady(Number(opt('--timeout', 20000)))); out(r); if (!r.ready) process.exitCode = 1; break; }
     case 'console': await consoleStream(Number(opt('--ms', 3000))); break;
+    case 'check': {
+      const r = await withSession((s) => check(s, { flicker: flag('--flicker'), strict: flag('--strict'), out: opt('--out') }));
+      out(r);
+      if (!r.ok) process.exitCode = 1;
+      break;
+    }
+    case 'flicker': {
+      const num = (n, d) => (opt(n) !== undefined ? Number(opt(n)) : d);
+      const r = await withSession((s) => flicker(s, { frames: num('--frames', 6), jitter: num('--jitter', 0.2), threshold: num('--threshold', 48), out: opt('--out') }));
+      out(r);
+      if (r.flicker_cells > 0) process.exitCode = 1;
+      break;
+    }
     case 'mcp': mcp(); break;
     default:
-      console.error('usage: node tools/bridge.mjs launch|status|call|eval|screenshot|reload|wait|console|mcp  (see header of this file)');
+      console.error('usage: node tools/bridge.mjs launch|status|call|eval|screenshot|reload|wait|console|check|flicker|mcp  (see header of this file)');
       process.exitCode = 2;
   }
 } catch (e) {

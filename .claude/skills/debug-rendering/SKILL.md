@@ -32,6 +32,29 @@ node tools/bridge.mjs call assets     # model failed / pending?
 - `visible: 0` with entities present → camera or culling (bounding sphere / scale).
 - Entity exists, model `pending` forever → fetch path wrong (`assets/…` relative to `dist/`).
 
+## Flicker / z-fighting
+
+Still screenshots hide z-fighting. Ask the engine instead:
+
+```bash
+node tools/bridge.mjs call zfight            # {"pairs": N, "worst": [{a, b, triangle_pairs, point, screen}]}
+```
+
+Coplanar overlapping faces of different entities (opaque/masked; blended, water and vertex-displaced
+meshes are skipped). Debug builds also run it automatically after scene changes and log a warning.
+
+For everything else that flickers (water, displaced meshes, shadow acne):
+
+```bash
+node tools/bridge.mjs flicker --out <scratch>/heat.png   # regions: [{x, y, pixels, entity, depth_ties}]
+node tools/bridge.mjs call pick '{"x":708,"y":292,"mesh":true}'   # what is drawn there + depth-tie partners
+```
+
+The scan pauses the game, freezes shader time, hides the HUD and uses the CPU draw path; frames
+alternate draw order and the near plane (`render {reverse_draw_order, depth_jitter}`), so pixels never
+move — only depth ties change colour. A clean scene gives exactly 0 flicker pixels. Typical causes: modular pieces overlapping at their ends, decals/planes placed
+exactly on a surface, duplicated entities. Fix the geometry (offset ≥ 1–2 mm, different heights, inset).
+
 ## 3. Visual debug views
 
 ```bash

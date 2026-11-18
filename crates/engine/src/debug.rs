@@ -36,11 +36,12 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("seed", "Reseed the engine RNG (ctx.rng). args: {value}"),
     ("input", "Inject input. args: {key?: 'KeyW', down?: bool} | {button?: 0|1|2, down?} | {x?, y?: pointer position, CSS px} | {dx?, dy?} | {action?: 'ui-action'} | {touch: {id, x, y, phase: 'start'|'move'|'end'}} | {release_all: true}. Returns keys, buttons and touch gestures"),
     ("logs", "Structured log entries. args: {since?: seq, level?: 'debug'|'info'|'warn'|'error', limit?: 100}"),
-    ("render", "Get/set render settings. args: {shadows?, debug_view?: 0|1|2, sun_dir?, sun_intensity?, shadow_extent?, clear_color?, gpu_culling?, occlusion_culling?}. Result includes gpu_culling_supported."),
+    ("render", "Get/set render settings. args: {shadows?, debug_view?: 0|1|2, sun_dir?, sun_intensity?, shadow_extent?, clear_color?, gpu_culling?, occlusion_culling?, camera_jitter?: [x,y,z], depth_jitter?: relative near-plane change, reverse_draw_order?, freeze_time?}. Result includes gpu_culling_supported."),
     ("camera", "Camera pose + projection; args {pos?, look_at?} moves it."),
     ("raycast", "Physics ray cast. args: {origin, dir, max?: 1000}"),
-    ("pick", "Entity under a canvas point (CSS px). args: {x, y}"),
+    ("pick", "Entity under a canvas point (CSS px). args: {x, y, mesh?: true = test rendered meshes instead of physics colliders; also returns depth_ties (z-fighting partners)}"),
     ("ui", "HUD slot contents."),
+    ("zfight", "Find z-fighting: coplanar, same-facing, overlapping triangles of different entities (opaque/masked). args: {eps?: 0.002 plane distance, tolerance?: 0.002 overlap, limit?: 50}. Returns pair count and the worst pairs with entities, world point and screen position."),
     ("debug_mode", "Debug mode (also the ` key): logs every key/mouse press and the camera pose once per second to logs/debug-*.log via the dev server, shows a badge. args: {on?: bool}. Returns file, line counts, last camera, last error."),
     ("audio", "Audio state: context state, sounds (ready/loading/failed, plays), active voices with 3D position, last 32 plays with sim step."),
     ("audio_play", "Play a sound by name. args: {sound, volume?: 1, pitch?: 1, pos?: [x,y,z], loop?, lowpass?: hz, highpass?: hz, bandpass?: [hz,q], echo?: [delay_s, feedback, mix?], reverb?: secs | [secs, mix], distort?: drive, pan?: -1..1, detune?: cents}. Returns the voice id."),
@@ -573,6 +574,18 @@ pub(crate) fn handle<G: Game>(
             if let Some(v) = a.get("occlusion_culling").and_then(|v| v.as_bool()) {
                 s.occlusion_culling = v;
             }
+            if let Some(v) = a.get("camera_jitter").and_then(v3) {
+                s.camera_jitter = v;
+            }
+            if let Some(v) = a.get("reverse_draw_order").and_then(|v| v.as_bool()) {
+                s.reverse_draw_order = v;
+            }
+            if let Some(v) = a.get("depth_jitter").and_then(|v| v.as_f64()) {
+                s.depth_jitter = v as f32;
+            }
+            if let Some(v) = a.get("freeze_time").and_then(|v| v.as_bool()) {
+                s.freeze_time = v;
+            }
             let mut out = json!(ctx.renderer.settings);
             out["gpu_culling_supported"] = json!(ctx.renderer.gpu_culling_supported);
             Ok(out)
@@ -611,6 +624,14 @@ pub(crate) fn handle<G: Game>(
             let x = a.get("x").and_then(|v| v.as_f64()).ok_or("missing 'x'")? as f32;
             let y = a.get("y").and_then(|v| v.as_f64()).ok_or("missing 'y'")? as f32;
             let (o, d) = ctx.screen_ray(Vec2::new(x, y)).ok_or("no camera")?;
+            if a.get("mesh").and_then(|v| v.as_bool()).unwrap_or(false) {
+                // what is drawn (meshes), plus entities whose surface ties in depth (z-fighting)
+                return Ok(match crate::zfight::ray_pick(&ctx.world, &ctx.renderer, o, d, 0.002) {
+                    Some((e, t, ties)) => json!({"hit": true, "entity": entity_summary(ctx, e), "point": arr(o + d.normalize() * t),
+                        "depth_ties": ties.iter().map(|t| entity_summary(ctx, *t)).collect::<Vec<_>>()}),
+                    None => json!({"hit": false}),
+                });
+            }
             Ok(match ctx.physics.raycast(o, d, 1000.0) {
                 Some(h) => {
                     json!({"hit": true, "entity": h.entity.map(|e| entity_summary(ctx, e)), "point": arr(h.point)})
@@ -619,6 +640,14 @@ pub(crate) fn handle<G: Game>(
             })
         }
         "ui" => Ok(json!({"slots": ctx.ui.slots()})),
+        "zfight" => {
+            let eps = a.get("eps").and_then(|v| v.as_f64()).unwrap_or(0.002) as f32;
+            let tol = a.get("tolerance").and_then(|v| v.as_f64()).unwrap_or(0.002) as f32;
+            let limit = a.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+            crate::scene::propagate_transforms(&mut ctx.world);
+            let css = Vec2::new(ctx.canvas.client_width() as f32, ctx.canvas.client_height() as f32);
+            Ok(crate::zfight::find(&ctx.world, &ctx.renderer, eps, tol, limit, ctx.renderer.last_view_proj, css))
+        }
         "debug_mode" => {
             if let Some(on) = a.get("on").and_then(|v| v.as_bool()) {
                 let (now, step, frame) = (log::now_ms(), ctx.time.step, ctx.time.frame);

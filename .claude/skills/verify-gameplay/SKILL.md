@@ -83,5 +83,6 @@ deltas between lines) to reproduce deterministically. AI-injected input is logge
 ## Done means
 
 - The asserted JSON changed as expected,
+- `call zfight` reports `"pairs": 0` if you added or moved geometry,
 - `logs` since the action has no `warn`/`error`,
 - the game is resumed (`call resume`) so the user sees it running.

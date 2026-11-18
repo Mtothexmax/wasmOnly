@@ -95,6 +95,8 @@ pub struct Ctx {
     pub panels: Panels,
     /// Web Audio (see [`crate::audio`]).
     pub audio: Audio,
+    /// Automatic z-fighting check (debug builds), see [`crate::zfight::AutoCheck`].
+    pub zcheck: crate::zfight::AutoCheck,
     /// Debug mode (` key): input + camera log file, badge (see [`crate::debugmode`]).
     pub debug_mode: crate::debugmode::DebugMode,
     pub time: Time,
@@ -378,6 +380,7 @@ async fn start<G: Game>(game: G) -> Result<(), String> {
         panels: Panels::default(),
         audio: Audio::default(),
         debug_mode: Default::default(),
+        zcheck: Default::default(),
         time: Time {
             fixed_dt: 1.0 / 60.0,
             step: 0,
@@ -513,6 +516,11 @@ fn frame<G: Game>(c: &mut Ctx, game: &mut G, dt: f32) {
     game.update(c, dt);
     scene::propagate_transforms(&mut c.world);
     c.panels.flush(&mut c.renderer);
+    {
+        let pending = c.models.pending.len();
+        let Ctx { zcheck, world, renderer, .. } = c;
+        zcheck.tick(world, renderer, pending, log::now_ms());
+    }
     {
         let cam = c
             .world

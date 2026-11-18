@@ -15,6 +15,8 @@ node tools/bridge.mjs launch        # Chrome with CDP on :9222, opens the game (
 node tools/bridge.mjs reload        # after a rebuild: reload, wait for engine-ready, prints warnings/errors
 node tools/bridge.mjs call help     # list every engine + game command
 node tools/bridge.mjs screenshot out.png
+node tools/bridge.mjs check          # build check: reload, assets, z-fighting, engine errors (exit 1 = fail)
+node tools/dev.mjs build --check     # build + check in one step (watch --check: after every rebuild)
 ```
 
 Or use the MCP server (`.mcp.json` registers `wasmonly`): tools `launch_chrome`, `status`,
@@ -37,6 +39,14 @@ normal `cargo` output above it.
 - **Errors:** Rust panics, WebGPU validation errors and WGSL compile errors (with line numbers)
   all land in the log at level `error` and in a red overlay (`#engine-error`). Startup failures
   set `window.engine.fatal`.
+- **Z-fighting / flicker:** a screenshot cannot show flicker. Three layers:
+  1. debug builds run the z-fighting test automatically after scene changes and log a warning
+     (shows up in `bridge reload` / `check`);
+  2. `call zfight` — geometric test, names both entities, world point, screen position; must be `"pairs": 0`;
+  3. `node tools/bridge.mjs flicker --out heat.png` — screenshots with flipped draw order and shifted depth
+     mapping (pixels stay put), returns flickering regions + entity + `depth_ties` partner; catches what the
+     geometric test skips (water, displaced meshes). `check --flicker` includes it.
+  Fix by offsetting one surface (height, inset) instead of relying on depth bias.
 - **Visual checks:** `render '{"debug_view":1}'` = normals, `2` = shadow term, `0` = lit.
 - **3D UI:** `call panels` gives every world-panel widget with its on-screen centre (`screen`, CSS px);
   click it for real with `input {x,y}` + `input {button:0}`, or directly with `panel_click {id, widget}`.

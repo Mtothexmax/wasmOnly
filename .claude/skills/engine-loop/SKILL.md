@@ -43,6 +43,8 @@ First time on a fresh clone: `node tools/make-sample-assets.mjs` (creates demo a
    A non-empty `warnings_and_errors` means the change is not done.
 3. Check `node tools/bridge.mjs call stats` (fps, entity/body counts, draw calls).
 4. Prove the behaviour with the verify-gameplay skill.
+5. Before you call it done: `node tools/bridge.mjs check` (or run the watcher as `watch --check`) — exit 0,
+   `zfight.pairs` 0, no errors. Use `check --flicker` after visual/geometry work.
 
 ## Command cheat sheet
 

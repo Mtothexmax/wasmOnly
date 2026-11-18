@@ -6,6 +6,9 @@
 //     from Cargo.toml [workspace.metadata.wasmonly] threads-toolchain + build-std; output in target/threads.
 //   node tools/dev.mjs serve [--port 8080]               -> static server for dist/ (+ /__events live reload)
 //   node tools/dev.mjs watch [--game demo] [--port 8080] -> build, serve, rebuild + reload on change
+//   --check (build/watch): after each successful build run `bridge check` in the debug Chrome
+//     (reload, assets, z-fighting, engine errors; --flicker adds the flicker scan) and print
+//     {"check":{...}}. build exits 1 if the check fails. Skipped when no Chrome is listening.
 //
 // POST /__throttle?kbps=64&match=assets/music slows responses whose path contains `match` (test
 // streaming/slow networks; kbps=0 turns it off). GET /__throttle shows the setting.
@@ -121,6 +124,23 @@ export function build() {
   return true;
 }
 
+/** Post-build check in the debug Chrome (tools/bridge.mjs check). Returns true when ok or skipped. */
+export function runCheck() {
+  const args = [path.join(ROOT, 'tools', 'bridge.mjs'), 'check'];
+  if (flag('--flicker')) args.push('--flicker');
+  if (flag('--strict')) args.push('--strict');
+  const r = spawnSync(process.execPath, args, { cwd: ROOT, encoding: 'utf8' });
+  let res;
+  try { res = JSON.parse(r.stdout); } catch { res = null; }
+  if (!res || res.error?.includes?.('ECONNREFUSED') || (res.error && !('ok' in res))) {
+    console.log(JSON.stringify({ check: 'skipped', reason: res?.error ?? (r.stderr || 'no output').trim().slice(0, 200) }));
+    return true;
+  }
+  const summary = { ok: res.ok, zfight_pairs: res.zfight?.pairs, errors: res.errors, warnings: res.warnings, flicker_cells: res.flicker?.flicker_cells, worst: res.zfight?.worst?.slice(0, 3) };
+  console.log(JSON.stringify({ check: summary }));
+  return res.ok;
+}
+
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.wasm': 'application/wasm', '.json': 'application/json',
   '.glb': 'model/gltf-binary', '.gltf': 'model/gltf+json', '.png': 'image/png', '.jpg': 'image/jpeg', '.webp': 'image/webp',
   '.svg': 'image/svg+xml', '.css': 'text/css', '.ktx2': 'image/ktx2', '.mp3': 'audio/mpeg', '.ogg': 'audio/ogg', '.wav': 'audio/wav' };
@@ -222,7 +242,10 @@ function watch() {
       building = true;
       const ok = build();
       building = false;
-      if (ok) reloadClients();
+      if (ok) {
+        if (flag('--check')) runCheck(); // reloads the debug page itself
+        else reloadClients();
+      }
       if (again) { again = false; trigger(); }
     }, 200);
   };
@@ -234,7 +257,7 @@ function watch() {
   console.log('watching crates/ games/ web/ ...');
 }
 
-if (cmd === 'build') process.exit(build() ? 0 : 1);
+if (cmd === 'build') process.exit(build() && (!flag('--check') || runCheck()) ? 0 : 1);
 else if (cmd === 'serve') serve();
 else if (cmd === 'watch') watch();
 else { console.error('usage: node tools/dev.mjs build|serve|watch [--game demo] [--release] [--port 8080]'); process.exit(2); }
