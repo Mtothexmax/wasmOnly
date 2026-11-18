@@ -1,0 +1,20 @@
+# Shadow cache: a still scene renders no shadow pass, moving renders cascade 0 (and refreshes the others).
+# (something animated near the camera keeps cascade 0 busy in the demo, so "still" means >= 2 of 4 cached)
+# Run: node tools/bridge.mjs run games/demo/tests/shadowcache.txt
+reload
+screen play
+pause
+call render {"shadow_cache":true,"particles":false}
+call sky {"time":15.5,"day_length":0}
+frames 20
+expect stats.render.shadow_passes_cached >= 2
+expect stats.render.shadow_passes_rendered <= 2
+down KeyW
+step 20
+frames 2
+up KeyW
+call render {"shadow_cache":false}
+frames 3
+expect stats.render.shadow_passes_cached == 0
+expect stats.render.shadow_passes_rendered >= 1
+call render {"shadow_cache":true,"particles":true}

@@ -21,6 +21,19 @@ const SHADOW_FORMAT: GpuTextureFormat = GpuTextureFormat::Depth32float;
 pub const AUTO_LOD_FACTOR: f32 = 40.0;
 /// Shadow cascades (layers of the shadow map array).
 const MAX_CASCADES: usize = 4;
+
+/// Content of one shadow-map layer: matrix, light-space sphere it covers, caster hash.
+#[derive(Clone, Copy, Default)]
+struct ShadowLayer {
+    valid: bool,
+    mat: Mat4,
+    texel: f32,
+    dir: Vec3,
+    center: Vec3,
+    radius: f32,
+    content: u64,
+    frame: u64,
+}
 /// Uniform slot stride for per-cascade matrices (minUniformBufferOffsetAlignment).
 const CASCADE_SLOT: u32 = 256;
 
@@ -247,6 +260,15 @@ pub struct RenderSettings {
     /// Cross-fade between the old and new shadow direction at each step (ms; 0 = jump). Renders the
     /// cascades twice while fading (a second shadow-map set is allocated on first use).
     pub shadow_fade_ms: f32,
+    /// Shadow cache: a cascade is re-rendered only when its matrix or its casters changed. Far
+    /// cascades (1..) are fitted with a margin and reused while the camera moves inside it; when
+    /// only casters moved, they refresh every `shadow_refresh` frames (cascade 0 every frame).
+    pub shadow_cache: bool,
+    /// Frames between refreshes of cascades 1, 2, 3 when only their casters changed.
+    pub shadow_refresh: [u32; 3],
+    /// Extra radius of cascades 1.. with the cache on (fraction), so a cached map still covers the
+    /// slice after the camera moved.
+    pub shadow_margin: f32,
     /// Light clusters cover depths up to this distance (lights beyond use the last slice).
     pub light_cluster_far: f32,
     /// Cull on the GPU (compute) and draw with drawIndexedIndirect (needs indirect-first-instance).
@@ -257,6 +279,9 @@ pub struct RenderSettings {
     /// triangles: building the depth pyramid costs a fixed ~0.4 ms of GPU time at 1440p, more than
     /// culling a small scene can save (early-Z already rejects the hidden fragments).
     pub occlusion_min_triangles: u32,
+    /// Hi-Z switches itself off for 5 s when it culls less than this fraction of the opaque
+    /// candidates (averaged over 1 s; a top-down view hides little), then probes again. 0 = never.
+    pub occlusion_min_ratio: f32,
     /// World-space offset added to the camera position (flicker detection: tiny shifts between
     /// screenshots reveal z-fighting and shimmering).
     pub camera_jitter: Vec3,
@@ -378,10 +403,14 @@ impl Default for RenderSettings {
             shadow_split_lambda: 0.8,
             shadow_step_deg: 0.5,
             shadow_fade_ms: 400.0,
+            shadow_cache: true,
+            shadow_refresh: [2, 3, 4],
+            shadow_margin: 0.08,
             light_cluster_far: 400.0,
             gpu_culling: true,
             occlusion_culling: true,
             occlusion_min_triangles: 100_000,
+            occlusion_min_ratio: 0.08,
             camera_jitter: Vec3::ZERO,
             freeze_time: false,
             depth_jitter: 0.0,
@@ -449,6 +478,11 @@ pub struct FrameStats {
     pub shadow_fade: f32,
     pub draw_calls: u32,
     pub shadow_draw_calls: u32,
+    /// Shadow passes rendered this frame (the others reused their cached map).
+    pub shadow_passes_rendered: u32,
+    pub shadow_passes_cached: u32,
+    /// Hi-Z occlusion culling ran this frame (off: too little geometry, or auto off).
+    pub hiz_active: bool,
     pub visible: u32,
     pub culled: u32,
     pub triangles: u64,
@@ -607,6 +641,8 @@ pub struct GpuMesh {
     pub cpu: Option<std::rc::Rc<CpuMesh>>,
     /// Full CPU copy (positions, normals, UVs) for static batching; same size limit as `cpu`.
     pub data: Option<std::rc::Rc<MeshData>>,
+    /// Bumped by every vertex update (skinning, morphs): the shadow cache sees deformed meshes.
+    pub version: u32,
 }
 
 pub struct Renderer {
@@ -659,6 +695,12 @@ pub struct Renderer {
     shadow_cur_set: u32,
     shadow_fade: Option<(Vec3, f64)>,
     shadow_step_count: u32,
+    /// Per shadow-map layer: what it currently holds (see `RenderSettings::shadow_cache`).
+    shadow_cache: [ShadowLayer; 2 * MAX_CASCADES],
+    shadow_frame: u64,
+    /// Hi-Z auto off: main-view frame count, frames since it was (re)enabled, occluded and
+    /// candidate sums of the current probe window, frame until which it stays off.
+    hiz_auto: (u64, u32, u64, u64, u64),
     cascade_buf: GpuBuffer,
     /// Clustered lighting buffers (lights, cluster grid, light index list).
     light_bufs: LightBufs,
@@ -1157,6 +1199,9 @@ impl Renderer {
             shadow_cur_set: 0,
             shadow_fade: None,
             shadow_step_count: 0,
+            shadow_cache: Default::default(),
+            shadow_frame: 0,
+            hiz_auto: (0, 0, 0, 0, 0),
             cascade_buf,
             light_bufs,
             shadow_sampler,
@@ -1294,6 +1339,11 @@ impl Renderer {
         (full, shadow)
     }
 
+    /// Forget what the shadow layers hold (reallocated, or overwritten by another view).
+    fn invalidate_shadow_cache(&mut self) {
+        self.shadow_cache = Default::default();
+    }
+
     /// Shadow-map array with `sets` x MAX_CASCADES layers (+ one attachment view per layer).
     fn make_shadow_maps(device: &GpuDevice, size: u32, sets: u32) -> Result<(GpuTextureView, Vec<GpuTextureView>), String> {
         let layers = sets * MAX_CASCADES as u32;
@@ -1324,6 +1374,7 @@ impl Renderer {
                 self.shadow_view = view;
                 self.shadow_layers = layers;
                 self.shadow_sets = 2;
+                self.shadow_cache = Default::default();
                 self.rebuild_bind0();
                 true
             }
@@ -1725,6 +1776,7 @@ impl Renderer {
             bounds_radius: r,
             cpu: (data.indices.len() <= 60_000).then(|| std::rc::Rc::new((data.vertices.iter().map(|v| v.pos).collect(), data.indices.clone()))),
             data: (data.indices.len() <= 60_000).then(|| std::rc::Rc::new(data.clone())),
+            version: 0,
         };
         if let Some(slot) = self.free_meshes.pop() {
             self.meshes[slot as usize] = gm;
@@ -1842,6 +1894,7 @@ impl Renderer {
             return;
         }
         let _ = self.queue.write_buffer_with_u32_and_u8_slice(&m.vb, 0, bytemuck::cast_slice(vertices));
+        m.version = m.version.wrapping_add(1);
         let md = MeshData { vertices: vertices.to_vec(), indices: vec![] };
         let (c, r) = md.bounds();
         m.bounds_center = c;
@@ -2173,6 +2226,8 @@ impl Renderer {
             slices[k] = (if k == 0 { near } else { splits[k - 1] }, z1);
             splits[k] = z1;
         }
+        let cache_on = self.settings.shadow_cache && main;
+        let shadow_margin = self.settings.shadow_margin.clamp(0.0, 1.0);
         let shadow_size = self.shadow_size as f32;
         // (matrices, texel sizes, (light view, half size, depth range) per cascade for caster culling)
         let fit = |dir: Vec3| {
@@ -2181,6 +2236,8 @@ impl Renderer {
             let mut mats = [Mat4::IDENTITY; MAX_CASCADES];
             let mut texels = [0.0f32; 4];
             let mut boxes: Vec<(Mat4, f32, f32)> = vec![];
+            // (snapped centre, fitted radius, radius the slice needs)
+            let mut spheres = [(Vec3::ZERO, 0.0f32, 0.0f32); MAX_CASCADES];
             for k in 0..n_casc {
                 let (z0, z1) = slices[k];
                 let mut center = Vec3::ZERO;
@@ -2192,8 +2249,9 @@ impl Renderer {
                     *c = inv_view.transform_point3(Vec3::new(sx * tan_x * z, sy * tan_y * z, -z));
                     center += *c / 8.0;
                 }
-                let r = corners.iter().map(|c| c.distance(center)).fold(0.0f32, f32::max);
-                let r = (r * 16.0).ceil() / 16.0;
+                let need = corners.iter().map(|c| c.distance(center)).fold(0.0f32, f32::max);
+                let margin = if k > 0 && cache_on { 1.0 + shadow_margin } else { 1.0 };
+                let r = (need * margin * 16.0).ceil() / 16.0;
                 let texel = 2.0 * r / shadow_size;
                 let mut c_ls = rot.transform_point3(center);
                 c_ls.x = (c_ls.x / texel).floor() * texel;
@@ -2208,10 +2266,13 @@ impl Renderer {
                 mats[k] = lp * lv;
                 texels[k] = texel;
                 boxes.push((lv, r, back + r));
+                spheres[k] = (center, r, need);
             }
-            (mats, texels, boxes)
+            (mats, texels, boxes, spheres)
         };
-        let (cascade_mats, texels, mut cascade_boxes) = fit(shadow_dir);
+        let (mut cascade_mats, mut texels, mut cascade_boxes, spheres) = fit(shadow_dir);
+        // per virtual pass: (direction, sphere)
+        let mut pass_fit: Vec<(Vec3, (Vec3, f32, f32))> = (0..n_casc).map(|k| (shadow_dir, spheres[k])).collect();
         let mut cascades = [[[0.0f32; 4]; 4]; MAX_CASCADES];
         for k in 0..MAX_CASCADES {
             cascades[k] = cascade_mats[k].to_cols_array_2d();
@@ -2220,20 +2281,19 @@ impl Renderer {
         // virtual shadow passes: (cascade slot in cascade_buf / bind0_shadow, array layer)
         let mut shadow_passes: Vec<(usize, u32)> = (0..n_casc).map(|k| (k, cur_set * MAX_CASCADES as u32 + k as u32)).collect();
         let mut cascade_data = vec![0u8; CASCADE_SLOT as usize * 2 * MAX_CASCADES];
-        for (k, m) in cascade_mats.iter().enumerate() {
-            cascade_data[k * CASCADE_SLOT as usize..k * CASCADE_SLOT as usize + 64].copy_from_slice(bytemuck::bytes_of(&m.to_cols_array()));
-        }
+        // matrix per virtual pass (current set, then the previous direction's set while fading)
+        let mut pass_mats: Vec<Mat4> = cascade_mats[..n_casc].to_vec();
+        let mut prev_texels = texels;
         if let Some((prev_dir, _)) = fading {
-            let (pm, _, pboxes) = fit(prev_dir);
+            let (pm, pt, pboxes, psph) = fit(prev_dir);
             for k in 0..n_casc {
-                cascades_prev[k] = pm[k].to_cols_array_2d();
-                let slot = MAX_CASCADES + k;
-                cascade_data[slot * CASCADE_SLOT as usize..slot * CASCADE_SLOT as usize + 64].copy_from_slice(bytemuck::bytes_of(&pm[k].to_cols_array()));
-                shadow_passes.push((slot, (cur_set ^ 1) * MAX_CASCADES as u32 + k as u32));
+                shadow_passes.push((MAX_CASCADES + k, (cur_set ^ 1) * MAX_CASCADES as u32 + k as u32));
+                pass_mats.push(pm[k]);
+                pass_fit.push((prev_dir, psph[k]));
             }
+            prev_texels = pt;
             cascade_boxes.extend(pboxes);
         }
-        self.queue.write_buffer_with_u32_and_u8_slice(&self.cascade_buf, 0, &cascade_data).map_err(js_err)?;
 
         // --- Clustered lights -----------------------------------------------------------------
         let cluster_far = self.settings.light_cluster_far.min(far).max(near * 2.0);
@@ -2464,6 +2524,74 @@ impl Renderer {
             })
             .collect();
 
+        // Shadow cache: which passes must be rendered; reused layers keep the matrix they were
+        // rendered with (the shader samples them with that one).
+        self.shadow_frame += 1;
+        if !main {
+            // render textures draw into the shared shadow layers
+            self.invalidate_shadow_cache();
+        }
+        let mut render_pass = vec![true; shadow_passes.len()];
+        for (p, &(slot, layer)) in shadow_passes.iter().enumerate() {
+            let k = slot % MAX_CASCADES;
+            let mut content: u64 = 0xcbf2_9ce4_8422_2325;
+            if shadows_on {
+                for &i in &cascade_casters[p] {
+                    let (key, ci) = casters[i as usize];
+                    let r = &raws[ci as usize];
+                    let m = &r.model;
+                    // mesh + its vertex version, alpha test (cutoff, base alpha), transform
+                    let ver = self.meshes.get(key as u32 as usize).map_or(0, |g| g.version) as u64;
+                    let mut h = (key ^ ver << 40 ^ (r.params[3].to_bits() as u64) << 8 ^ r.base_color[3].to_bits() as u64) ^ content.rotate_left(5);
+                    for col in m {
+                        for v in col {
+                            h = (h ^ v.to_bits() as u64).wrapping_mul(0x1000_0000_01b3);
+                        }
+                    }
+                    content = h;
+                }
+            } else {
+                content = 1;
+            }
+            let (dir, (center, radius, need)) = pass_fit[p];
+            let mat = pass_mats[p];
+            let c = &mut self.shadow_cache[layer as usize];
+            let reuse = cache_on && c.valid && c.dir == dir && {
+                let same = c.mat == mat;
+                let covers = k > 0 && (center - c.center).length() + need <= c.radius;
+                let age = self.shadow_frame.saturating_sub(c.frame);
+                if c.content == content {
+                    same || covers
+                } else {
+                    k > 0 && (same || covers) && age < self.settings.shadow_refresh[k - 1].max(1) as u64
+                }
+            };
+            if reuse {
+                render_pass[p] = false;
+                pass_mats[p] = c.mat;
+                let tx = c.texel;
+                if p < n_casc { texels[k] = tx; } else { prev_texels[k] = tx; }
+            } else {
+                let tx = if p < n_casc { texels[k] } else { prev_texels[k] };
+                *c = ShadowLayer { valid: true, mat, texel: tx, dir, center, radius, content, frame: self.shadow_frame };
+            }
+        }
+        let _ = &prev_texels;
+        for (p, &(slot, _)) in shadow_passes.iter().enumerate() {
+            let m = pass_mats[p];
+            cascade_data[slot * CASCADE_SLOT as usize..slot * CASCADE_SLOT as usize + 64].copy_from_slice(bytemuck::bytes_of(&m.to_cols_array()));
+            if p < n_casc {
+                cascade_mats[slot] = m;
+                cascades[slot] = m.to_cols_array_2d();
+            } else {
+                cascades_prev[slot - MAX_CASCADES] = m.to_cols_array_2d();
+            }
+        }
+        globals.cascades = cascades;
+        globals.cascades_prev = cascades_prev;
+        globals.cascade_texel = texels;
+        self.queue.write_buffer_with_u32_and_u8_slice(&self.cascade_buf, 0, &cascade_data).map_err(js_err)?;
+
         // Opaque batches: runs of equal (pipeline, texture, mesh) -> one (indirect) draw each.
         let mut batches: Vec<(u8, u32, u32, u32, u32)> = vec![]; // (pipeline, texture, mesh, first, count)
         // nearest distance of a batch's instances to the camera (bounding sphere surface, then centre)
@@ -2499,7 +2627,16 @@ impl Renderer {
         }
         // Hi-Z occlusion culling pays off only with enough geometry behind the occluders.
         let candidate_tris: u64 = batches.iter().map(|b| (self.meshes[b.2 as usize].index_count / 3) as u64 * b.4 as u64).sum();
-        let use_hiz = gpu && self.settings.occlusion_culling && candidate_tris >= self.settings.occlusion_min_triangles as u64;
+        let mut use_hiz = gpu && self.settings.occlusion_culling && candidate_tris >= self.settings.occlusion_min_triangles as u64;
+        if main {
+            self.hiz_auto.0 += 1;
+            if use_hiz && self.settings.occlusion_min_ratio > 0.0 && self.hiz_auto.0 < self.hiz_auto.4 {
+                use_hiz = false;
+            }
+            if !use_hiz {
+                self.hiz_auto.1 = 0;
+            }
+        }
         // Blended runs: only *adjacent* equal keys merge, so the back-to-front order is kept.
         let blend_base = visible.len() as u32;
         let mut blend_runs: Vec<(bool, u32, u32, u32, u32)> = vec![];
@@ -2523,7 +2660,7 @@ impl Renderer {
             .write_buffer_with_u32_and_u8_slice(&self.globals_buf, 0, bytemuck::bytes_of(&globals))
             .map_err(js_err)?;
 
-        let shadow_instances: usize = cascade_casters.iter().map(|c| c.len()).sum();
+        let shadow_instances: usize = cascade_casters.iter().enumerate().filter(|(p, _)| render_pass.get(*p).copied().unwrap_or(true)).map(|(_, c)| c.len()).sum();
         let total = (visible.len() + blended.len() + shadow_instances) as u32;
         self.ensure_instance_capacity(total.max(1))?;
         let mut data: Vec<InstanceRaw> = std::mem::take(&mut self.scratch_data);
@@ -2532,9 +2669,11 @@ impl Renderer {
         data.extend(visible.iter().map(|v| raws[v.1 as usize]));
         data.extend(blended.iter().map(|b| raws[b.4 as usize]));
         let mut cascade_base = vec![];
-        for list in &cascade_casters {
+        for (p, list) in cascade_casters.iter().enumerate() {
             cascade_base.push(data.len() as u32);
-            data.extend(list.iter().map(|&i| raws[casters[i as usize].1 as usize]));
+            if render_pass.get(p).copied().unwrap_or(true) {
+                data.extend(list.iter().map(|&i| raws[casters[i as usize].1 as usize]));
+            }
         }
         if !data.is_empty() {
             self.queue.write_buffer_with_u32_and_u8_slice(&self.instance_buf, 0, bytemuck::cast_slice(&data)).map_err(js_err)?;
@@ -2644,6 +2783,7 @@ impl Renderer {
         // --- GPU culling (compute) ----------------------------------------------------------
         if gpu {
             let occlusion = use_hiz;
+            stats.hiz_active = use_hiz;
             if let Some(c) = self.cull.as_mut() {
                 c.ensure_capacity(&self.device, visible.len() as u32, batches.len() as u32)?;
                 let mut items = Vec::with_capacity(visible.len());
@@ -2677,6 +2817,26 @@ impl Renderer {
                 stats.gpu_frustum_culled = k[0];
                 stats.gpu_occluded = k[1];
                 stats.gpu_visible = k[2];
+                // Hi-Z auto off (the counters lag a few frames: skip the first 10 after enabling)
+                let min_ratio = self.settings.occlusion_min_ratio;
+                if main && occlusion && min_ratio > 0.0 {
+                    let a = &mut self.hiz_auto;
+                    a.1 += 1;
+                    if a.1 > 10 {
+                        a.2 += k[1] as u64;
+                        a.3 += (k[1] + k[2]) as u64;
+                    }
+                    if a.1 >= 70 {
+                        let ratio = a.2 as f32 / a.3.max(1) as f32;
+                        if ratio < min_ratio {
+                            a.4 = a.0 + 300;
+                            crate::log_info!("Hi-Z occlusion off for 5 s: it culled {:.1}% of the opaque candidates (occlusion_min_ratio {:.0}%)", ratio * 100.0, min_ratio * 100.0);
+                        }
+                        a.1 = 10;
+                        a.2 = 0;
+                        a.3 = 0;
+                    }
+                }
             }
         } else if main {
             if let Some(c) = self.cull.as_mut() {
@@ -2686,10 +2846,14 @@ impl Renderer {
 
         // --- Shadow passes: one per cascade (opaque depth-only, alpha-tested casters sample their texture)
         {
-            let n_pass = shadow_passes.len();
-            let ts = self.timing.as_mut().filter(|_| main).and_then(|t| t.split_writes(crate::gpu_timing::SHADOW));
-            for (k, list) in cascade_casters.iter().enumerate().take(n_pass) {
-                let (slot, layer) = shadow_passes[k];
+            let todo: Vec<usize> = (0..shadow_passes.len()).filter(|&p| render_pass[p]).collect();
+            stats.shadow_passes_rendered = todo.len() as u32;
+            stats.shadow_passes_cached = (shadow_passes.len() - todo.len()) as u32;
+            let n_pass = todo.len();
+            let ts = if n_pass > 0 { self.timing.as_mut().filter(|_| main).and_then(|t| t.split_writes(crate::gpu_timing::SHADOW)) } else { None };
+            for (k, &p) in todo.iter().enumerate() {
+                let list = &cascade_casters[p];
+                let (slot, layer) = shadow_passes[p];
                 let att = GpuRenderPassDepthStencilAttachment::new_with_gpu_texture_view(&self.shadow_layers[layer as usize]);
                 att.set_depth_clear_value(1.0);
                 att.set_depth_load_op(GpuLoadOp::Clear);
@@ -2712,7 +2876,7 @@ impl Renderer {
                 let pass = encoder.begin_render_pass(&desc).map_err(js_err)?;
                 if self.settings.shadows && !list.is_empty() {
                     pass.set_bind_group(0, Some(&self.bind0_shadow[slot]));
-                    let base = cascade_base[k];
+                    let base = cascade_base[p];
                     let mut bound: Option<(bool, u32)> = None;
                     let mut i = 0usize;
                     while i < list.len() {
@@ -2741,10 +2905,19 @@ impl Renderer {
             }
         }
 
+        // Nothing blended (no transparent draws, particles or water): the opaque pass resolves
+        // straight into the HDR target and the blend pass is skipped. Saves a full load + store of
+        // the 4x MSAA HDR target, pure bandwidth (a few ms on integrated GPUs).
+        let skip_blend = blend_runs.is_empty() && n_add + n_alpha == 0 && !has_water;
         // --- Opaque pass (indirect on the GPU path); keeps colour + depth for the blend pass ---
         {
             let att = GpuRenderPassColorAttachment::new_with_gpu_texture_view(GpuLoadOp::Clear, GpuStoreOp::Store, &msaa);
-            if has_water {
+            if skip_blend {
+                att.set_resolve_target_gpu_texture_view(&hdr_view);
+                if !self.immediate_gpu {
+                    att.set_store_op(GpuStoreOp::Discard);
+                }
+            } else if has_water {
                 // water refracts and reflects the opaque scene: resolved straight into the texture
                 // the blend pass samples (no extra full-screen copy)
                 att.set_resolve_target_gpu_texture_view(&scene_color);
@@ -2811,7 +2984,7 @@ impl Renderer {
         }
 
         // --- Blend pass: back to front, depth read-only *and* bound as a texture (water) -----
-        {
+        if !skip_blend {
             // immediate-mode GPUs keep the samples (free there) so the next opaque pass can skip its clear
             let store = if self.immediate_gpu { GpuStoreOp::Store } else { GpuStoreOp::Discard };
             let att = GpuRenderPassColorAttachment::new_with_gpu_texture_view(GpuLoadOp::Load, store, &msaa);

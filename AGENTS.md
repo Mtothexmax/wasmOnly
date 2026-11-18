@@ -143,6 +143,20 @@ normal `cargo` output above it.
   undoes it) and compare `gpu_ms.frame`.
 - **Hi-Z occlusion culling** only runs when the opaque candidates add up to `render {occlusion_min_triangles}`
   (default 100000): below that the depth pyramid costs more than it saves (`gpu_occluded` stays 0, `gpu_ms.hiz` 0).
+  It also switches itself off for 5 s when it culls less than `occlusion_min_ratio` (default 0.08) of the candidates
+  (top-down views hide little), then probes again; `stats.render.hiz_active` shows whether it ran.
+- **Shadow cache:** a cascade is re-rendered only when its matrix or its casters (mesh + model matrix) changed.
+  Cascades 1.. are fitted `shadow_margin` (0.08) larger and reused while the camera stays inside that margin; when
+  only casters moved they refresh every `shadow_refresh` frames (`[2,3,4]`; cascade 0 always at once). A still
+  scene renders no shadow pass at all: `stats.render.shadow_passes_rendered` / `shadow_passes_cached`.
+  `render {shadow_cache:false}` = old behaviour (A/B, debugging); render textures invalidate it.
+  Test: `games/demo/tests/shadowcache.txt`.
+- **Blend pass skip:** with no transparent draws, particles or water the opaque pass resolves straight into the HDR
+  target (saves a load + store of the 4x MSAA target).
+- **Benchmarking against other engines:** count frames engine-neutrally (hook on `getCurrentTexture`), run Chrome
+  uncapped (`--disable-gpu-vsync --disable-frame-rate-limit`), and make sure the GPU is quiet first: the Windows
+  counter `\GPU Engine(*engtype_3D)\Utilization Percentage` per process shows other browsers or an idle debug
+  Chrome still rendering the demo (on an integrated GPU they halve the numbers).
 
 ## Code map
 
