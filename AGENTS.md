@@ -159,10 +159,13 @@ normal `cargo` output above it.
   It also switches itself off for 5 s when it culls less than `occlusion_min_ratio` (default 0.08) of the candidates
   (top-down views hide little), then probes again; `stats.render.hiz_active` shows whether it ran.
 - **Shadow cache:** a cascade is re-rendered only when its matrix or its casters (mesh + model matrix) changed.
-  Cascades 1.. are fitted `shadow_margin` (0.08) larger and reused while the camera stays inside that margin; when
-  only casters moved they refresh every `shadow_refresh` frames (`[2,3,4]`; cascade 0 always at once). A still
-  scene renders no shadow pass at all: `stats.render.shadow_passes_rendered` / `shadow_passes_cached`.
-  `render {shadow_cache:false}` = old behaviour (A/B, debugging); render textures invalidate it.
+  Cascades 1.. are fitted `shadow_margin` (0.08) larger and reused while the camera stays inside that margin. A
+  changed caster whose shadow lands in a cascade's own depth slice (reach = its size / tan(sun elevation), plus the
+  blend band) re-renders that cascade the same frame, so a moving hero never gets a stepped, lagging shadow; only
+  changes whose shadow falls elsewhere wait up to `shadow_refresh` frames (`[2,3,4]`). A still scene renders no
+  shadow pass at all: `stats.render.shadow_passes_rendered` / `shadow_passes_cached` / `shadow_cascades_rendered`
+  (per cascade). `call gpu_scene` lists what changed this frame (`changed`: entity + moved / rebuilt / mesh deformed
+  / removed). `render {shadow_cache:false}` = old behaviour (A/B, debugging); render textures invalidate it.
   Test: `games/demo/tests/shadowcache.txt`.
 - **Blend pass skip:** with no transparent draws, particles or water the opaque pass resolves straight into the HDR
   target (saves a load + store of the 4x MSAA target).

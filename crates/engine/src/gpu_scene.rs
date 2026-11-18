@@ -246,6 +246,8 @@ pub(super) struct GpuScene {
     pub shadow_changes: Vec<[f32; 4]>,
     /// Everything changed (first frame, shadows toggled): no cached shadow layer is valid.
     pub shadow_reset: bool,
+    /// Slots changed this frame and why (for `gpu_scene`: what keeps uploads / shadows busy).
+    changed: Vec<(u32, &'static str)>,
     /// Triangles (LOD 0) and count of the main-view objects.
     pub main_tris: u64,
     pub main_count: u32,
@@ -387,6 +389,7 @@ impl GpuScene {
     pub fn sync(&mut self, world: &World, pool: &mut InstancePool, materials: &[Material], mat_ver: &[u32], meshes: &[GpuMesh], shadows_on: bool) {
         let frame = pool.frame;
         self.shadow_changes.clear();
+        self.changed.clear();
         if self.shadows_on != Some(shadows_on) {
             self.shadows_on = Some(shadows_on);
             self.epoch += 1;
@@ -417,6 +420,7 @@ impl GpuScene {
                             self.infos[ss as usize].seen = frame;
                         }
                         if mesh_changed {
+                            self.changed.push((s, "mesh deformed"));
                             // deformed mesh (skinning, morphs): same draw, new shadow
                             self.infos[i].mesh_ver = mv;
                             self.note_shadow(i);
@@ -427,6 +431,7 @@ impl GpuScene {
                         continue;
                     }
                     if same_inputs {
+                        self.changed.push((s, "moved"));
                         // moved only: new record + sphere, same groups
                         self.moved(ek, i, &g.0, mr, mv, pool, materials, meshes, shadows_on, frame);
                         continue;
@@ -434,10 +439,14 @@ impl GpuScene {
                 }
             }
             self.rebuild(ek, &g.0, mr, lod, mv, mat_v, pool, materials, meshes, shadows_on, frame);
+            if let Some(&s) = pool.slot_of.get(&(ek, false)) {
+                self.changed.push((s, "rebuilt"));
+            }
         }
         // entities that are gone (despawned, MeshRenderer removed)
         for i in 0..self.infos.len() {
             if self.infos[i].active && self.infos[i].seen != frame {
+                self.changed.push((i as u32, "removed"));
                 self.deactivate(i);
             }
         }
@@ -794,8 +803,20 @@ impl GpuScene {
     }
 
     /// State for the `gpu_scene` command.
-    pub fn describe(&self) -> serde_json::Value {
+    pub fn describe(&self, owner: &[(u64, bool)]) -> serde_json::Value {
+        let changed: Vec<serde_json::Value> = self
+            .changed
+            .iter()
+            .take(24)
+            .map(|&(s, why)| {
+                let id = owner.get(s as usize).and_then(|o| hecs::Entity::from_bits(o.0)).map(|e| e.id());
+                serde_json::json!({"slot": s, "entity": id, "why": why})
+            })
+            .collect();
         serde_json::json!({
+            "changed_count": self.changed.len(),
+            "changed": changed,
+            "shadow_changes": self.shadow_changes.len(),
             "slots": self.infos.len(),
             "active": self.infos.iter().filter(|f| f.active).count(),
             "main_objects": self.main_count,

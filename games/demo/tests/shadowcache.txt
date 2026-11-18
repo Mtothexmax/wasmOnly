@@ -17,4 +17,18 @@ call render {"shadow_cache":false}
 frames 3
 expect stats.render.shadow_passes_cached == 0
 expect stats.render.shadow_passes_rendered >= 1
-call render {"shadow_cache":true,"particles":true}
+call render {"shadow_cache":true}
+
+# a moving caster re-renders the cascade its shadow lands in every frame (no delayed refresh)
+# log splits put the ball 7 m away into cascade 2. Real frames, not "step": step renders its own frame.
+call render {"shadow_distance":200,"shadow_split_lambda":1}
+resume
+down KeyW
+frames 20
+expect stats.render.shadow_cascades_rendered.2 == true
+frames 1
+expect stats.render.shadow_cascades_rendered.2 == true
+frames 1
+expect stats.render.shadow_cascades_rendered.2 == true
+up KeyW
+call render {"shadow_distance":160,"shadow_split_lambda":0.8,"particles":true}

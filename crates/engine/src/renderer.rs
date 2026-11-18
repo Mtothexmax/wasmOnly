@@ -213,6 +213,8 @@ struct ShadowLayer {
     depth: f32,
     /// GPU-driven path: a caster touching the layer changed since it was rendered.
     dirty: bool,
+    /// CPU path: hash of the casters whose shadow lands in the cascade's own depth slice.
+    near: u64,
 }
 /// Uniform slot stride for per-cascade matrices (minUniformBufferOffsetAlignment).
 const CASCADE_SLOT: u32 = 256;
@@ -661,6 +663,8 @@ pub struct FrameStats {
     /// Shadow passes rendered this frame (the others reused their cached map).
     pub shadow_passes_rendered: u32,
     pub shadow_passes_cached: u32,
+    /// Per cascade of the current set: re-rendered this frame (false = cached map reused).
+    pub shadow_cascades_rendered: Vec<bool>,
     /// Hi-Z occlusion culling ran this frame (off: too little geometry, or auto off).
     pub hiz_active: bool,
     /// Instance record slots in use (stable per entity).
@@ -2137,7 +2141,7 @@ impl Renderer {
     }
     /// `gpu_scene` command: the GPU-driven scene's state and its last GPU counters.
     pub fn gpu_scene_info(&self) -> serde_json::Value {
-        let mut v = self.scene.describe();
+        let mut v = self.scene.describe(&self.pool.owner);
         if let Some(sg) = &self.scene_gpu {
             let l = sg.last.borrow();
             let k = l.counters;
@@ -2771,15 +2775,36 @@ impl Renderer {
                     });
             }
         }
+        // A caster whose shadow lands inside cascade k's own depth slice (where the screen samples
+        // cascade k) is urgent: that cascade re-renders the same frame. Only changes whose shadow
+        // falls elsewhere wait for `shadow_refresh` (a moving hero must never cast a 20 Hz shadow).
+        // Reach = how far the shadow extends from the caster: about its height / tan(sun elevation).
+        let elev = (-shadow_dir.y).clamp(0.17, 1.0).asin();
+        let reach_f = 1.0 + 2.0 / elev.tan();
+        let in_slice = |k: usize, c: Vec3, r: f32| {
+            let d = (c - cam_pos).dot(cam_fwd_n);
+            let reach = r * reach_f + 0.5;
+            let (z0, z1) = slices[k];
+            let band = (z1 - z0) * 0.15; // cascade blend band
+            d + reach >= z0 - band && d - reach <= z1 + band
+        };
+        let mut urgent_gpu = [false; MAX_CASCADES];
+        if gpu {
+            for (k, u) in urgent_gpu.iter_mut().enumerate().take(n_casc) {
+                *u = self.scene.shadow_changes.iter().any(|b| in_slice(k, Vec3::new(b[0], b[1], b[2]), b[3]));
+            }
+        }
         let mut render_pass = vec![true; shadow_passes.len()];
         for (p, &(slot, layer)) in shadow_passes.iter().enumerate() {
             let k = slot % MAX_CASCADES;
             let mut content: u64 = 0xcbf2_9ce4_8422_2325;
+            let mut near: u64 = 0xcbf2_9ce4_8422_2325;
             if gpu {
                 content = 0;
             } else if shadows_on {
                 for &i in &cascade_casters[p] {
                     let (key, ci) = casters[i as usize];
+                    let b = bounds[ci as usize];
                     let r = &self.pool.recs[raws[ci as usize] as usize];
                     let m = &r.model;
                     // mesh + its vertex version, alpha test (cutoff, base alpha), transform
@@ -2791,6 +2816,9 @@ impl Renderer {
                         }
                     }
                     content = h;
+                    if in_slice(k, Vec3::new(b[0], b[1], b[2]), b[3]) {
+                        near = h ^ near.rotate_left(7);
+                    }
                 }
             } else {
                 content = 1;
@@ -2802,10 +2830,11 @@ impl Renderer {
                 let same = c.mat == mat;
                 let covers = k > 0 && (center - c.center).length() + need <= c.radius;
                 let age = self.shadow_frame.saturating_sub(c.frame);
+                let urgent = if gpu { urgent_gpu[k] } else { c.near != near };
                 if if gpu { !c.dirty } else { c.content == content } {
                     same || covers
                 } else {
-                    k > 0 && (same || covers) && age < self.settings.shadow_refresh[k - 1].max(1) as u64
+                    k > 0 && !urgent && (same || covers) && age < self.settings.shadow_refresh[k - 1].max(1) as u64
                 }
             };
             if reuse {
@@ -2816,7 +2845,7 @@ impl Renderer {
             } else {
                 let tx = if p < n_casc { texels[k] } else { prev_texels[k] };
                 let (lv, half, depth) = cascade_boxes[p];
-                *c = ShadowLayer { valid: true, mat, texel: tx, dir, center, radius, content, frame: self.shadow_frame, lv, half, depth, dirty: false };
+                *c = ShadowLayer { valid: true, mat, texel: tx, dir, center, radius, content, frame: self.shadow_frame, lv, half, depth, dirty: false, near };
             }
         }
         let _ = &prev_texels;
@@ -3160,6 +3189,7 @@ impl Renderer {
             let shadow_groups = if gpu && !todo.is_empty() { self.scene.shadow_groups(cam_pos, lod_bias) } else { vec![] };
             stats.shadow_passes_rendered = todo.len() as u32;
             stats.shadow_passes_cached = (shadow_passes.len() - todo.len()) as u32;
+            stats.shadow_cascades_rendered = render_pass.iter().take(n_casc).copied().collect();
             let n_pass = todo.len();
             let ts = if n_pass > 0 { self.timing.as_mut().filter(|_| main).and_then(|t| t.split_writes(crate::gpu_timing::SHADOW)) } else { None };
             for (k, &p) in todo.iter().enumerate() {
