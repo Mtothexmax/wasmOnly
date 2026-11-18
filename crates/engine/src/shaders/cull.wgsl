@@ -2,7 +2,7 @@
 //   1. frustum test (bounding sphere vs 6 planes of the current camera)
 //   2. occlusion test against the Hi-Z pyramid of the *previous* frame (conservative; objects
 //      revealed by fast camera moves can pop in one frame late)
-//   3. survivors append their instance index to their batch's slice of `visible` and bump the
+//   3. survivors append their instance record slot to their batch's slice of `visible` and bump the
 //      batch's indirect draw `instance_count` -> the render pass issues drawIndexedIndirect.
 // Standalone shader (not prefixed with common.wgsl).
 
@@ -21,7 +21,7 @@ struct CullParams {
 struct Item {
     center_radius: vec4f, // world-space bounding sphere
     batch: u32,
-    _a: u32,
+    inst: u32, // instance record slot
     _b: u32,
     _c: u32,
 }
@@ -87,6 +87,6 @@ fn cull(@builtin(global_invocation_id) id: vec3u) {
         return;
     }
     let slot = atomicAdd(&args[it.batch].instance_count, 1u);
-    visible[args[it.batch].first_instance + slot] = i;
+    visible[args[it.batch].first_instance + slot] = it.inst;
     atomicAdd(&counters[2], 1u);
 }

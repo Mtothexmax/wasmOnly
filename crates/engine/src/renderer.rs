@@ -22,6 +22,90 @@ pub const AUTO_LOD_FACTOR: f32 = 40.0;
 /// Shadow cascades (layers of the shadow map array).
 const MAX_CASCADES: usize = 4;
 
+/// Instance records at stable slots, one per (entity, shadow-copy) key. A record is uploaded only
+/// when it changed, so the per-frame upload is the moving entities plus the 4-byte id lists (the
+/// layout no longer shifts when the visible set changes).
+#[derive(Default)]
+struct InstancePool {
+    slot_of: crate::scene::FxMap<(u64, bool), u32>,
+    owner: Vec<(u64, bool)>,
+    /// frame a slot was last used (0 = free)
+    seen: Vec<u64>,
+    free: Vec<u32>,
+    /// CPU copy of the GPU buffer
+    recs: Vec<InstanceRaw>,
+    dirty: Vec<u32>,
+    /// the GPU buffer was reallocated: upload every slot
+    upload_all: bool,
+    frame: u64,
+}
+
+impl InstancePool {
+    fn put(&mut self, key: (u64, bool), raw: &InstanceRaw) -> u32 {
+        if let Some(&s) = self.slot_of.get(&key) {
+            let i = s as usize;
+            self.seen[i] = self.frame;
+            if bytemuck::bytes_of(&self.recs[i]) != bytemuck::bytes_of(raw) {
+                self.recs[i] = *raw;
+                self.dirty.push(s);
+            }
+            return s;
+        }
+        let s = match self.free.pop() {
+            Some(s) => s,
+            None => {
+                self.recs.push(*raw);
+                self.seen.push(0);
+                self.owner.push(key);
+                self.recs.len() as u32 - 1
+            }
+        };
+        let i = s as usize;
+        self.slot_of.insert(key, s);
+        self.owner[i] = key;
+        self.seen[i] = self.frame;
+        self.recs[i] = *raw;
+        self.dirty.push(s);
+        s
+    }
+
+    /// Frees the slots no view used for a few frames (despawned or hidden entities).
+    fn sweep(&mut self) {
+        for i in 0..self.seen.len() {
+            if self.seen[i] != 0 && self.seen[i] + 3 < self.frame {
+                self.seen[i] = 0;
+                self.slot_of.remove(&self.owner[i]);
+                self.free.push(i as u32);
+            }
+        }
+    }
+
+    /// Dirty slot ranges to upload, merged across small gaps; many ranges collapse to one span.
+    fn take_ranges(&mut self) -> Vec<(usize, usize)> {
+        if std::mem::take(&mut self.upload_all) {
+            self.dirty.clear();
+            return if self.recs.is_empty() { vec![] } else { vec![(0, self.recs.len())] };
+        }
+        let mut d = std::mem::take(&mut self.dirty);
+        d.sort_unstable();
+        d.dedup();
+        let mut ranges: Vec<(usize, usize)> = vec![];
+        for &s in &d {
+            let s = s as usize;
+            match ranges.last_mut() {
+                Some(r) if s <= r.1 + 4 => r.1 = s + 1,
+                _ => ranges.push((s, s + 1)),
+            }
+        }
+        if ranges.len() > 32 {
+            ranges = vec![(ranges[0].0, ranges[ranges.len() - 1].1)];
+        }
+        d.clear();
+        self.dirty = d;
+        ranges
+    }
+}
+
 /// Content of one shadow-map layer: matrix, light-space sphere it covers, caster hash.
 #[derive(Clone, Copy, Default)]
 struct ShadowLayer {
@@ -483,7 +567,9 @@ pub struct FrameStats {
     pub shadow_passes_cached: u32,
     /// Hi-Z occlusion culling ran this frame (off: too little geometry, or auto off).
     pub hiz_active: bool,
-    /// Instance records uploaded this frame (only the chunks that changed), bytes.
+    /// Instance record slots in use (stable per entity).
+    pub instance_slots: u32,
+    /// Instance records + id lists uploaded this frame (only what changed), bytes.
     pub instance_upload_bytes: u64,
     pub visible: u32,
     pub culled: u32,
@@ -667,11 +753,12 @@ pub struct Renderer {
     sky_gpu: SkyGpu,
     /// Inputs of the last sky-LUT render (sun, moon, intensities); the LUT is only redrawn when they change.
     sky_lut_key: [f32; 10],
-    /// Per-frame instance lists, kept between frames for their allocations.
-    scratch_raws: Vec<InstanceRaw>,
-    scratch_data: Vec<InstanceRaw>,
-    /// What `instance_buf` holds (diff upload).
-    uploaded: Vec<InstanceRaw>,
+    /// Instance records at stable slots (what `instance_buf` holds).
+    pool: InstancePool,
+    /// What `visible_buf` holds (diff upload; u32::MAX where the GPU cull wrote).
+    ids_uploaded: Vec<u32>,
+    /// Per-frame scratch for the id list.
+    scratch_ids: Vec<u32>,
     skybox: Option<TextureId>,
     /// Derived sky / day-night state (sun, moon, daylight, night), see `crate::sky`.
     pub sky: crate::sky::SkyState,
@@ -684,6 +771,7 @@ pub struct Renderer {
     timing: Option<crate::gpu_timing::GpuTiming>,
     pub gpu_culling_supported: bool,
     instance_cap: u32,
+    ids_cap: u32,
     bind0: GpuBindGroup,
     /// One shadow bind group per cascade (its light matrix at a different uniform offset).
     bind0_shadow: Vec<GpuBindGroup>,
@@ -877,6 +965,7 @@ impl Renderer {
                 uniform_entry(0, gpu_shader_stage::VERTEX),
                 storage_entry(1, gpu_shader_stage::VERTEX),
                 uniform_entry(2, gpu_shader_stage::VERTEX),
+                storage_entry(4, gpu_shader_stage::VERTEX),
             ]))
             .map_err(js_err)?;
         let tex_entry = GpuBindGroupLayoutEntry::new(0, gpu_shader_stage::FRAGMENT);
@@ -1181,9 +1270,9 @@ impl Renderer {
             bind0_t: None,
             sky_gpu,
             sky_lut_key: [0.0; 10],
-            scratch_raws: vec![],
-            scratch_data: vec![],
-            uploaded: vec![],
+            pool: InstancePool::default(),
+            ids_uploaded: vec![],
+            scratch_ids: vec![],
             skybox: None,
             sky: Default::default(),
             globals_buf,
@@ -1194,6 +1283,7 @@ impl Renderer {
             immediate_gpu,
             gpu_culling_supported: gpu_cull_supported,
             instance_cap,
+            ids_cap: instance_cap,
             bind0,
             bind0_shadow,
             shadow_view,
@@ -1336,6 +1426,7 @@ impl Renderer {
                         GpuBindGroupEntry::new_with_gpu_buffer(0, globals),
                         GpuBindGroupEntry::new_with_gpu_buffer(1, instances),
                         GpuBindGroupEntry::new_with_gpu_buffer_binding(2, &b),
+                        GpuBindGroupEntry::new_with_gpu_buffer(4, visible),
                     ],
                     bgl0_shadow,
                 ))
@@ -2059,20 +2150,31 @@ impl Renderer {
         }
     }
 
-    fn ensure_instance_capacity(&mut self, n: u32) -> Result<(), String> {
-        if n <= self.instance_cap {
+    /// Grows the record buffer (`records` slots) and the id buffer (`ids` entries).
+    fn ensure_instance_capacity(&mut self, records: u32, ids: u32) -> Result<(), String> {
+        if records <= self.instance_cap && ids <= self.ids_cap {
             return Ok(());
         }
-        let mut cap = self.instance_cap;
-        while cap < n {
-            cap *= 2;
+        let grow = |mut cap: u32, n: u32| {
+            while cap < n {
+                cap *= 2;
+            }
+            cap
+        };
+        if records > self.instance_cap {
+            let cap = grow(self.instance_cap, records);
+            self.instance_buf = Self::make_instance_buffer(&self.device, cap)?;
+            self.instance_cap = cap;
+            self.pool.upload_all = true;
         }
-        self.instance_buf = Self::make_instance_buffer(&self.device, cap)?;
-        self.instance_cap = cap;
-        self.uploaded.clear();
-        self.visible_buf = Self::make_visible_buffer(&self.device, cap)?;
-        if let Some(c) = &mut self.cull {
-            c.invalidate_bindings();
+        if ids > self.ids_cap {
+            let cap = grow(self.ids_cap, ids);
+            self.visible_buf = Self::make_visible_buffer(&self.device, cap)?;
+            self.ids_cap = cap;
+            self.ids_uploaded.clear();
+            if let Some(c) = &mut self.cull {
+                c.invalidate_bindings();
+            }
         }
         self.rebuild_bind0();
         Ok(())
@@ -2371,10 +2473,17 @@ impl Renderer {
         let gpu = main && self.settings.gpu_culling && self.cull.is_some();
         let planes = frustum_planes(&view_proj);
         let cam_fwd_n = cam_fwd.normalize_or(Vec3::NEG_Z);
-        // Per accepted instance (index `mi`): its GPU record and bounding sphere. The lists below
-        // only hold small sort keys + `mi`, so sorting never moves the 192-byte records.
-        let mut raws: Vec<InstanceRaw> = std::mem::take(&mut self.scratch_raws);
-        raws.clear();
+        // Per accepted instance (index `mi`): the slot of its GPU record and its bounding sphere. The
+        // lists below only hold small sort keys + `mi`, so sorting never moves the 192-byte records.
+        let mut slots: Vec<u32> = Vec::with_capacity(self.pool.recs.len());
+        if main {
+            self.pool.frame += 1;
+            if self.pool.frame % 30 == 0 {
+                self.pool.sweep();
+            }
+        }
+        self.pool.frame = self.pool.frame.max(1);
+        let raws = &mut slots;
         let mut bounds: Vec<[f32; 4]> = Vec::with_capacity(raws.capacity());
         // (pipeline 0..3 << 56 | texture key << 28 | mesh, mi); opaque pipelines sort first
         let mut visible: Vec<(u64, u32)> = Vec::with_capacity(raws.capacity());
@@ -2394,7 +2503,7 @@ impl Renderer {
         let (mut scene_min, mut scene_max) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
         let shadows_on = self.settings.shadows;
         let lod_bias = self.settings.lod_bias.max(0.01);
-        for (g, mr, lod) in world.query::<(&GlobalTransform, &MeshRenderer, Option<&Lod>)>().iter() {
+        for (ent, g, mr, lod) in world.query::<(hecs::Entity, &GlobalTransform, &MeshRenderer, Option<&Lod>)>().iter() {
             if layers & (1u32 << (mr.layer & 31)) == 0 {
                 continue;
             }
@@ -2478,8 +2587,9 @@ impl Renderer {
                 key_list.push(key);
                 key_list.len() as u32 - 1
             });
+            let ekey = ent.to_bits().get();
             let mi = raws.len() as u32;
-            raws.push(raw);
+            raws.push(self.pool.put((ekey, false), &raw));
             bounds.push([center.x, center.y, center.z, radius]);
             if casts {
                 // a faded entity casts with its unfaded record (full alpha, original alpha test)
@@ -2487,7 +2597,7 @@ impl Renderer {
                     let mut r = raw;
                     r.base_color = mat.base_color.into();
                     r.params[3] = cast_alpha;
-                    raws.push(r);
+                    raws.push(self.pool.put((ekey, true), &r));
                     bounds.push([center.x, center.y, center.z, radius]);
                     raws.len() as u32 - 1
                 } else {
@@ -2544,7 +2654,7 @@ impl Renderer {
             if shadows_on {
                 for &i in &cascade_casters[p] {
                     let (key, ci) = casters[i as usize];
-                    let r = &raws[ci as usize];
+                    let r = &self.pool.recs[raws[ci as usize] as usize];
                     let m = &r.model;
                     // mesh + its vertex version, alpha test (cutoff, base alpha), transform
                     let ver = self.meshes.get(key as u32 as usize).map_or(0, |g| g.version) as u64;
@@ -2668,31 +2778,40 @@ impl Renderer {
 
         let shadow_instances: usize = cascade_casters.iter().enumerate().filter(|(p, _)| render_pass.get(*p).copied().unwrap_or(true)).map(|(_, c)| c.len()).sum();
         let total = (visible.len() + blended.len() + shadow_instances) as u32;
-        self.ensure_instance_capacity(total.max(1))?;
-        let mut data: Vec<InstanceRaw> = std::mem::take(&mut self.scratch_data);
-        data.clear();
-        data.reserve(total as usize);
-        data.extend(visible.iter().map(|v| raws[v.1 as usize]));
-        data.extend(blended.iter().map(|b| raws[b.4 as usize]));
+        self.ensure_instance_capacity((self.pool.recs.len() as u32).max(1), total.max(1))?;
+        // Id lists: [opaque (GPU path: written by cull.wgsl)] ++ [blended] ++ [casters per rendered pass]
+        let mut ids: Vec<u32> = std::mem::take(&mut self.scratch_ids);
+        ids.clear();
+        ids.reserve(total as usize);
+        ids.extend(visible.iter().map(|v| raws[v.1 as usize]));
+        ids.extend(blended.iter().map(|b| raws[b.4 as usize]));
         let mut cascade_base = vec![];
         for (p, list) in cascade_casters.iter().enumerate() {
-            cascade_base.push(data.len() as u32);
+            cascade_base.push(ids.len() as u32);
             if render_pass.get(p).copied().unwrap_or(true) {
-                data.extend(list.iter().map(|&i| raws[casters[i as usize].1 as usize]));
+                ids.extend(list.iter().map(|&i| raws[casters[i as usize].1 as usize]));
             }
         }
-        // Upload only the chunks that differ from what the buffer already holds (a still scene
-        // uploads almost nothing; writeBuffer was the largest main-thread cost in busy scenes).
+        // Upload the records that changed, and the chunks of the id list that differ from what the
+        // id buffer holds (a still scene uploads almost nothing).
         let mut upload_bytes = 0u64;
         {
-            const CH: usize = 32; // instances per chunk (6 KB)
-            let prev = &self.uploaded;
+            let size = std::mem::size_of::<InstanceRaw>();
+            for (a, b) in self.pool.take_ranges() {
+                upload_bytes += ((b - a) * size) as u64;
+                self.queue
+                    .write_buffer_with_u32_and_u8_slice(&self.instance_buf, (a * size) as u32, bytemuck::cast_slice(&self.pool.recs[a..b]))
+                    .map_err(js_err)?;
+            }
+            // the GPU path writes the opaque range itself
+            let from = if gpu { blend_base as usize } else { 0 };
+            const CH: usize = 256; // ids per chunk (1 KB)
+            let prev = &self.ids_uploaded;
             let mut ranges: Vec<(usize, usize)> = vec![];
-            let mut i = 0;
-            while i < data.len() {
-                let e = (i + CH).min(data.len());
-                let dirty = e > prev.len() || bytemuck::cast_slice::<_, u8>(&data[i..e]) != bytemuck::cast_slice::<_, u8>(&prev[i..e]);
-                if dirty {
+            let mut i = from;
+            while i < ids.len() {
+                let e = (i + CH - i % CH).min(ids.len());
+                if e > prev.len() || ids[i..e] != prev[i..e] {
                     match ranges.last_mut() {
                         Some(r) if r.1 == i => r.1 = e,
                         _ => ranges.push((i, e)),
@@ -2703,22 +2822,18 @@ impl Renderer {
             if ranges.len() > 16 {
                 ranges = vec![(ranges[0].0, ranges[ranges.len() - 1].1)];
             }
-            let size = std::mem::size_of::<InstanceRaw>();
             for (a, b) in ranges {
-                upload_bytes += ((b - a) * size) as u64;
-                self.queue.write_buffer_with_u32_and_u8_slice(&self.instance_buf, (a * size) as u32, bytemuck::cast_slice(&data[a..b])).map_err(js_err)?;
+                upload_bytes += ((b - a) * 4) as u64;
+                self.queue.write_buffer_with_u32_and_u8_slice(&self.visible_buf, (a * 4) as u32, bytemuck::cast_slice(&ids[a..b])).map_err(js_err)?;
             }
         }
-        // keep the allocations for the next frame: `data` is now what the buffer holds
-        self.scratch_raws = raws;
-        self.scratch_data = std::mem::replace(&mut self.uploaded, data);
-        // visible_ids: identity for the CPU-drawn ranges (all opaque on the CPU path, blended always).
-        let id_from = if gpu { blend_base } else { 0 };
-        let id_to = blend_base + blended.len() as u32;
-        if id_to > id_from {
-            let ids: Vec<u32> = (id_from..id_to).collect();
-            self.queue.write_buffer_with_u32_and_u8_slice(&self.visible_buf, id_from * 4, bytemuck::cast_slice(&ids)).map_err(js_err)?;
+        if gpu {
+            // unknown after the cull pass
+            ids[..blend_base as usize].fill(u32::MAX);
         }
+        // keep the allocations for the next frame: `ids` is now what the id buffer holds
+        self.scratch_ids = std::mem::replace(&mut self.ids_uploaded, ids);
+        let n_records = self.pool.recs.len() as u32;
 
         let mut stats = FrameStats {
             width: self.size.0,
@@ -2735,6 +2850,7 @@ impl Renderer {
             shadow_hash: cascade_mats[..n_casc].iter().flat_map(|m| m.to_cols_array()).enumerate().map(|(i, v)| v as f64 * (i as f64 * 0.618 + 1.0)).sum(),
             shadow_steps: self.shadow_step_count,
             instance_upload_bytes: upload_bytes,
+            instance_slots: n_records,
             shadow_fade: prev_weight,
             ..Default::default()
         };
@@ -2821,7 +2937,7 @@ impl Renderer {
                 let mut items = Vec::with_capacity(visible.len());
                 for (b, batch) in batches.iter().enumerate() {
                     for v in &visible[batch.3 as usize..(batch.3 + batch.4) as usize] {
-                        items.push(crate::gpu_cull::CullItem { center_radius: bounds[v.1 as usize], batch: b as u32, _pad: [0; 3] });
+                        items.push(crate::gpu_cull::CullItem { center_radius: bounds[v.1 as usize], batch: b as u32, inst: raws[v.1 as usize], _pad: [0; 2] });
                     }
                 }
                 let args: Vec<crate::gpu_cull::DrawArgs> = batches

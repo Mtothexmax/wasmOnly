@@ -35,8 +35,9 @@ struct VsOut {
     @location(3) @interpolate(flat) inst: u32,
 }
 
-// Instance indirection: the main pass draws visible_ids[first_instance + k] (identity on the CPU
-// path, compacted by cull.wgsl on the GPU path).
+// Instance indirection: draw instance k reads the record in slot visible_ids[first_instance + k].
+// Records keep a stable slot per entity (only changed ones are uploaded); the id lists are written
+// per frame (opaque: by cull.wgsl on the GPU path).
 @group(0) @binding(4) var<storage, read> visible_ids: array<u32>;
 
 const PI: f32 = 3.14159265;

@@ -153,10 +153,14 @@ normal `cargo` output above it.
   Test: `games/demo/tests/shadowcache.txt`.
 - **Blend pass skip:** with no transparent draws, particles or water the opaque pass resolves straight into the HDR
   target (saves a load + store of the 4x MSAA target).
-- **Instance upload:** only the 6 KB chunks of the instance buffer that changed since the last frame are written
-  (`stats.render.instance_upload_bytes`); the audio listener is only updated for positional voices and a moved camera.
-  Uncapped frame-time spikes (short frame after a long one) are Chrome's submit queue when GPU-bound; pacing with
-  `onSubmittedWorkDone` was tried and is much worse on the main thread (the promise resolves late).
+- **Instance upload:** every drawn or shadow-casting entity owns a stable slot in the instance buffer (`InstancePool`
+  in `renderer.rs`; a faded entity has a second slot for its shadow copy). A record is uploaded only when it changed;
+  draws go through 4-byte id lists (`visible_ids`: opaque written by `cull.wgsl` on the GPU path, blended and
+  shadow casters by the CPU), so a changing visible set no longer shifts the records. Unused slots are freed after a
+  few frames. `stats.render.instance_upload_bytes` (records + ids), `instance_slots`. Brickhollow walking: ~500 KB
+  -> ~10 KB per frame, uncapped p95 17 -> 11 ms. The audio listener is only updated for positional voices and a
+  moved camera. Pacing with `onSubmittedWorkDone` was tried and is much worse on the main thread (the promise
+  resolves late).
 - **Benchmarking against other engines:** count frames engine-neutrally (hook on `getCurrentTexture`), run Chrome
   uncapped (`--disable-gpu-vsync --disable-frame-rate-limit`), and make sure the GPU is quiet first: the Windows
   counter `\GPU Engine(*engtype_3D)\Utilization Percentage` per process shows other browsers or an idle debug

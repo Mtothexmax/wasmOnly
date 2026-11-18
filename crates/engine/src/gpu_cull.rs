@@ -40,7 +40,9 @@ pub(crate) struct CullParams {
 pub(crate) struct CullItem {
     pub center_radius: [f32; 4],
     pub batch: u32,
-    pub _pad: [u32; 3],
+    /// Slot of the instance record in the instance buffer (written to the visible list).
+    pub inst: u32,
+    pub _pad: [u32; 2],
 }
 
 #[repr(C)]
