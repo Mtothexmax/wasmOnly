@@ -665,6 +665,7 @@ fn frame<G: Game>(c: &mut Ctx, game: &mut G, dt: f32) {
     c.input.poll_gamepad();
     resize(c);
 
+    c.physics.begin_frame();
     if !c.time.paused {
         c.time.accumulator += dt * c.time.time_scale;
         let mut n = 0;

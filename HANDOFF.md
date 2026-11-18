@@ -20,7 +20,7 @@ Rust → `wasm32-unknown-unknown` → Chrome (WebGPU). AI-first: every runtime s
 | Look | PBR, cascaded shadows, clustered point/spot lights, physically based sky (clouds, stars, moon, skybox) with day/night cycle, fog, bloom, depth darkening, particles, Unreal-style water (Gerstner waves, refraction, SSR, caustics, foam), render to texture, adaptive resolution |
 | UI | DOM HUD slots with `data-action` buttons (`ui`), clickable world panels (`panel`), world-anchored labels |
 | Audio | 3D sounds, procedural sfx presets, streamed music (`audio`) |
-| Physics | rapier3d (`physics`) |
+| Physics | rapier3d (`physics`): bodies, collision events (`collision_events`, `entered`, `exited`, `inside`), trigger zones (`ctx.spawn_trigger`), overlap / sphere-cast / ray queries |
 
 ## 2. Start a project
 

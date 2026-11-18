@@ -56,7 +56,7 @@ Debugging in DevTools: the dev build contains DWARF for engine and game code. Wi
 | Scene | hecs ECS, `Transform` + `Parent` → `GlobalTransform` | ✅ |
 | Assets | Runtime only glTF 2.0 (`.glb`), images via `createImageBitmap`, cache per URL, all asynchronous. Mipmaps generated on the GPU, 8× anisotropic filtering | ✅ · KTX2 and texture streaming missing |
 | Foreign formats | `tools/asset-cook` (russimp/Assimp, native): OBJ/FBX/DAE/3DS/… → `.glb` | ✅ |
-| Physics | rapier3d 0.36 as the fixed module, `Body` component, raycasts, CCD | ✅ |
+| Physics | rapier3d 0.36 as the fixed module, `Body` component, raycasts, CCD; **collision detection** for game logic: start/stop events for every touching pair (contacts, sensors, character touches) without collider flags, trigger zones with enter/exit/inside, overlap (sphere, box) and sphere-cast queries; kinematic obstacles push characters out | ✅ |
 | GUI / HUD | DOM overlay: HUD slots, `data-action` clicks, `WorldLabel` (anchored in the world) | ✅ |
 | 3D GUI | **World panels**: 2D widgets (label, button, bar, rect) drawn with Canvas2D into a texture on a 3D quad. Clicks by ray and UV, occlusion by physics, same action queue as the HUD | ✅ · SVG→texture (resvg) missing |
 | Input | Keyboard, pointer, wheel, pointer lock, gamepad; DOM UI and world panels take precedence | ✅ |

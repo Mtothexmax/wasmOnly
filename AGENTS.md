@@ -79,6 +79,19 @@ normal `cargo` output above it.
   name the blocking entity. Low edges and seams between boxes (where rapier's autostep does not trigger) are
   handled by a step-up retry (lift by `step_height`, move, drop); `step_ups` counts it. Step-up lab in the demo:
   `step_lab {height, radius, half_height, step_height, speed, lanes, start_spread}` + `step` + `characters`.
+- **Collision detection:** after every fixed step the touching collider pairs (solid contacts, sensor overlaps,
+  character-controller touches from a probe a few cm around the capsule) are diffed against the last step:
+  `ctx.physics.collision_events()` (this frame; `CollisionEvent {a, b, started, sensor, step}`), `entered(e)` /
+  `exited(e)` / `inside(trigger)` / `touching(e)` / `is_touching(a, b)`. No collider flags needed. Trigger zones:
+  `ctx.spawn_trigger(name, half, t)` or `physics.add_trigger(world, e, collider)` (sensor on a kinematic body that
+  follows the Transform; reports dynamic and kinematic bodies incl. characters, not static ground). Queries:
+  `overlap_sphere`, `overlap_box`, `sphere_cast`, `raycast`. Kinematic obstacles (NPCs: `physics.add(world, npc,
+  RigidBodyBuilder::kinematic_position_based(), capsule)`, root entity) block characters and push a standing
+  character out sideways when they walk into it (`characters[].pushed`; one fixed step behind the obstacle).
+  `cc.colliders` / log warnings also name static colliders without an entity ("static collider Cuboid at (x,y,z)").
+  AI API: `collisions {since?, entity?: id|name}` (events + `started`/`stopped` counts), `{touching}`, `{inside}`,
+  `overlap {pos, radius | half}`, `trigger {pos, half, name}`, `spawn {.., body: "kinematic"}`.
+  Test: `games/demo/tests/collisions.txt`.
 - **LOD:** glTF primitives with ≥ 256 triangles get vertex-clustered LODs (first switch at 40x their radius).
   Per load: `ctx.load_gltf_with(url, t, GltfOpts { auto_lod: false, .. })` or `lod_distance`; for all loads:
   `ctx.gltf_defaults`; globally: `render {lod_bias: 2}` (far cameras). `stats.render.lod_levels` shows the mix.
@@ -216,7 +229,7 @@ normal `cargo` output above it.
 | `crates/engine/src/shaders/*.wgsl` | `common.wgsl` (layouts, sky, fog) is prepended to pbr/shadow/sky/particles; `cull`, `hiz`, `mipgen`, `post` are standalone |
 | `crates/engine/src/debug.rs` | the AI API (`COMMANDS` table = `help` output) |
 | `crates/engine/src/debugmode.rs` | ` debug mode: input + camera log -> dev server `/__debuglog` -> `logs/` |
-| `crates/engine/src/physics.rs` | rapier3d wrapper, `Body` component, raycasts |
+| `crates/engine/src/physics.rs` | rapier3d wrapper, `Body` component, collision events, triggers, overlap/sphere/ray queries |
 | `crates/engine/src/gltf_loader.rs` | `.glb` loading via fetch + createImageBitmap, per-URL cache |
 | `crates/engine/src/ui.rs` | DOM HUD slots, `data-action` clicks, `WorldLabel` positioning |
 | `games/demo/` | example game; `assets/` is copied to `dist/assets/` |

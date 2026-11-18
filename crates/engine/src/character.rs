@@ -75,9 +75,15 @@ pub struct CharacterController {
     pub grounded: bool,
     pub sliding: bool,
     pub yaw: f32,
-    /// Colliding entities of the last step.
+    /// Entities touching the capsule after the last step (walls, ground, obstacles, pushed bodies).
     #[serde(skip)]
     pub collisions: Vec<Entity>,
+    /// Every collider touching the capsule, also static ones without an entity
+    /// (`ctx.physics.collider_label` names them).
+    #[serde(skip)]
+    pub colliders: Vec<ColliderHandle>,
+    /// Pushed out of kinematic obstacles (NPCs walking into it) this step, metres.
+    pub pushed: f32,
     pub jumps: u32,
     /// Seconds the character has wanted to move but could not (see the "stuck" log warning).
     pub blocked_time: f32,
@@ -130,6 +136,8 @@ impl Default for CharacterController {
             sliding: false,
             yaw: 0.0,
             collisions: vec![],
+            colliders: vec![],
+            pushed: 0.0,
             jumps: 0,
             blocked_time: 0.0,
             stuck_reports: 0,
@@ -324,7 +332,39 @@ pub(crate) fn step_characters(ctx: &mut Ctx, dt: f32) {
         cc.sliding = moved.is_sliding_down_slope;
         let actual = moved.translation / dt.max(1e-6);
         cc.velocity = Vec3::new(actual.x, if cc.grounded || ceiling { 0.0 } else { vy }, actual.z);
-        cc.collisions = hits.iter().filter_map(|c| ctx.physics.entity_of_collider(c.handle)).collect();
+        // Touch probe: every collider within a few cm of the capsule. Fills `colliders` (static ones
+        // without an entity too: "blocked by nothing" in a wall corner was a static wall the KCC hit
+        // list did not name), feeds the collision events, and pushes the character out of kinematic
+        // obstacles (NPCs) that walked into it, sideways, so it never sticks inside or jitters.
+        let mut touched: Vec<ColliderHandle> = hits.iter().map(|c| c.handle).collect();
+        let mut push = Vec3::ZERO;
+        {
+            let pw = &ctx.physics.world;
+            let pose = Pose::from_parts(t.translation, Quat::IDENTITY);
+            let probe = crate::physics::rapier::parry::shape::Capsule::new_y(cc.half_height + 0.05, cc.radius + 0.05);
+            for (ch, co) in pw.intersect_shape(pose, &probe, filter) {
+                touched.push(ch);
+                let kinematic = co.parent().and_then(|b| pw.bodies.get(b)).is_some_and(|b| b.is_kinematic());
+                if kinematic {
+                    let pos12 = pose.inv_mul(co.position());
+                    if let Ok(Some(c)) = pw.narrow_phase.query_dispatcher().contact(&pos12, &*shape, co.shape(), 0.0) {
+                        if c.dist < 0.0 {
+                            let n = pose.rotation * c.normal1;
+                            push += Vec3::new(n.x, 0.0, n.z).normalize_or_zero() * c.dist;
+                        }
+                    }
+                }
+            }
+        }
+        let push = if push.length() > 0.25 { push.normalize() * 0.25 } else { push };
+        t.translation += push;
+        cc.pushed = push.length();
+        touched.sort_by_key(|h| h.into_raw_parts());
+        touched.dedup();
+        cc.collisions = touched.iter().filter_map(|&h| ctx.physics.entity_of_collider(h)).collect();
+        cc.collisions.dedup();
+        ctx.physics.probe_hits.extend(touched.iter().map(|&h| (collider, h)));
+        cc.colliders = touched;
 
         // Self-diagnosis: input that has no effect is logged (with what blocks it), so a "jump /
         // walk does nothing" report shows its cause in the log instead of needing a repro.
@@ -336,19 +376,19 @@ pub(crate) fn step_characters(ctx: &mut Ctx, dt: f32) {
             cc.blocked_time = 0.0;
         }
         cc.warn_cooldown = (cc.warn_cooldown - dt).max(0.0);
-        let names = |ctx_w: &hecs::World, list: &[Entity]| -> String {
-            let mut v: Vec<String> = list.iter().take(3).map(|e| format!("{}#{}", ctx_w.get::<&crate::scene::Name>(*e).map(|n| n.0.clone()).unwrap_or_default(), e.id())).collect();
+        let names = |ctx_w: &hecs::World, list: &[ColliderHandle]| -> String {
+            let mut v: Vec<String> = list.iter().take(4).map(|&h| ctx.physics.collider_label(ctx_w, h)).collect();
             v.dedup();
             if v.is_empty() { "nothing (no collision reported)".into() } else { v.join(", ") }
         };
         if cc.blocked_time > 0.5 && cc.warn_cooldown <= 0.0 {
             cc.warn_cooldown = 3.0;
             cc.stuck_reports += 1;
-            crate::log_warn!("character #{} stuck: wants {:.1} m/s, moves {:.2} m/s, blocked by {} (grounded={})", e.id(), want_speed, got_speed, names(&ctx.world, &cc.collisions), cc.grounded);
+            crate::log_warn!("character #{} stuck: wants {:.1} m/s, moves {:.2} m/s, blocked by {} (grounded={})", e.id(), want_speed, got_speed, names(&ctx.world, &cc.colliders), cc.grounded);
         }
         if ceiling && cc.warn_cooldown <= 0.0 {
             cc.warn_cooldown = 3.0;
-            crate::log_warn!("character #{} jump blocked after {:.2} m by {}", e.id(), rise, names(&ctx.world, &cc.collisions));
+            crate::log_warn!("character #{} jump blocked after {:.2} m by {}", e.id(), rise, names(&ctx.world, &cc.colliders));
         }
         if pressed && cc.jumps == jumps_before && cc.since_ground > cc.coyote_time + cc.jump_buffer && cc.warn_cooldown <= 0.0 {
             // pressed while airborne: normal, but if it repeats the player is likely stuck in the air
@@ -356,7 +396,7 @@ pub(crate) fn step_characters(ctx: &mut Ctx, dt: f32) {
             if cc.airborne_presses >= 3 {
                 cc.warn_cooldown = 3.0;
                 cc.airborne_presses = 0;
-                crate::log_warn!("character #{} jump pressed while not grounded {:.1} s (velocity y {:.2}, touching {})", e.id(), cc.since_ground, cc.velocity.y, names(&ctx.world, &cc.collisions));
+                crate::log_warn!("character #{} jump pressed while not grounded {:.1} s (velocity y {:.2}, touching {})", e.id(), cc.since_ground, cc.velocity.y, names(&ctx.world, &cc.colliders));
             }
         } else if cc.grounded {
             cc.airborne_presses = 0;
@@ -518,7 +558,7 @@ pub fn describe_characters(world: &hecs::World) -> serde_json::Value {
         .map(|(e, cc, t)| {
             serde_json::json!({"id": e.id(), "pos": t.translation.to_array(), "grounded": cc.grounded, "velocity": cc.velocity.to_array(),
                 "jumps": cc.jumps, "jump_held": cc.jump, "wish": cc.wish.to_array(), "blocked_time": cc.blocked_time, "stuck_reports": cc.stuck_reports, "step_ups": cc.step_ups,
-                "touching": cc.collisions.iter().map(|c| c.id()).collect::<Vec<_>>()})
+                "touching": cc.collisions.iter().map(|c| c.id()).collect::<Vec<_>>(), "touching_colliders": cc.colliders.len(), "pushed": cc.pushed})
         })
         .collect();
     serde_json::Value::Array(list)

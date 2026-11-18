@@ -1,0 +1,40 @@
+# Collision detection: trigger enter/exit, blocking + pushing kinematic obstacles (NPCs), events.
+#   node tools/bridge.mjs run games/demo/tests/collisions.txt
+
+reload
+screen play
+pause
+# play the character controller figure (the critter)
+key KeyC
+step 5
+expect game_state.state.control == "walker"
+
+# a door trigger across the path and an NPC-like kinematic box behind it
+call trigger {"pos":[2.5,1,8],"half":[1.5,1,0.3],"name":"door"}
+call spawn {"shape":"cube","pos":[2.5,0.9,6.3],"size":1,"color":"#ff8800","body":"kinematic","name":"npc"}
+step 2
+# triggers report moving things only, not the ground they touch
+expect collisions{"entity":"door"}.started == 0
+
+down KeyW
+step 150
+up KeyW
+step 5
+# walked through the door: entered and left it
+expect collisions{"entity":"door"}.started >= 1
+expect collisions{"entity":"door"}.stopped >= 1
+# stopped by the box (not walked through it), the touch is an event with the npc
+expect characters.characters.0.pos.2 > 6.95
+expect collisions{"entity":"npc"}.started >= 1
+expect overlap{"pos":[2.5,0.9,6.3],"radius":0.2}.count == 1
+
+# the box walks into the standing character: it is pushed back, never stuck inside
+call set {"name":"npc","pos":[2.5,0.9,6.6]}
+step 1
+call set {"name":"npc","pos":[2.5,0.9,6.9]}
+step 1
+call set {"name":"npc","pos":[2.5,0.9,7.2]}
+step 1
+call set {"name":"npc","pos":[2.5,0.9,7.4]}
+step 3
+expect characters.characters.0.pos.2 > 8.1

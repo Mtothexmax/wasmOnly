@@ -34,6 +34,9 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("lights", "Clustered lights: counts + last frame stats. args: {add?: {pos, color?, intensity?, range?, spot?: true, dir?, inner_deg?, outer_deg?}, grid?: {n, spacing?, center?} (stress test), clear_test?: true}"),
     ("generate", "Procedural generators (geom kit). No args: list. args: {name, params?: {...}, seed?: 1, pos?: [x,y,z], yaw_deg?, regenerate?: true (drop cache)}"),
     ("batch", "Static batches + moving (Motion) instances. args: {id?: root entity to batch now, cell?: 64}"),
+    ("collisions", "Collision events (start/stop of solid contacts, sensor/trigger overlaps, character touches), newest last. args: {since?: step, entity?: id|name, limit?: 64} (started/stopped = counts) | {touching: id|name} | {inside: trigger id|name}"),
+    ("overlap", "Entities overlapping a sphere or box. args: {pos, radius?: 1} | {pos, half: [x,y,z]}, sensors?: false"),
+    ("trigger", "Spawn a box trigger zone (sensor, reports enter/exit). args: {pos, half?: [1,1,1], name?: 'trigger'}"),
     ("gpu_scene", "GPU-driven scene of the main view: object slots, draw groups, id-buffer layout, last GPU counters (frustum, occluded, visible, shadow instances, LOD levels)"),
     ("render_texture", "Render textures (portraits, mirrors). args: {id?, render?: true (re-render once), export?: true (PNG blob URL -> url)}"),
     ("animation", "Animators (glTF clips, skinning, morph targets). args: {id?, play?: clip, fade?: 0.2, speed?: 1, looped?: true, stop?: true, morph?: index, weight?: w}"),
@@ -44,7 +47,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("entities", "List entities. args: {name?: substring, limit?: 200, with?: 'mesh'|'body'|'light'|'label'|'camera'}"),
     ("entity", "Full detail of one entity. args: {id}"),
     ("set", "Modify an entity. args: {id, pos?: [x,y,z], rot?: [deg x,y,z], scale?: [x,y,z], vel?: [x,y,z], color?: '#rrggbb', opacity?: 0..1 (this entity and its children; keeps its shadow)}"),
-    ("spawn", "Spawn a primitive or a glTF model. args: {shape: 'cube'|'sphere', pos, size?: 1, color?: '#rrggbb', body?: 'dynamic'|'fixed'|'none', name?} or {gltf: 'assets/x.glb', pos, size?: scale, auto_lod?: bool}"),
+    ("spawn", "Spawn a primitive or a glTF model. args: {shape: 'cube'|'sphere', pos, size?: 1, color?: '#rrggbb', body?: 'dynamic'|'fixed'|'kinematic'|'none', name?} or {gltf: 'assets/x.glb', pos, size?: scale, auto_lod?: bool}"),
     ("despawn", "Remove entity and children. args: {id}"),
     ("pause", "Pause simulation (rendering continues)."),
     ("resume", "Resume simulation."),
@@ -499,6 +502,11 @@ pub(crate) fn handle<G: Game>(
                     ctx.physics
                         .add(&mut ctx.world, e, RigidBodyBuilder::fixed(), collider);
                 }
+                "kinematic" => {
+                    // moved by its Transform (`set {id, pos}`): obstacles like NPCs
+                    ctx.physics
+                        .add(&mut ctx.world, e, RigidBodyBuilder::kinematic_position_based(), collider);
+                }
                 _ => {}
             }
             crate::scene::propagate_transforms(&mut ctx.world);
@@ -721,6 +729,14 @@ pub(crate) fn handle<G: Game>(
         "generate" => ctx.generate_command(a),
         "batch" => ctx.batch_command(a),
         "gpu_scene" => Ok(ctx.renderer.gpu_scene_info()),
+        "collisions" => ctx.collisions_command(a),
+        "overlap" => ctx.overlap_command(a),
+        "trigger" => {
+            let pos = v3(&a["pos"]).ok_or("pos: [x,y,z] required")?;
+            let half = v3(&a["half"]).unwrap_or(Vec3::ONE);
+            let e = ctx.spawn_trigger(a["name"].as_str().unwrap_or("trigger"), half, crate::scene::Transform::from_translation(pos));
+            Ok(json!({"id": e.id()}))
+        }
         "animation" => ctx.animation_command(a),
         "render_texture" => {
             if let Some(id) = a["id"].as_u64() {
