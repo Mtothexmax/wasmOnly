@@ -64,11 +64,18 @@ pub struct AutoCheck {
     last_report: String,
     pub runs: u32,
     pub last_pairs: u32,
+    /// Triangles near the camera at the last skip (0 = not skipped).
+    pub skipped_triangles: u64,
+    pub last_ms: f64,
 }
 
 impl AutoCheck {
     /// Automatic check radius around the camera (m): big streamed worlds would take seconds.
     pub const RADIUS: f32 = 80.0;
+    /// Above this many triangles near the camera the automatic check is skipped (it is O(n log n)
+    /// on the CPU and blocks the frame: ~1 s per 100k triangles in a debug build). Run
+    /// `zfight {radius}` by hand instead.
+    pub const MAX_TRIANGLES: u64 = 150_000;
 
     pub(crate) fn tick(&mut self, world: &World, renderer: &Renderer, pending_models: usize, now: f64, camera: Option<Vec3>) {
         if !cfg!(debug_assertions) {
@@ -85,10 +92,32 @@ impl AutoCheck {
             return;
         }
         self.due_ms = None;
+        // cheap estimate first: triangles of instances whose centre is within the radius
+        if let Some(c) = camera {
+            let mut tris = 0u64;
+            for (g, mr) in world.query::<(&GlobalTransform, &MeshRenderer)>().iter() {
+                if g.translation().distance_squared(c) < (Self::RADIUS * 1.2).powi(2) {
+                    tris += renderer.mesh(mr.mesh).map(|m| m.index_count as u64 / 3).unwrap_or(0);
+                }
+            }
+            if tris > Self::MAX_TRIANGLES {
+                if self.skipped_triangles == 0 {
+                    crate::log_info!("automatic z-fighting check skipped: {tris} triangles within {} m (limit {}); run engine.call('zfight', {{radius: 20}}) by hand", Self::RADIUS, Self::MAX_TRIANGLES);
+                }
+                self.skipped_triangles = tris;
+                return;
+            }
+            self.skipped_triangles = 0;
+        }
         self.runs += 1;
+        let t0 = crate::log::now_ms();
         let r = find_near(world, renderer, 0.002, 0.002, 3, Mat4::IDENTITY, Vec2::ZERO, camera.map(|c| (c, Self::RADIUS)));
         let pairs = r["pairs"].as_u64().unwrap_or(0) as u32;
         self.last_pairs = pairs;
+        self.last_ms = crate::log::now_ms() - t0;
+        if self.last_ms > 100.0 {
+            crate::log_warn!("automatic z-fighting check blocked the frame for {:.0} ms", self.last_ms);
+        }
         let report = if pairs == 0 {
             String::new()
         } else {
