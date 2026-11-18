@@ -210,6 +210,9 @@ pub(crate) fn step_characters(ctx: &mut Ctx, dt: f32) {
         let k = (1.0 - (-cc.acceleration * control * dt).exp()).clamp(0.0, 1.0);
         let h = Vec3::new(cc.velocity.x, 0.0, cc.velocity.z);
         let h = h + (target - h) * k;
+        // standing still: the exponential approach never reaches 0 exactly; stop below 5 cm/s
+        let idle = cc.grounded && wish.length_squared() < 1e-6;
+        let h = if idle && h.length() < 0.05 { Vec3::ZERO } else { h };
 
         // vertical
         let mut vy = cc.velocity.y;
@@ -310,6 +313,11 @@ pub(crate) fn step_characters(ctx: &mut Ctx, dt: f32) {
         if cc.push_mass > 0.0 && !hits.is_empty() {
             let mut qpm = pw.broad_phase.as_query_pipeline_mut(pw.narrow_phase.query_dispatcher(), &mut pw.bodies, &mut pw.colliders, filter);
             kcc.solve_character_collision_impulses(dt, &mut qpm, &*shape, cc.push_mass, &hits);
+        }
+        // idle on the ground: drop sub-millimetre corrections of the collision solver (contact
+        // offset, depenetration), so a standing character and its follow camera stay exactly still
+        if idle && h == Vec3::ZERO && cc.jumps == jumps_before && !moved.is_sliding_down_slope && moved.grounded && moved.translation.length() < 0.002 {
+            moved.translation = Vec3::ZERO;
         }
         t.translation += moved.translation;
         cc.grounded = moved.grounded && vy <= 0.0;

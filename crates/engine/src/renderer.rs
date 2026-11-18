@@ -2198,6 +2198,9 @@ impl Renderer {
                 let mut c_ls = rot.transform_point3(center);
                 c_ls.x = (c_ls.x / texel).floor() * texel;
                 c_ls.y = (c_ls.y / texel).floor() * texel;
+                // along the light too (only shifts depth values): tiny camera motion keeps the
+                // cascade matrix bit-identical
+                c_ls.z = (c_ls.z / 0.5).floor() * 0.5;
                 let center = rot.inverse().transform_point3(c_ls);
                 let back = r + 120.0; // casters up to 120 m beyond the slice towards the sun
                 let lv = Mat4::look_at_rh(center - dir * back, center, up);
