@@ -102,6 +102,9 @@ normal `cargo` output above it.
   the scene, ambient; `sky {time: 18.5}` (turns the cycle on), `{cycle, day_length (min per day, 0 = still), mode:
   "atmosphere"|"gradient", clouds, stars, moon, skybox: url|null, skybox_blend, skybox_night_blend}`. The clock follows
   the simulation (`pause` + `step` are deterministic). Everything else via `render` (`sun_azimuth_deg`, ...).
+  Moving sun: shadows follow the light in `shadow_step_deg` steps (default 0.5) with a `shadow_fade_ms` cross-fade
+  (default 400; a second shadow-map set is allocated on first use), so the texel grid does not re-snap every frame
+  (shimmering edges). `shadow_step_deg: 0` = follow every frame.
   Lens flare: `render {lens_flare: 0..}` (0 = off); test `games/demo/tests/flare.txt` (visible / hidden behind the tower).
 - **Water:** `Material::water` + `ctx.spawn_water(name, mat, size, t)` / `ctx.spawn_ocean(mat, y)`; tune `wave_height`,
   `wave_scale`, `water_chop`, `water_clarity`, `water_foam`, `water_vertex_spacing`; `render {water_ssr, water_refraction,

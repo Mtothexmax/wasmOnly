@@ -42,6 +42,8 @@ struct Globals {
     misc: vec4f,           // x = water SSR on, y = water refraction, z = water caustics, w = atmosphere intensity
     scene_min: vec4f,      // xyz = world bounds of the opaque scene (padded); min > max = nothing drawn
     scene_max: vec4f,
+    cascades_prev: array<mat4x4f, 4>, // previous shadow direction while cross-fading (stepped sun)
+    shadow_sets: vec4f,               // x = first layer of the current set, y = of the previous set, z = previous weight
 }
 
 struct Instance {

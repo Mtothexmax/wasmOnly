@@ -150,10 +150,12 @@ fn brdf(n: vec3f, v: vec3f, l: vec3f, albedo: vec3f, metallic: f32, rough: f32) 
     return (kd * albedo / PI + spec) * n_l;
 }
 
-fn cascade_shadow(world: vec3f, n: vec3f, k: u32) -> f32 {
+fn cascade_shadow(world: vec3f, n: vec3f, k: u32, prev: bool) -> f32 {
     // normal offset scaled by the cascade's texel size (no acne on near cascades, no peter-panning far)
     let biased = world + n * g.cascade_texel[k] * 1.5;
-    let lp = g.cascades[k] * vec4f(biased, 1.0);
+    var m = g.cascades[k];
+    if (prev) { m = g.cascades_prev[k]; }
+    let lp = m * vec4f(biased, 1.0);
     let ndc = lp.xyz / lp.w;
     let uv = ndc.xy * vec2f(0.5, -0.5) + vec2f(0.5);
     if (any(uv < vec2f(0.0)) || any(uv > vec2f(1.0)) || ndc.z > 1.0) { return 1.0; }
@@ -169,7 +171,7 @@ fn cascade_shadow(world: vec3f, n: vec3f, k: u32) -> f32 {
     let ua = (base - 0.5 + 1.0 / wa) / size;
     let ub = (base + 1.5 + f / wb) / size;
     let z = ndc.z - 0.0008;
-    let layer = i32(k);
+    let layer = i32(k) + i32(select(g.shadow_sets.x, g.shadow_sets.y, prev));
     var sum = wa.x * wa.y * textureSampleCompareLevel(shadow_map, shadow_sampler, ua, layer, z);
     sum += wb.x * wa.y * textureSampleCompareLevel(shadow_map, shadow_sampler, vec2f(ub.x, ua.y), layer, z);
     sum += wa.x * wb.y * textureSampleCompareLevel(shadow_map, shadow_sampler, vec2f(ua.x, ub.y), layer, z);
@@ -178,8 +180,17 @@ fn cascade_shadow(world: vec3f, n: vec3f, k: u32) -> f32 {
 }
 
 // Cascaded shadow maps: cascade by view depth, blended over the last 15% of each cascade, faded
-// out at the shadow distance.
+// out at the shadow distance. While a stepped sun cross-fades, the previous direction's set is
+// blended in (weight shadow_sets.z).
 fn shadow_factor(world: vec3f, n: vec3f) -> f32 {
+    let s = shadow_set_factor(world, n, false);
+    if (g.shadow_sets.z > 0.0) {
+        return mix(s, shadow_set_factor(world, n, true), g.shadow_sets.z);
+    }
+    return s;
+}
+
+fn shadow_set_factor(world: vec3f, n: vec3f, prev: bool) -> f32 {
     let vz = -(g.view * vec4f(world, 1.0)).z;
     let count = g.counts.w;
     var k = 0u;
@@ -188,14 +199,14 @@ fn shadow_factor(world: vec3f, n: vec3f) -> f32 {
         k++;
     }
     if (k >= count) { return 1.0; }
-    var s = cascade_shadow(world, n, k);
+    var s = cascade_shadow(world, n, k, prev);
     let start = select(0.0, g.cascade_splits[max(k, 1u) - 1u], k > 0u);
     let end = g.cascade_splits[k];
     let band = mix(start, end, 0.85);
     let t = clamp((vz - band) / max(end - band, 1e-3), 0.0, 1.0);
     if (t > 0.0) {
         var next = 1.0;
-        if (k + 1u < count) { next = cascade_shadow(world, n, k + 1u); }
+        if (k + 1u < count) { next = cascade_shadow(world, n, k + 1u, prev); }
         s = mix(s, next, t);
     }
     return s;

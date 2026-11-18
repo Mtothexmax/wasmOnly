@@ -236,6 +236,13 @@ pub struct RenderSettings {
     pub shadow_cascades: u32,
     /// Split distribution: 0 = linear, 1 = logarithmic.
     pub shadow_split_lambda: f32,
+    /// A moving sun (day cycle) re-snaps the shadow-map texel grid every frame, so shadow edges
+    /// shimmer. The shadow projection therefore follows the light in steps of this many degrees
+    /// (lighting itself stays continuous); 0 = follow every frame.
+    pub shadow_step_deg: f32,
+    /// Cross-fade between the old and new shadow direction at each step (ms; 0 = jump). Renders the
+    /// cascades twice while fading (a second shadow-map set is allocated on first use).
+    pub shadow_fade_ms: f32,
     /// Light clusters cover depths up to this distance (lights beyond use the last slice).
     pub light_cluster_far: f32,
     /// Cull on the GPU (compute) and draw with drawIndexedIndirect (needs indirect-first-instance).
@@ -365,6 +372,8 @@ impl Default for RenderSettings {
             shadow_distance: 160.0,
             shadow_cascades: 4,
             shadow_split_lambda: 0.8,
+            shadow_step_deg: 0.5,
+            shadow_fade_ms: 400.0,
             light_cluster_far: 400.0,
             gpu_culling: true,
             occlusion_culling: true,
@@ -505,6 +514,10 @@ struct Globals {
     misc: [f32; 4],
     scene_min: [f32; 4],
     scene_max: [f32; 4],
+    cascades_prev: [[[f32; 4]; 4]; MAX_CASCADES],
+    /// x = first layer of the current cascade set, y = of the previous set, z = weight of the
+    /// previous set (cross-fade, 0 = none)
+    shadow_sets: [f32; 4],
 }
 
 /// Sky resources shared by every view: the atmosphere LUT (rendered per view), its sampler, the
@@ -628,6 +641,13 @@ pub struct Renderer {
     shadow_view: GpuTextureView,
     shadow_layers: Vec<GpuTextureView>,
     shadow_size: u32,
+    /// Shadow-map sets allocated (1, or 2 once a stepped sun cross-fades).
+    shadow_sets: u32,
+    /// Stepped shadow direction, the set it is rendered into, and the cross-fade from the previous
+    /// direction (direction, start ms).
+    shadow_dir: Option<Vec3>,
+    shadow_cur_set: u32,
+    shadow_fade: Option<(Vec3, f64)>,
     cascade_buf: GpuBuffer,
     /// Clustered lighting buffers (lights, cluster grid, light index list).
     light_bufs: LightBufs,
@@ -1001,20 +1021,11 @@ impl Renderer {
             gpu_texture_usage::RENDER_ATTACHMENT | gpu_texture_usage::TEXTURE_BINDING,
         );
         st.set_label("shadow-cascades");
-        let shadow_tex = device.create_texture(&st).map_err(js_err)?;
-        let svd = GpuTextureViewDescriptor::new();
-        svd.set_dimension(GpuTextureViewDimension::N2dArray);
-        let shadow_view = shadow_tex.create_view_with_descriptor(&svd).map_err(js_err)?;
-        let mut shadow_layers = vec![];
-        for k in 0..MAX_CASCADES as u32 {
-            let d = GpuTextureViewDescriptor::new();
-            d.set_dimension(GpuTextureViewDimension::N2d);
-            d.set_base_array_layer(k);
-            d.set_array_layer_count(1);
-            shadow_layers.push(shadow_tex.create_view_with_descriptor(&d).map_err(js_err)?);
-        }
+        drop(st);
+        let (shadow_view, shadow_layers) = Self::make_shadow_maps(&device, shadow_size, 1)?;
+        // two sets of cascade slots: the second one is used while a stepped sun cross-fades
         let cascade_buf = device
-            .create_buffer(&GpuBufferDescriptor::new(CASCADE_SLOT * MAX_CASCADES as u32, gpu_buffer_usage::UNIFORM | gpu_buffer_usage::COPY_DST))
+            .create_buffer(&GpuBufferDescriptor::new(CASCADE_SLOT * 2 * MAX_CASCADES as u32, gpu_buffer_usage::UNIFORM | gpu_buffer_usage::COPY_DST))
             .map_err(js_err)?;
         let light_bufs = LightBufs::new(&device, 256, 16384)?;
         let sd = GpuSamplerDescriptor::new();
@@ -1130,6 +1141,10 @@ impl Renderer {
             shadow_view,
             shadow_layers,
             shadow_size,
+            shadow_sets: 1,
+            shadow_dir: None,
+            shadow_cur_set: 0,
+            shadow_fade: None,
             cascade_buf,
             light_bufs,
             shadow_sampler,
@@ -1249,7 +1264,7 @@ impl Renderer {
             ],
             bgl0,
         ));
-        let shadow = (0..MAX_CASCADES as u32)
+        let shadow = (0..2 * MAX_CASCADES as u32)
             .map(|k| {
                 let b = GpuBufferBinding::new(cascade_buf);
                 b.set_offset(k * CASCADE_SLOT);
@@ -1265,6 +1280,46 @@ impl Renderer {
             })
             .collect();
         (full, shadow)
+    }
+
+    /// Shadow-map array with `sets` x MAX_CASCADES layers (+ one attachment view per layer).
+    fn make_shadow_maps(device: &GpuDevice, size: u32, sets: u32) -> Result<(GpuTextureView, Vec<GpuTextureView>), String> {
+        let layers = sets * MAX_CASCADES as u32;
+        let st = GpuTextureDescriptor::new(SHADOW_FORMAT, &nums(&[size, size, layers]), gpu_texture_usage::RENDER_ATTACHMENT | gpu_texture_usage::TEXTURE_BINDING);
+        st.set_label("shadow-cascades");
+        let tex = device.create_texture(&st).map_err(js_err)?;
+        let svd = GpuTextureViewDescriptor::new();
+        svd.set_dimension(GpuTextureViewDimension::N2dArray);
+        let view = tex.create_view_with_descriptor(&svd).map_err(js_err)?;
+        let mut views = vec![];
+        for k in 0..layers {
+            let d = GpuTextureViewDescriptor::new();
+            d.set_dimension(GpuTextureViewDimension::N2d);
+            d.set_base_array_layer(k);
+            d.set_array_layer_count(1);
+            views.push(tex.create_view_with_descriptor(&d).map_err(js_err)?);
+        }
+        Ok((view, views))
+    }
+
+    /// Allocates the second shadow-map set (cross-fading a stepped sun). False if that failed.
+    fn ensure_two_shadow_sets(&mut self) -> bool {
+        if self.shadow_sets >= 2 {
+            return true;
+        }
+        match Self::make_shadow_maps(&self.device, self.shadow_size, 2) {
+            Ok((view, layers)) => {
+                self.shadow_view = view;
+                self.shadow_layers = layers;
+                self.shadow_sets = 2;
+                self.rebuild_bind0();
+                true
+            }
+            Err(e) => {
+                crate::log_warn!("second shadow-map set: {e} (stepped sun jumps instead of fading)");
+                false
+            }
+        }
     }
 
     /// Sky LUT target + pipeline (uniform globals only), sky sampler, 1x1 skybox placeholder.
@@ -2053,55 +2108,114 @@ impl Renderer {
         }
         let cam_fwd = -view.inverse().z_axis.truncate();
 
+        // --- Shadow direction: follows the light in steps (a rotating light re-snaps the texel grid
+        // every frame = shimmering edges); each step cross-fades from the previous direction
+        let light = self.settings.sun_dir.normalize_or(Vec3::NEG_Y);
+        let now = crate::log::now_ms();
+        let fade_ms = self.settings.shadow_fade_ms.max(0.0) as f64;
+        if main {
+            let step = self.settings.shadow_step_deg.max(0.0).to_radians();
+            match self.shadow_dir {
+                Some(d) if step > 0.0 => {
+                    let ang = d.dot(light).clamp(-1.0, 1.0).acos();
+                    if ang > 10f32.to_radians() {
+                        // a jump (sun set by hand, teleported time): no fade
+                        self.shadow_dir = Some(light);
+                        self.shadow_fade = None;
+                    } else if ang >= step {
+                        if fade_ms > 0.0 && self.ensure_two_shadow_sets() {
+                            self.shadow_fade = Some((d, now));
+                            self.shadow_cur_set ^= 1;
+                        }
+                        self.shadow_dir = Some(light);
+                    }
+                }
+                _ => {
+                    self.shadow_dir = Some(light);
+                    self.shadow_fade = None;
+                }
+            }
+            if self.shadow_fade.is_some_and(|(_, t0)| now - t0 >= fade_ms) {
+                self.shadow_fade = None;
+            }
+        }
+        let shadow_dir = self.shadow_dir.unwrap_or(light);
+        let fading = self.shadow_fade.filter(|_| self.shadow_sets >= 2);
+        let prev_weight = fading.map(|(_, t0)| (1.0 - (now - t0) / fade_ms.max(1.0)).clamp(0.0, 1.0) as f32).unwrap_or(0.0);
+        let cur_set = if self.shadow_sets >= 2 { self.shadow_cur_set } else { 0 };
+
         // --- Shadow cascades: bounding sphere per view-depth slice (rotation-stable), texel-snapped
         let s = &self.settings;
-        let dir = s.sun_dir.normalize_or(Vec3::NEG_Y);
-        let up = if dir.y.abs() > 0.99 { Vec3::Z } else { Vec3::Y };
         let n_casc = s.shadow_cascades.clamp(1, MAX_CASCADES as u32) as usize;
         let shadow_far = s.shadow_distance.max(near * 4.0).min(far);
         let (tan_x, tan_y) = (1.0 / proj.x_axis.x, 1.0 / proj.y_axis.y);
         let inv_view = view.inverse();
-        let rot = Mat4::look_at_rh(Vec3::ZERO, dir, up);
-        let mut cascades = [[[0.0f32; 4]; 4]; MAX_CASCADES];
-        let mut cascade_mats = [Mat4::IDENTITY; MAX_CASCADES];
         let mut splits = [0.0f32; 4];
-        let mut texels = [0.0f32; 4];
-        // (light view matrix, half size, depth range) per cascade, for caster culling
-        let mut cascade_boxes: Vec<(Mat4, f32, f32)> = vec![];
+        let mut slices = [(0.0f32, 0.0f32); MAX_CASCADES];
         for k in 0..n_casc {
             let f = (k + 1) as f32 / n_casc as f32;
             let lin = near + (shadow_far - near) * f;
             let log = near * (shadow_far / near).powf(f);
             let z1 = lin + (log - lin) * s.shadow_split_lambda;
-            let z0 = if k == 0 { near } else { splits[k - 1] };
+            slices[k] = (if k == 0 { near } else { splits[k - 1] }, z1);
             splits[k] = z1;
-            let mut center = Vec3::ZERO;
-            let mut corners = [Vec3::ZERO; 8];
-            for (ci, c) in corners.iter_mut().enumerate() {
-                let z = if ci < 4 { z0 } else { z1 };
-                let sx = if ci & 1 == 0 { -1.0 } else { 1.0 };
-                let sy = if ci & 2 == 0 { -1.0 } else { 1.0 };
-                *c = inv_view.transform_point3(Vec3::new(sx * tan_x * z, sy * tan_y * z, -z));
-                center += *c / 8.0;
-            }
-            let r = corners.iter().map(|c| c.distance(center)).fold(0.0f32, f32::max);
-            let r = (r * 16.0).ceil() / 16.0;
-            let texel = 2.0 * r / self.shadow_size as f32;
-            let mut c_ls = rot.transform_point3(center);
-            c_ls.x = (c_ls.x / texel).floor() * texel;
-            c_ls.y = (c_ls.y / texel).floor() * texel;
-            let center = rot.inverse().transform_point3(c_ls);
-            let back = r + 120.0; // casters up to 120 m beyond the slice towards the sun
-            let lv = Mat4::look_at_rh(center - dir * back, center, up);
-            let lp = Mat4::orthographic_rh(-r, r, -r, r, 0.0, back + r);
-            cascade_mats[k] = lp * lv;
-            cascades[k] = cascade_mats[k].to_cols_array_2d();
-            texels[k] = texel;
-            cascade_boxes.push((lv, r, back + r));
         }
-        let mut cascade_data = vec![0u8; CASCADE_SLOT as usize * MAX_CASCADES];
+        let shadow_size = self.shadow_size as f32;
+        // (matrices, texel sizes, (light view, half size, depth range) per cascade for caster culling)
+        let fit = |dir: Vec3| {
+            let up = if dir.y.abs() > 0.99 { Vec3::Z } else { Vec3::Y };
+            let rot = Mat4::look_at_rh(Vec3::ZERO, dir, up);
+            let mut mats = [Mat4::IDENTITY; MAX_CASCADES];
+            let mut texels = [0.0f32; 4];
+            let mut boxes: Vec<(Mat4, f32, f32)> = vec![];
+            for k in 0..n_casc {
+                let (z0, z1) = slices[k];
+                let mut center = Vec3::ZERO;
+                let mut corners = [Vec3::ZERO; 8];
+                for (ci, c) in corners.iter_mut().enumerate() {
+                    let z = if ci < 4 { z0 } else { z1 };
+                    let sx = if ci & 1 == 0 { -1.0 } else { 1.0 };
+                    let sy = if ci & 2 == 0 { -1.0 } else { 1.0 };
+                    *c = inv_view.transform_point3(Vec3::new(sx * tan_x * z, sy * tan_y * z, -z));
+                    center += *c / 8.0;
+                }
+                let r = corners.iter().map(|c| c.distance(center)).fold(0.0f32, f32::max);
+                let r = (r * 16.0).ceil() / 16.0;
+                let texel = 2.0 * r / shadow_size;
+                let mut c_ls = rot.transform_point3(center);
+                c_ls.x = (c_ls.x / texel).floor() * texel;
+                c_ls.y = (c_ls.y / texel).floor() * texel;
+                let center = rot.inverse().transform_point3(c_ls);
+                let back = r + 120.0; // casters up to 120 m beyond the slice towards the sun
+                let lv = Mat4::look_at_rh(center - dir * back, center, up);
+                let lp = Mat4::orthographic_rh(-r, r, -r, r, 0.0, back + r);
+                mats[k] = lp * lv;
+                texels[k] = texel;
+                boxes.push((lv, r, back + r));
+            }
+            (mats, texels, boxes)
+        };
+        let (cascade_mats, texels, mut cascade_boxes) = fit(shadow_dir);
+        let mut cascades = [[[0.0f32; 4]; 4]; MAX_CASCADES];
+        for k in 0..MAX_CASCADES {
+            cascades[k] = cascade_mats[k].to_cols_array_2d();
+        }
+        let mut cascades_prev = cascades;
+        // virtual shadow passes: (cascade slot in cascade_buf / bind0_shadow, array layer)
+        let mut shadow_passes: Vec<(usize, u32)> = (0..n_casc).map(|k| (k, cur_set * MAX_CASCADES as u32 + k as u32)).collect();
+        let mut cascade_data = vec![0u8; CASCADE_SLOT as usize * 2 * MAX_CASCADES];
         for (k, m) in cascade_mats.iter().enumerate() {
             cascade_data[k * CASCADE_SLOT as usize..k * CASCADE_SLOT as usize + 64].copy_from_slice(bytemuck::bytes_of(&m.to_cols_array()));
+        }
+        if let Some((prev_dir, _)) = fading {
+            let (pm, _, pboxes) = fit(prev_dir);
+            for k in 0..n_casc {
+                cascades_prev[k] = pm[k].to_cols_array_2d();
+                let slot = MAX_CASCADES + k;
+                cascade_data[slot * CASCADE_SLOT as usize..slot * CASCADE_SLOT as usize + 64].copy_from_slice(bytemuck::bytes_of(&pm[k].to_cols_array()));
+                shadow_passes.push((slot, (cur_set ^ 1) * MAX_CASCADES as u32 + k as u32));
+            }
+            cascade_boxes.extend(pboxes);
         }
         self.queue.write_buffer_with_u32_and_u8_slice(&self.cascade_buf, 0, &cascade_data).map_err(js_err)?;
 
@@ -2130,7 +2244,7 @@ impl Renderer {
             view_proj: view_proj.to_cols_array_2d(),
             cascades,
             camera_pos: cam_pos.extend(1.0).into(),
-            sun_dir: dir.extend(s.sun_intensity).into(),
+            sun_dir: light.extend(s.sun_intensity).into(),
             sun_color: s.sun_color.extend(1.0).into(),
             sky_color: s.sky_color.extend(1.0).into(),
             ground_color: s.ground_color.extend(1.0).into(),
@@ -2162,6 +2276,8 @@ impl Renderer {
             misc: [s.water_ssr as u32 as f32, s.water_refraction.max(0.0), s.water_caustics.max(0.0), s.atmosphere_intensity.max(0.0)],
             scene_min: [0.0; 4], // set after the instance pass
             scene_max: [0.0; 4],
+            cascades_prev,
+            shadow_sets: [(cur_set * MAX_CASCADES as u32) as f32, ((cur_set ^ 1) * MAX_CASCADES as u32) as f32, prev_weight, 0.0],
         };
 
         // --- Instances -------------------------------------------------------------------------
@@ -2532,10 +2648,11 @@ impl Renderer {
 
         // --- Shadow passes: one per cascade (opaque depth-only, alpha-tested casters sample their texture)
         {
-            let n_pass = n_casc;
+            let n_pass = shadow_passes.len();
             let ts = self.timing.as_mut().filter(|_| main).and_then(|t| t.split_writes(crate::gpu_timing::SHADOW));
             for (k, list) in cascade_casters.iter().enumerate().take(n_pass) {
-                let att = GpuRenderPassDepthStencilAttachment::new_with_gpu_texture_view(&self.shadow_layers[k]);
+                let (slot, layer) = shadow_passes[k];
+                let att = GpuRenderPassDepthStencilAttachment::new_with_gpu_texture_view(&self.shadow_layers[layer as usize]);
                 att.set_depth_clear_value(1.0);
                 att.set_depth_load_op(GpuLoadOp::Clear);
                 att.set_depth_store_op(GpuStoreOp::Store);
@@ -2556,7 +2673,7 @@ impl Renderer {
                 }
                 let pass = encoder.begin_render_pass(&desc).map_err(js_err)?;
                 if self.settings.shadows && !list.is_empty() {
-                    pass.set_bind_group(0, Some(&self.bind0_shadow[k]));
+                    pass.set_bind_group(0, Some(&self.bind0_shadow[slot]));
                     let base = cascade_base[k];
                     let mut bound: Option<(bool, u32)> = None;
                     let mut i = 0usize;
