@@ -390,7 +390,7 @@ impl PlayScreen {
             "help",
             "<div class='panel'><b>Tumble</b> — push every crate off the island<br>\
              <kbd>WASD</kbd> move · <kbd>Space</kbd> jump · <kbd>Left click</kbd> shoot<br>\
-             <kbd>Right drag</kbd> camera · <kbd>Wheel</kbd> zoom · <kbd>C</kbd> switch figure · <kbd>R</kbd> reset · <kbd>P</kbd> pause<br>\
+             <kbd>Right drag</kbd> camera · <kbd>Wheel</kbd> zoom · <kbd>C</kbd> switch figure · <kbd>R</kbd> reset · <kbd>P</kbd> pause<br>             <kbd>N</kbd> day/night · <kbd>L</kbd> run the day cycle · <kbd>[</kbd> <kbd>]</kbd> time of day<br>\
              <button data-action='reset'>Restart</button> <button data-action='toggle-shadows'>Shadows</button> \
              <button data-action='walker'>Switch figure</button></div>",
         );
@@ -410,10 +410,17 @@ impl PlayScreen {
         };
         let island_mesh = tiled_cube(ctx, "island", 7.0);
 
-        // Sea around the island: water shader (waves, Fresnel sky reflection, sun glint, depth colour).
-        let water_mesh = ctx.renderer.add_mesh("water", &engine::mesh::MeshData::plane(1.0, 60.0));
-        let water_mat = ctx.renderer.add_material(Material { wave_height: 0.09, wave_scale: 0.35, ..Material::water(0x0b3a5a, 0x2f8fa8) });
-        let w = ctx.spawn_mesh("water", water_mesh, water_mat, Transform::from_xyz(0.0, -2.2, 0.0).with_scale(Vec3::new(400.0, 1.0, 400.0)));
+        // Sea around the island: endless camera-following ocean (Gerstner waves, refraction,
+        // screen-space reflections, foam on the crests and at the island).
+        let water_mat = ctx.renderer.add_material(Material {
+            wave_height: 0.16,
+            wave_scale: 0.3,
+            water_chop: 0.9,
+            water_clarity: 3.0,
+            water_vertex_spacing: 0.3,
+            ..Material::water(0x06304a, 0x1f8a9a)
+        });
+        let w = ctx.spawn_ocean(water_mat, -2.2);
         if let Ok(mut mr) = ctx.world.get::<&mut MeshRenderer>(w) {
             mr.cast_shadows = false;
         }
@@ -449,8 +456,16 @@ impl PlayScreen {
             });
             let bed = ctx.spawn_mesh("pond-bed", bed_mesh, bed_mat, Transform::from_translation(POND + Vec3::Y * 0.04));
             ctx.physics.add(&mut ctx.world, bed, RigidBodyBuilder::fixed(), ColliderBuilder::cylinder(0.02, POND_R));
-            let surface = ctx.renderer.add_mesh("pond-water", &engine::mesh::MeshData::disk(POND_R + 0.15, 24, 64, 1.0));
-            let pond_mat = ctx.renderer.add_material(Material { wave_height: 0.012, wave_scale: 2.2, ..Material::water(0x0e3b3a, 0x5fa89a) });
+            let surface = ctx.renderer.add_mesh("pond-water", &engine::mesh::MeshData::disk(POND_R + 0.15, 40, 160, 1.0));
+            let pond_mat = ctx.renderer.add_material(Material {
+                wave_height: 0.012,
+                wave_scale: 2.2,
+                water_chop: 0.3,
+                water_clarity: 0.8,
+                water_foam: 0.6,
+                water_vertex_spacing: 0.06,
+                ..Material::water(0x0e3b3a, 0x5fa89a)
+            });
             let w = ctx.spawn_mesh("pond-water", surface, pond_mat, Transform::from_translation(POND + Vec3::Y * 0.45));
             if let Ok(mut mr) = ctx.world.get::<&mut MeshRenderer>(w) {
                 mr.cast_shadows = false;
@@ -585,6 +600,7 @@ impl Screen<Data> for PlayScreen {
         data.ensure(ctx);
         data.progress.plays += 1;
         data.save(ctx);
+        sky_setup(ctx);
         self.build_world(ctx);
 
         // Player: physics ball
@@ -751,6 +767,8 @@ impl Screen<Data> for PlayScreen {
         }
         let reset = input.key_pressed("KeyR");
         let toggle_walker = input.key_pressed("KeyC");
+        sky_keys(ctx);
+        let input = &ctx.input;
         let pause = input.key_pressed("KeyP") || input.key_pressed("Escape");
         if shoot {
             self.shoot(ctx);
@@ -943,5 +961,41 @@ impl Screen<Data> for PlayScreen {
             "targets_remaining": self.targets.iter().filter(|(_, c)| !c).map(|(e, _)| e.id()).collect::<Vec<_>>(),
             "progress": data.progress,
         })
+    }
+}
+
+/// Atmosphere sky with clouds, driven by the day/night cycle (clock stopped until L is pressed).
+pub fn sky_setup(ctx: &mut Ctx) {
+    let s = &mut ctx.renderer.settings;
+    s.sky_mode = 1;
+    s.clouds = 0.45;
+    s.day_cycle = true;
+    s.day_length_minutes = 0.0;
+    s.time_of_day = 15.5;
+    s.sun_azimuth_deg = 200.0;
+    s.sun_max_elevation_deg = 58.0;
+    // night sky image (Milky Way), faded in as the sun sets; the moon and clouds stay on top
+    s.skybox_blend = 0.0;
+    s.skybox_night_blend = 1.0;
+    if ctx.renderer.skybox().is_none() {
+        ctx.load_skybox("assets/skybox-night.png");
+    }
+}
+
+/// N = jump between day and night, L = run/stop the cycle (2 min per day), [ / ] = -/+ 1 hour.
+pub fn sky_keys(ctx: &mut Ctx) {
+    let (n, l, back, fwd) = (ctx.input.key_pressed("KeyN"), ctx.input.key_pressed("KeyL"), ctx.input.key_pressed("BracketLeft"), ctx.input.key_pressed("BracketRight"));
+    let s = &mut ctx.renderer.settings;
+    if n {
+        s.day_cycle = true;
+        s.time_of_day = if (6.5..19.0).contains(&s.time_of_day) { 22.5 } else { 15.5 };
+    }
+    if l {
+        s.day_cycle = true;
+        s.day_length_minutes = if s.day_length_minutes > 0.0 { 0.0 } else { 2.0 };
+    }
+    if back || fwd {
+        s.day_cycle = true;
+        s.time_of_day = (s.time_of_day + if fwd { 1.0 } else { -1.0 }).rem_euclid(24.0);
     }
 }

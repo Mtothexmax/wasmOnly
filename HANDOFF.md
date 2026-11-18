@@ -17,7 +17,7 @@ Rust → `wasm32-unknown-unknown` → Chrome (WebGPU). AI-first: every runtime s
 | Models | glTF `.glb` (static, skinned, morph targets, clips via `Animator`) (`gltf_loader`, `animation`); other formats via `tools/asset-cook` |
 | Procedural content | `MeshBuilder` geometry kit + generator registry, cached + instanced (`geom`); static batching, `Motion` (`batch`) |
 | World | heightmap terrain (LOD chunks, splat, colliders, scatter), GPU grass, streaming cells, floating origin (`terrain`, `vegetation`, `streaming`) |
-| Look | PBR, cascaded shadows, clustered point/spot lights, sky, fog, bloom, depth darkening, particles, water, render to texture, adaptive resolution |
+| Look | PBR, cascaded shadows, clustered point/spot lights, physically based sky (clouds, stars, moon, skybox) with day/night cycle, fog, bloom, depth darkening, particles, Unreal-style water (Gerstner waves, refraction, SSR, caustics, foam), render to texture, adaptive resolution |
 | UI | DOM HUD slots with `data-action` buttons (`ui`), clickable world panels (`panel`), world-anchored labels |
 | Audio | 3D sounds, procedural sfx presets, streamed music (`audio`) |
 | Physics | rapier3d (`physics`) |
@@ -81,8 +81,9 @@ auto_lod: false, ..Default::default() })`, `ctx.gltf_defaults.auto_lod = false`,
 | Area switching (interiors) | one `Screen` or scene per area (`ctx.begin_scene` / `unload_scene`) or streaming layers |
 | Canvas2D card art / `toDataURL` | Canvas in the DOM as before, or render to texture (`create_render_texture`, `export_render_texture` → blob URL for `<img>`) |
 | Photo mode (`snapPhoto`) | render texture + `export_render_texture`, or `bridge screenshot` for tests |
-| `THREE.Fog`, background colour | `renderer.settings` fog_*, sky_*, `clear_color` |
-| Point/spot lights, day/night | `PointLight`, `SpotLight` (clustered, hundreds), `sun_dir`/`sun_intensity`/sky colours per time of day |
+| `THREE.Fog`, background colour, sky | `renderer.settings` fog_*, `sky_mode: 1` (atmosphere) + `clouds`, or sky_zenith/sky_horizon (gradient), `ctx.load_skybox(url)` |
+| Water plane | `Material::water(deep, shallow)` on `ctx.spawn_water(...)` (dense mesh for vertex waves) or `ctx.spawn_ocean(mat, y)` |
+| Point/spot lights, day/night | `PointLight`, `SpotLight` (clustered, hundreds); `day_cycle` + `time_of_day` (+ `day_length_minutes`) drive sun, moon, sky and ambient; lamps follow `ctx.renderer.sky.night` |
 | Sprite particles | `ctx.spawn_particles(name, pos, ParticleEmitter::preset(..))` |
 | Rain `InstancedMesh` | `ParticlePreset::Rain`, or instanced entities (same mesh = one draw) |
 | Quality presets / auto-downgrade | adaptive resolution (`render.auto_resolution`), `shadow_cascades`, grass radius |

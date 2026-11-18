@@ -42,23 +42,44 @@ struct VsOut {
 const PI: f32 = 3.14159265;
 
 // --- Water waves (shared by vertex displacement and the fragment normal) ----------------------
-// Sum of directional sine waves in world XZ. Returns (height, d/dx, d/dz). `fp` = world size of one
-// pixel: waves shorter than ~2 pixels fade out (no moiré on distant water; 0 in the vertex shader).
-fn waves(p: vec2f, t: f32, amp: f32, scale: f32, fp: f32) -> vec3f {
-    var h = 0.0;
-    var d = vec2f(0.0);
-    let dirs = array<vec2f, 4>(vec2f(0.8, 0.6), vec2f(-0.5, 0.86), vec2f(0.2, -0.98), vec2f(-0.94, -0.33));
-    let freq = array<f32, 4>(1.0, 1.7, 2.9, 4.3);
-    let speed = array<f32, 4>(0.9, 1.3, 1.8, 2.4);
-    let weight = array<f32, 4>(1.0, 0.55, 0.3, 0.18);
-    for (var k = 0; k < 4; k++) {
-        let f = freq[k] * scale;
-        let ph = dot(dirs[k], p) * f + t * speed[k];
-        let a = amp * weight[k] * (1.0 - smoothstep(0.6, 2.2, f * fp));
-        h += a * sin(ph);
-        d += dirs[k] * (a * f * cos(ph));
+// Eight Gerstner waves around a wind direction with deep-water dispersion (speed = sqrt(g k)):
+// sharp crests and wide troughs (`chop` = horizontal displacement), analytic normal, crest height
+// for foam and subsurface scattering. `fp` = world size of one pixel (fragment) or one vertex
+// spacing (vertex): waves shorter than ~2 samples fade out (no aliasing on far or coarse water).
+struct Wave {
+    disp: vec3f,
+    n: vec3f,
+    crest: f32,
+}
+
+fn gerstner(p: vec2f, t: f32, amp: f32, scale: f32, chop: f32, fp: f32) -> Wave {
+    let ang = array<f32, 8>(0.0, 0.42, -0.55, 1.05, -1.2, 0.22, -0.3, 2.1);
+    let len = array<f32, 8>(1.0, 1.37, 1.83, 2.6, 3.4, 4.7, 6.3, 8.9);
+    let wgt = array<f32, 8>(1.0, 0.72, 0.52, 0.36, 0.25, 0.17, 0.11, 0.07);
+    var disp = vec3f(0.0);
+    var nx = 0.0;
+    var nz = 0.0;
+    var ny = 0.0;
+    for (var k = 0; k < 8; k++) {
+        let a0 = 0.65 + ang[k];
+        let d = vec2f(cos(a0), sin(a0));
+        let f = len[k] * scale;
+        let a = amp * wgt[k] * (1.0 - smoothstep(0.6, 2.2, f * fp));
+        if (a <= 0.0) { continue; }
+        let q = min(chop, 1.0 / (8.0 * f * a + 1e-5)); // no loops at the crests
+        let ph = f * dot(d, p) - sqrt(9.81 * f) * t + f32(k) * 1.7;
+        let s = sin(ph);
+        let c = cos(ph);
+        disp += vec3f(d.x * q * a * c, a * s, d.y * q * a * c);
+        nx -= d.x * f * a * c;
+        nz -= d.y * f * a * c;
+        ny -= q * f * a * s;
     }
-    return vec3f(h, d.x, d.y);
+    var w: Wave;
+    w.disp = disp;
+    w.n = vec3f(nx, 1.0 + ny, nz);
+    w.crest = disp.y / max(amp * 3.6, 1e-5);
+    return w;
 }
 
 @vertex
@@ -73,16 +94,19 @@ fn vs_main(v: VsIn) -> VsOut {
     }
     var world = inst.model * vec4f(local, 1.0);
     var normal = (inst.normal * vec4f(v.normal, 0.0)).xyz;
-    if (inst.params.z > 2.5) { // water: animated waves in world space
-        let w = waves(world.xz, g.time.x, inst.maps.y, inst.maps.w, 0.0);
-        world = vec4f(world.x, world.y + w.x, world.z, 1.0);
-        normal = vec3f(-w.y, 1.0, -w.z);
+    var uv = v.uv;
+    if (inst.params.z > 2.5) { // water: Gerstner waves in world space; uv = undisplaced world xz
+        uv = world.xz;
+        let spacing = max(inst.maps.x, length(world.xyz - g.camera_pos.xyz) * 0.025);
+        let w = gerstner(world.xz, g.time.x, inst.maps.y, inst.maps.w, inst.maps.z, spacing);
+        world = vec4f(world.xyz + w.disp, 1.0);
+        normal = w.n;
     }
     var o: VsOut;
     o.clip = g.view_proj * world;
     o.world = world.xyz;
     o.normal = normal;
-    o.uv = v.uv;
+    o.uv = uv;
     o.inst = idx;
     return o;
 }
@@ -186,7 +210,23 @@ fn cluster_lights(i_clip: vec4f, world: vec3f, n: vec3f, v: vec3f, albedo: vec3f
 // Output is linear HDR into the scene target; the post pass tonemaps (alpha = "tonemap me" mask:
 // 1 for scene colour, 0 for UI panels and debug views, which are shown as they are).
 fn finish(c: vec3f, world: vec3f) -> vec3f {
-    return apply_fog(c, world);
+    return sanitize(apply_fog(c, world));
+}
+
+// normalize() of a zero vector is NaN: edge-on triangles have zero screen-space derivatives, and a
+// single NaN pixel showed up as a black dot with a bloom halo. Fall back instead.
+fn safe_normal(v: vec3f, fallback: vec3f) -> vec3f {
+    let l2 = dot(v, v);
+    if (l2 > 1e-20) { return v * inverseSqrt(l2); }
+    let f2 = dot(fallback, fallback);
+    return select(vec3f(0.0, 1.0, 0.0), fallback * inverseSqrt(max(f2, 1e-20)), f2 > 1e-20);
+}
+
+// Last line of defence for the HDR target: NaN / inf / absurd values (grazing-angle specular spikes)
+// become finite. Comparisons with NaN are false, so NaN lanes take the 0 branch.
+fn sanitize(c: vec3f) -> vec3f {
+    let ok = (c >= vec3f(0.0)) & (c <= vec3f(6.0e4));
+    return select(vec3f(0.0), min(c, vec3f(2.0e3)), ok);
 }
 
 // Derivatives of everything that needs them, taken once in uniform control flow.
@@ -264,7 +304,7 @@ fn shade(i: VsOut, front: bool, d: Deriv, face_n: vec3f) -> Surface {
     let inst = instances[i.inst];
     // Double-sided back faces: mirror the shading normal at the triangle plane (equals flipping for
     // a flat pane; keeps the up tilt of foliage normals, which flipping turned black).
-    let nn = normalize(i.normal);
+    let nn = safe_normal(i.normal, vec3f(0.0, 1.0, 0.0));
     var n = select(nn, normalize(nn - 2.0 * dot(nn, face_n) * face_n), !front);
     let v = normalize(g.camera_pos.xyz - i.world);
     let tbn = cotangent_frame(n, d);
@@ -353,7 +393,7 @@ fn debug_extra(i: VsOut) -> vec4f {
 @fragment
 fn fs_main(i: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4f {
     let d = derivs(i);
-    let face_n = normalize(cross(d.dpx, d.dpy));
+    let face_n = safe_normal(cross(d.dpx, d.dpy), i.normal);
     let s = shade(i, front, d, face_n);
     if (g.counts.z >= 3u) { return debug_extra(i); }
     return debug_out(s);
@@ -361,6 +401,8 @@ fn fs_main(i: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4f {
 
 // --- Blend pass: the opaque depth buffer is readable here -------------------------------------
 @group(0) @binding(5) var scene_depth: texture_depth_multisampled_2d;
+// Resolved opaque scene colour (water refraction + screen-space reflections).
+@group(0) @binding(9) var scene_color: texture_2d<f32>;
 
 fn linear_depth(z: f32) -> f32 {
     let n = g.time.y;
@@ -379,59 +421,159 @@ fn vnoise(p: vec2f) -> f32 {
     return mix(mix(hash2(i), hash2(i + vec2f(1.0, 0.0)), u.x), mix(hash2(i + vec2f(0.0, 1.0)), hash2(i + vec2f(1.0, 1.0)), u.x), u.y);
 }
 
-// Water: wave normal + fine ripples, Fresnel sky reflection, sun glint, depth-tinted body colour
-// (shallow -> deep by the distance to the ground below), soft edges and foam at the shore.
+// Screen-space reflection: march the reflected ray through the opaque depth buffer (geometric
+// steps, then bisection). Returns (colour, confidence); confidence fades at the screen border and
+// with distance, the caller falls back to the sky.
+fn ssr(origin: vec3f, r: vec3f) -> vec4f {
+    var t = 0.35;
+    var prev = 0.0;
+    let max_t = 400.0;
+    for (var s = 0; s < 22; s++) {
+        let c = g.view_proj * vec4f(origin + r * t, 1.0);
+        if (c.w <= g.time.y) { break; }
+        let uv = vec2f(c.x / c.w * 0.5 + 0.5, 0.5 - c.y / c.w * 0.5);
+        if (any(uv < vec2f(0.0)) || any(uv > vec2f(1.0))) { break; }
+        let sd = linear_depth(textureLoad(scene_depth, vec2i(uv * g.screen.xy), 0));
+        if (c.w > sd) {
+            if (c.w - sd > max(t * 0.06, 0.25) + (t - prev)) { break; } // passed behind: no hit
+            var lo = prev;
+            var hi = t;
+            var huv = uv;
+            for (var b = 0; b < 5; b++) {
+                let mid = 0.5 * (lo + hi);
+                let cm = g.view_proj * vec4f(origin + r * mid, 1.0);
+                let um = vec2f(cm.x / cm.w * 0.5 + 0.5, 0.5 - cm.y / cm.w * 0.5);
+                let dm = linear_depth(textureLoad(scene_depth, vec2i(clamp(um, vec2f(0.0), vec2f(0.9999)) * g.screen.xy), 0));
+                if (cm.w > dm) { hi = mid; huv = um; } else { lo = mid; }
+            }
+            huv = clamp(huv, vec2f(0.0), vec2f(0.9999));
+            let col = textureLoad(scene_color, vec2i(huv * g.screen.xy), 0).rgb;
+            let edge = smoothstep(0.0, 0.1, min(min(huv.x, 1.0 - huv.x), min(huv.y, 1.0 - huv.y)));
+            let far = 1.0 - smoothstep(max_t * 0.5, max_t, t);
+            return vec4f(col, edge * far);
+        }
+        prev = t;
+        t = t * 1.3 + 0.25;
+        if (t > max_t) { break; }
+    }
+    return vec4f(0.0);
+}
+
+// Light patterns on the ground below water: two layers of warped noise ridges.
+fn caustics(p: vec2f, t: f32) -> f32 {
+    var c = 0.0;
+    for (var k = 0; k < 2; k++) {
+        let s = 1.1 + f32(k) * 0.8;
+        let q = p * s + vec2f(t * 0.21, -t * 0.17) * (1.0 + f32(k) * 0.6);
+        let w = vnoise(q * 0.6 + vec2f(t * 0.05, 0.0)) * 1.4;
+        let n = vnoise(q + vec2f(w, -w));
+        c += pow(1.0 - abs(n * 2.0 - 1.0), 7.0);
+    }
+    return c;
+}
+
+// Water (params.z == 3): Gerstner waves + three octaves of drifting ripples; refraction of the
+// opaque scene with per-channel absorption (red fades first) and in-scattering towards the deep
+// colour; caustics on the ground below; reflections = screen-space reflections over the full sky
+// (atmosphere, clouds, moon, skybox); GGX sun specular + glint; subsurface glow through crests;
+// shore and crest foam; soft shore edge.
+// Material: base_color = deep colour, emissive = shallow colour, emissive.a = foam,
+// params.y = clarity (m), maps = (vertex spacing, wave height, chop, wave scale).
 fn water(i: VsOut, d: Deriv) -> vec4f {
     let inst = instances[i.inst];
     let t = g.time.x;
     let fp = max(length(d.dpx), length(d.dpy));
-    let wv = waves(i.world.xz, t, inst.maps.y, inst.maps.w, fp);
-    // fine ripples: gradient of two scrolling value-noise layers (organic, no regular stripes),
-    // faded out where a ripple would be smaller than ~2 pixels
+    let base = i.uv; // undisplaced world xz (set by vs_main)
+    let wv = gerstner(base, t, inst.maps.y, inst.maps.w, inst.maps.z, fp);
     var r = vec2f(0.0);
-    let scales = array<f32, 2>(3.5, 9.0);
-    let drift = array<vec2f, 2>(vec2f(0.35, 0.2), vec2f(-0.25, 0.4));
-    for (var k = 0; k < 2; k++) {
+    let scales = array<f32, 3>(3.1, 7.3, 15.7);
+    let drift = array<vec2f, 3>(vec2f(0.35, 0.2), vec2f(-0.25, 0.4), vec2f(0.15, -0.45));
+    for (var k = 0; k < 3; k++) {
         let f = scales[k] * inst.maps.w;
-        let q = i.world.xz * f + drift[k] * t * f * 0.6;
+        let q = base * f + drift[k] * t * sqrt(f) * 0.9;
         let e = 0.05;
         let h0 = vnoise(q);
         let gx = (vnoise(q + vec2f(e, 0.0)) - h0) / e;
         let gz = (vnoise(q + vec2f(0.0, e)) - h0) / e;
-        let fade = 1.0 - smoothstep(0.6, 2.2, f * fp * 6.28);
-        r += vec2f(gx, gz) * f * 0.035 * fade;
+        let fade = 1.0 - smoothstep(0.5, 2.0, f * fp * 6.28);
+        r += vec2f(gx, gz) * f * 0.03 * fade * (inst.maps.y / max(inst.maps.y, 0.02) * 0.6 + 0.4);
     }
-    let n = normalize(vec3f(-wv.y - r.x, 1.0, -wv.z - r.y));
+    let n = normalize(normalize(wv.n) + vec3f(-r.x, 0.0, -r.y));
     let v = normalize(g.camera_pos.xyz - i.world);
-    let n_v = max(dot(n, v), 0.0);
+    let n_v = clamp(dot(n, v), 0.0, 1.0);
     let fresnel = 0.02 + 0.98 * pow(1.0 - n_v, 5.0);
-
-    // scene depth below this pixel -> water thickness along the view ray
-    let px = vec2i(i.clip.xy);
-    let scene_z = textureLoad(scene_depth, px, 0);
-    let thickness = max(linear_depth(scene_z) - linear_depth(i.clip.z), 0.0);
-    let depth_t = 1.0 - exp(-thickness * 2.2);
-
-    let deep = inst.base_color.rgb;
-    let shallow = inst.emissive_metallic.rgb;
     let l_sun = normalize(-g.sun_dir.xyz);
     var shadow = 1.0;
     if (g.counts.y == 1u) { shadow = shadow_factor(i.world, vec3f(0.0, 1.0, 0.0)); }
-    let lit = g.sun_color.rgb * g.sun_dir.w * (0.25 + 0.35 * max(dot(n, l_sun), 0.0)) * shadow + g.sky_color.rgb * 0.6;
-    let body = mix(shallow, deep, depth_t) * lit;
 
-    let refl = reflect(-v, n);
-    let sky = sky_radiance(normalize(vec3f(refl.x, max(refl.y, 0.02), refl.z)));
+    // --- refraction: offset the scene lookup along the wave normal, unless that lands in front
+    let px = vec2i(i.clip.xy);
+    let water_lin = linear_depth(i.clip.z);
+    let max_px = vec2i(g.screen.xy) - vec2i(1);
+    let off = n.xz * g.misc.y * g.screen.y * 0.035 / (1.0 + water_lin * 0.06);
+    var q = clamp(vec2i(i.clip.xy + off), vec2i(0), max_px);
+    var raw = textureLoad(scene_depth, q, 0);
+    if (linear_depth(raw) < water_lin) {
+        q = px;
+        raw = textureLoad(scene_depth, px, 0);
+    }
+    let scene_lin = linear_depth(raw);
+    let thickness = max(scene_lin - water_lin, 0.0); // view-depth difference below the surface
+    var refracted = textureLoad(scene_color, q, 0).rgb;
+
+    // caustics on the ground below (reconstructed from the depth buffer)
+    if (g.misc.z > 0.0 && raw < 1.0) {
+        let uvq = (vec2f(q) + 0.5) * g.screen.zw;
+        let wp = g.inv_view_proj * vec4f(uvq.x * 2.0 - 1.0, 1.0 - uvq.y * 2.0, raw, 1.0);
+        let bottom = wp.xyz / wp.w;
+        let below = i.world.y - bottom.y;
+        let k = caustics(bottom.xz * inst.maps.w * 1.5, t) * g.misc.z * exp(-below * 0.5) * smoothstep(0.02, 0.3, below);
+        refracted *= 1.0 + k * clamp(g.sun_dir.w * 0.25, 0.0, 1.5) * shadow;
+    }
+
+    // --- absorption + in-scattering (Beer-Lambert, red absorbed first)
+    let clarity = max(inst.params.y, 0.05);
+    let absorb = exp(-thickness / clarity * vec3f(2.2, 0.9, 0.65));
+    let depth_t = 1.0 - exp(-thickness / clarity);
+    let deep = inst.base_color.rgb;
+    let shallow = inst.emissive_metallic.rgb;
+    let lit = g.sun_color.rgb * g.sun_dir.w * (0.2 + 0.3 * max(dot(n, l_sun), 0.0)) * shadow + g.sky_color.rgb * 0.7;
+    let scatter = mix(shallow, deep, depth_t) * lit;
+    var body = refracted * absorb + scatter * (1.0 - absorb.g);
+    // subsurface glow: sunlight through the thin crests towards the viewer
+    let hs = normalize(l_sun + n * 0.6);
+    let sss = pow(clamp(dot(v, -hs), 0.0, 1.0), 4.0) * clamp(wv.crest * 0.6 + 0.4, 0.0, 1.0);
+    body += shallow * g.sun_color.rgb * g.sun_dir.w * sss * 0.8 * shadow;
+
+    // --- reflection: SSR over the full sky
+    var rd = reflect(-v, n);
+    rd = normalize(vec3f(rd.x, max(rd.y, 0.015), rd.z));
+    var reflection = sky_full(rd, false);
+    if (g.misc.x > 0.5 && fresnel > 0.04) { // below that a reflection is barely visible
+        let hit = ssr(i.world + n * 0.02, rd);
+        reflection = mix(reflection, hit.rgb, hit.a);
+    }
+
+    // --- sun specular (GGX, smooth) + glint
     let h = normalize(l_sun + v);
-    let glint = pow(max(dot(n, h), 0.0), 600.0) * 6.0 * g.sun_dir.w * shadow;
+    let n_l = max(dot(n, l_sun), 0.0);
+    let rough = clamp(inst.params.x, 0.02, 0.5) + fp * 0.02;
+    let spec = d_ggx(max(dot(n, h), 0.0), rough * rough) * v_smith(max(n_v, 1e-3), n_l, rough * rough) * f_schlick(vec3f(0.02), max(dot(v, h), 0.0)) * n_l;
+    let glint = pow(max(dot(n, h), 0.0), 900.0) * 4.0;
+    let sun_spec = g.sun_color.rgb * g.sun_dir.w * shadow * (spec + glint);
 
-    let foam_noise = vnoise(i.world.xz * 6.0 + vec2f(t * 0.4, -t * 0.3));
-    let foam = smoothstep(0.28, 0.0, thickness) * smoothstep(0.35, 0.75, foam_noise + 0.25);
+    // --- foam: shore (thin water) and crests
+    let foam_amt = inst.emissive_metallic.a;
+    let fn1 = vnoise(base * 5.5 + vec2f(t * 0.4, -t * 0.3));
+    let fn2 = vnoise(base * 13.0 - vec2f(t * 0.2, t * 0.5));
+    let shore = smoothstep(0.35, 0.0, thickness) * smoothstep(0.35, 0.75, fn1 * 0.7 + fn2 * 0.3 + 0.25);
+    let crest = smoothstep(0.55, 0.95, wv.crest + (fn2 - 0.5) * 0.35) * smoothstep(0.3, 0.7, fn1) * clamp(inst.maps.z, 0.0, 1.0);
+    let foam = clamp((shore + crest) * foam_amt, 0.0, 1.0);
 
-    var color = mix(body, sky, fresnel) + g.sun_color.rgb * glint;
-    color = mix(color, vec3f(0.95, 0.97, 1.0) * (0.6 + 0.4 * shadow), foam);
-    let edge = smoothstep(0.0, 0.12, thickness); // soft intersection with the shore
-    let alpha = clamp((mix(0.45, 0.94, depth_t) + fresnel * 0.4 + foam) * edge, 0.0, 1.0) * inst.base_color.a;
+    var color = mix(body, reflection, fresnel) + sun_spec;
+    color = mix(color, vec3f(0.92, 0.95, 0.97) * (lit * 0.9 + 0.05), foam);
+    let edge = smoothstep(0.0, 0.08, thickness); // soft intersection with the shore
+    let alpha = clamp(edge, 0.0, 1.0) * inst.base_color.a;
     if (g.counts.z == 1u) { return vec4f(pow(n * 0.5 + 0.5, vec3f(2.2)), 0.0); }
     return vec4f(finish(color, i.world), alpha);
 }
@@ -439,7 +581,7 @@ fn water(i: VsOut, d: Deriv) -> vec4f {
 @fragment
 fn fs_blend(i: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4f {
     let d = derivs(i);
-    let face_n = normalize(cross(d.dpx, d.dpy));
+    let face_n = safe_normal(cross(d.dpx, d.dpy), i.normal);
     if (instances[i.inst].params.z > 2.5) {
         return water(i, d);
     }

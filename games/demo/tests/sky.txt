@@ -1,0 +1,39 @@
+# Day/night cycle + atmosphere sky + water: deterministic times of day, light switches between sun
+# and moon, screenshots of the sea at day, sunset and night.
+reload
+screen play
+wait 1500
+expect sky.mode == "atmosphere"
+call sky {"time":12}
+expect sky.light == "sun"
+expect sky.daylight > 0.99
+expect sky.sun_elevation_deg > 50
+# look out to sea, a bit upwards (right-drag the camera)
+call input {"button":2,"down":true}
+frames 2
+call input {"dx":500,"dy":-15}
+frames 2
+call input {"dx":500,"dy":-15}
+frames 2
+call input {"button":2,"down":false}
+frames 10
+screenshot shots/sky-noon.png
+call sky {"time":17.5}
+expect sky.sun_elevation_deg < 8
+expect sky.light == "sun"
+frames 5
+screenshot shots/sky-sunset.png
+call sky {"time":23}
+wait_for sky.skybox != null 5000
+expect sky.light == "moon"
+expect sky.night > 0.99
+expect sky.exposure_mul > 2
+frames 5
+screenshot shots/sky-night.png
+# the clock advances with the simulation: 1 minute per day -> 1 hour = 2.5 s = 150 steps
+call sky {"time":10, "day_length":1}
+pause
+step 150
+expect sky.time_of_day ~= 11
+resume
+call sky {"day_length":0, "time":15.5}

@@ -100,7 +100,7 @@ pub async fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
     Ok(Uint8Array::new(&buf).to_vec())
 }
 
-async fn decode_image(bytes: &[u8], mime: &str) -> Result<ImageBitmap, String> {
+pub(crate) async fn decode_image(bytes: &[u8], mime: &str) -> Result<ImageBitmap, String> {
     let arr = Array::new();
     arr.push(&Uint8Array::from(bytes));
     let opts = BlobPropertyBag::new();

@@ -23,6 +23,8 @@ use wasm_bindgen::JsCast;
 
 pub const COMMANDS: &[(&str, &str)] = &[
     ("help", "List commands."),
+    ("sky", "Sky + day/night: mode, time of day, sun/moon elevation, daylight, night, light, ambient. args: {time?: hours (turns the cycle on), cycle?: bool, day_length?: minutes per day (0 = still), mode?: gradient|atmosphere, clouds?, stars?, moon?, skybox?: url|null, skybox_blend?, skybox_night_blend?}."),
+    ("inspect", "What is drawn at a canvas point (CSS px): entity, name, scene, local + absolute position, mesh, material, parent chain. args: {x, y, copy?: false}. In debug mode Ctrl+click does this and copies it to the clipboard."),
     ("characters", "Character controllers: pos, grounded, velocity, jumps, held jump, wish, blocked time, touching entities. args: {id?, pos?: [x,y,z] (place)}"),
     ("world", "Open world: floating origin + streaming layers (loaded cells, loads/unloads). args: {shift?: [x,y,z], origin_shift_distance?: m, layer?: name, radius?: m, enabled?: bool}"),
     ("grass", "GPU grass settings + blade count. args: any GrassSettings field (enabled, radius, spacing, height, width, layer, full_density, color_base, color_tip, wind)"),
@@ -639,6 +641,12 @@ pub(crate) fn handle<G: Game>(
         "ui" => Ok(json!({"slots": ctx.ui.slots()})),
         "save" => ctx.save.command(a),
         "particles" => ctx.particles_command(a),
+        "sky" => ctx.sky_command(a),
+        "inspect" => {
+            let x = a.get("x").and_then(|v| v.as_f64()).ok_or("missing 'x'")? as f32;
+            let y = a.get("y").and_then(|v| v.as_f64()).ok_or("missing 'y'")? as f32;
+            Ok(ctx.inspect_at(Vec2::new(x, y), a["copy"].as_bool().unwrap_or(false)))
+        }
         "characters" => ctx.characters_command(a),
         "world" => ctx.world_command(a),
         "grass" => {

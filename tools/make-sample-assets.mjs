@@ -243,3 +243,38 @@ function cylinder(r0, r1, y0, y1, seg, jitter = 0) {
   fs.writeFileSync(path.join(SRC, 'rock.mtl'), 'newmtl stone\nKd 0.45 0.43 0.40\nNs 10\n');
   console.log(JSON.stringify({ wrote: 'games/demo/assets-src/rock.obj' }));
 }
+
+// skybox-night.png: equirectangular night sky (2:1) — Milky Way band and nebula tint. Blended
+// in by `render.skybox_night_blend` after `ctx.load_skybox("assets/skybox-night.png")`.
+{
+  const W = 2048, H = 1024;
+  const hash = (x, y) => { const s = Math.sin(x * 127.1 + y * 311.7) * 43758.5453; return s - Math.floor(s); };
+  const noise = (x, y) => {
+    const xi = Math.floor(x), yi = Math.floor(y), xf = x - xi, yf = y - yi;
+    const u = xf * xf * (3 - 2 * xf), v = yf * yf * (3 - 2 * yf);
+    const a = hash(xi, yi), b = hash(xi + 1, yi), c = hash(xi, yi + 1), d = hash(xi + 1, yi + 1);
+    return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+  };
+  const fbm = (x, y) => { let s = 0, a = 0.5; for (let o = 0; o < 6; o++) { s += a * noise(x, y); x *= 2.03; y *= 2.03; a *= 0.5; } return s; };
+  const img = new Float32Array(W * H * 3);
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const lon = (x / W) * Math.PI * 2, lat = Math.PI / 2 - (y / H) * Math.PI;
+    const d = [Math.cos(lat) * Math.cos(lon), Math.sin(lat), Math.cos(lat) * Math.sin(lon)];
+    // galactic plane tilted 60 degrees
+    const n = [0, Math.cos(1.05), Math.sin(1.05)];
+    const g = d[0] * n[0] + d[1] * n[1] + d[2] * n[2];
+    const band = Math.exp(-g * g * 18);
+    const u = (x / W) * 8, v = (y / H) * 4;
+    const cloud = fbm(u * 2, v * 2), dust = fbm(u * 5 + 3, v * 5);
+    const glow = band * (0.35 + 0.65 * cloud) * (1 - 0.7 * Math.max(0, dust - 0.45) * 2.2);
+    const neb = Math.max(0, fbm(u * 1.3 + 9, v * 1.3) - 0.55) * 1.4;
+    const i = (y * W + x) * 3;
+    img[i] = 0.006 + glow * 0.07 + neb * 0.025;
+    img[i + 1] = 0.008 + glow * 0.065 + neb * 0.01;
+    img[i + 2] = 0.018 + glow * 0.09 + neb * 0.04;
+  }
+  // no stars in the image: the engine's procedural stars stay pixel-sharp on top of any skybox
+  const srgb = (l) => Math.round(255 * Math.min(1, l <= 0.0031308 ? l * 12.92 : 1.055 * Math.pow(l, 1 / 2.4) - 0.055));
+  fs.writeFileSync(path.join(OUT, 'skybox-night.png'), png(W, H, (x, y) => { const i = (y * W + x) * 3; return [srgb(img[i]), srgb(img[i + 1]), srgb(img[i + 2]), 255]; }));
+  console.log(JSON.stringify({ wrote: 'games/demo/assets/skybox-night.png' }));
+}

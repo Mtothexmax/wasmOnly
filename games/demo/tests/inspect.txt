@@ -1,0 +1,16 @@
+# Debug-mode Ctrl+click inspection: the click is consumed (the game does not shoot), the pick is
+# logged, and the `inspect` command names what is drawn at a point.
+reload
+screen play
+wait 1500
+call debug_mode {"on":true}
+expect inspect{"x":640,"y":420}.hit == true
+expect inspect{"x":640,"y":420}.scene == "play"
+call game_state
+down ControlLeft
+click 640 420
+up ControlLeft
+frames 3
+expect game_state.state.shots_alive == 0
+expect debug_mode.inputs_logged >= 4
+call debug_mode {"on":false}

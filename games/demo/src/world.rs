@@ -203,25 +203,12 @@ impl WorldScreen {
         ctx.physics.add_static(ColliderBuilder::cuboid(4.5, 0.15, 4.5), ctx.local(DVec3::new(-25.0, pz as f64 + 0.15, 20.0)));
     }
 
+    /// Night = 22:30, day = 15:30 on the day/night cycle (sun, moon, sky, ambient follow).
     fn set_night(&mut self, ctx: &mut Ctx, night: bool) {
         self.night = night;
         let s = &mut ctx.renderer.settings;
-        if night {
-            s.sun_intensity = 0.06;
-            s.sky_zenith = Vec3::new(0.005, 0.008, 0.025);
-            s.sky_horizon = Vec3::new(0.02, 0.03, 0.06);
-            s.sky_color = Vec3::new(0.02, 0.025, 0.05);
-            s.ground_color = Vec3::new(0.005, 0.005, 0.005);
-            s.exposure = 1.4;
-        } else {
-            let d = engine::renderer::RenderSettings::default();
-            s.sun_intensity = d.sun_intensity;
-            s.sky_zenith = d.sky_zenith;
-            s.sky_horizon = d.sky_horizon;
-            s.sky_color = d.sky_color;
-            s.ground_color = d.ground_color;
-            s.exposure = d.exposure;
-        }
+        s.day_cycle = true;
+        s.time_of_day = if night { 22.5 } else { 15.5 };
     }
 
     fn teleport(&mut self, ctx: &mut Ctx, abs: DVec3) {
@@ -244,6 +231,7 @@ impl Screen<Data> for WorldScreen {
 
     fn enter(&mut self, ctx: &mut Ctx, data: &mut Data) {
         data.ensure(ctx);
+        crate::sky_setup(ctx);
         register_generators(ctx);
         materials(ctx);
         // --- terrain: island with a flattened town and two roads
@@ -277,9 +265,16 @@ impl Screen<Data> for WorldScreen {
         ctx.renderer.grass_settings().layer = 0;
 
         // sea
-        let water_mesh = ctx.renderer.add_mesh("sea", &engine::mesh::MeshData::plane(1.0, 400.0));
-        let water_mat = ctx.renderer.add_material(Material { wave_height: 0.12, wave_scale: 0.3, ..Material::water(0x0b3a5a, 0x2f8fa8) });
-        let w = ctx.spawn_mesh("sea", water_mesh, water_mat, Transform::from_translation(ctx.local(DVec3::new(0.0, -0.5, 0.0))).with_scale(Vec3::new(4000.0, 1.0, 4000.0)));
+        let water_mat = ctx.renderer.add_material(Material {
+            wave_height: 0.2,
+            wave_scale: 0.25,
+            water_chop: 0.9,
+            water_clarity: 3.0,
+            water_vertex_spacing: 0.4,
+            ..Material::water(0x06304a, 0x1f8a9a)
+        });
+        let sea_y = ctx.local(DVec3::new(0.0, -0.5, 0.0)).y;
+        let w = ctx.spawn_ocean(water_mat, sea_y);
         if let Ok(mut mr) = ctx.world.get::<&mut MeshRenderer>(w) {
             mr.cast_shadows = false;
         }
@@ -367,7 +362,7 @@ impl Screen<Data> for WorldScreen {
             "help",
             "<div class='panel'><b>Open world</b> — 1 km terrain, streaming, grass, lights<br>\
              <kbd>WASD</kbd> walk · <kbd>Shift</kbd> run · <kbd>Space</kbd> jump · <kbd>Right drag</kbd> camera<br>\
-             <kbd>N</kbd> night · <kbd>T</kbd> teleport (island edge) · <kbd>H</kbd> back to town · <kbd>P</kbd> pause</div>",
+             <kbd>N</kbd> night · <kbd>L</kbd> day cycle · <kbd>[</kbd> <kbd>]</kbd> time · <kbd>T</kbd> teleport (island edge) · <kbd>H</kbd> back to town · <kbd>P</kbd> pause</div>",
         );
     }
 
@@ -403,10 +398,8 @@ impl Screen<Data> for WorldScreen {
     }
 
     fn update(&mut self, ctx: &mut Ctx, _data: &mut Data, dt: f32) -> Trans<Data> {
-        if ctx.input.key_pressed("KeyN") {
-            let n = !self.night;
-            self.set_night(ctx, n);
-        }
+        crate::sky_keys(ctx); // N day/night, L run the cycle, [ ] time of day
+        self.night = ctx.renderer.sky.night > 0.5;
         if ctx.input.key_pressed("KeyT") {
             self.teleport(ctx, DVec3::new(380.0, 0.0, -380.0));
         }

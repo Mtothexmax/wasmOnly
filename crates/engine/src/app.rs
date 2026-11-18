@@ -402,6 +402,80 @@ impl Ctx {
         }
     }
 
+    /// Identifying properties of the object drawn under a canvas point (CSS px): entity, name,
+    /// scene, positions, mesh, material, parent chain, glTF root. `copy` puts the text on the
+    /// clipboard (needs a recent user gesture — the Ctrl+click is one) and shows it in the
+    /// debug badge; the pick is also written to the debug log. AI API: `inspect {x, y}`.
+    pub fn inspect_at(&mut self, css: Vec2, copy: bool) -> serde_json::Value {
+        use serde_json::json;
+        scene::propagate_transforms(&mut self.world);
+        let Some((o, d)) = self.screen_ray(css) else { return json!({"hit": false, "reason": "no camera"}) };
+        let Some((e, dist, _)) = crate::zfight::ray_pick(&self.world, &self.renderer, o, d, 0.002) else {
+            if copy {
+                self.debug_mode.toast = Some("nothing under the cursor".into());
+            }
+            return json!({"hit": false});
+        };
+        let point = o + d.normalize() * dist;
+        let w = &self.world;
+        let name_of = |e: Entity| w.get::<&Name>(e).map(|n| n.0.clone()).unwrap_or_default();
+        let name = name_of(e);
+        let scene = w.get::<&crate::screens::SceneTag>(e).map(|t| self.scenes.name_of(*t).to_string()).unwrap_or_else(|_| "persistent".into());
+        let local = w.get::<&scene::GlobalTransform>(e).map(|g| g.translation()).unwrap_or_default();
+        let abs = self.origin + local.as_dvec3();
+        let (mesh, material) = match w.get::<&MeshRenderer>(e) {
+            Ok(mr) => (
+                json!({"id": mr.mesh.0, "name": self.renderer.mesh(mr.mesh).map(|m| m.name.clone()).unwrap_or_default(), "layer": mr.layer}),
+                json!({"id": mr.material.0, "name": self.renderer.material(mr.material).map(|m| m.name.clone()).unwrap_or_default()}),
+            ),
+            Err(_) => (json!(null), json!(null)),
+        };
+        let mut parents = vec![];
+        let mut cur = e;
+        while let Ok(p) = w.get::<&scene::Parent>(cur).map(|p| p.0) {
+            if parents.len() > 32 {
+                break;
+            }
+            parents.push(json!({"id": p.id(), "name": name_of(p)}));
+            cur = p;
+        }
+        let r3 = |v: [f64; 3]| [(v[0] * 1000.0).round() / 1000.0, (v[1] * 1000.0).round() / 1000.0, (v[2] * 1000.0).round() / 1000.0];
+        let info = json!({
+            "hit": true, "id": e.id(), "name": name, "scene": scene,
+            "pos": r3(local.as_dvec3().to_array()), "abs": r3(abs.to_array()), "hit_point": r3(point.as_dvec3().to_array()), "distance": (dist * 100.0).round() / 100.0,
+            "mesh": mesh, "material": material, "parents": parents,
+            "body": self.physics.body(&self.world, e).is_some(),
+        });
+        if copy {
+            let quoted = |v: &serde_json::Value| match v.as_str() {
+                Some(s) if !s.is_empty() => format!(" \"{s}\""),
+                _ => String::new(),
+            };
+            let chain: Vec<String> = parents.iter().map(|p| format!("{}#{}", p["name"].as_str().unwrap_or(""), p["id"])).collect();
+            let text = format!(
+                "{name}#{id} · scene {scene}\npos {pos:?} · abs {abs:?}\nmesh #{mid}{mname} · material #{tid}{tname}\nparents: {chain}\nengine.call(\"entity\", {{\"id\": {id}}})",
+                id = e.id(),
+                pos = info["pos"].as_array().map(|a| a.iter().map(|v| v.as_f64().unwrap_or(0.0)).collect::<Vec<_>>()).unwrap_or_default(),
+                abs = info["abs"].as_array().map(|a| a.iter().map(|v| v.as_f64().unwrap_or(0.0)).collect::<Vec<_>>()).unwrap_or_default(),
+                mid = info["mesh"]["id"],
+                mname = quoted(&info["mesh"]["name"]),
+                tid = info["material"]["id"],
+                tname = quoted(&info["material"]["name"]),
+                chain = if chain.is_empty() { "-".to_string() } else { chain.join(" > ") },
+            );
+            if let Some(clip) = web_sys::window().map(|w| w.navigator().clipboard()) {
+                let _ = clip.write_text(&text);
+            }
+            self.debug_mode.toast = Some(format!("copied: {}#{} ({})", info["name"].as_str().unwrap_or(""), e.id(), info["scene"].as_str().unwrap_or("")));
+            log_info!("inspect: {}", text.replace('\n', " | "));
+            let (now, step, frame) = (log::now_ms(), self.time.step, self.time.frame);
+            let mut ev = info.clone();
+            ev["kind"] = json!("pick");
+            self.debug_mode.record_event(now, step, frame, ev);
+        }
+        info
+    }
+
     pub fn request_pointer_lock(&self) {
         self.canvas.request_pointer_lock();
     }
@@ -612,6 +686,13 @@ fn frame<G: Game>(c: &mut Ctx, game: &mut G, dt: f32) {
         let Ctx { ui, input, .. } = c;
         ui.sync_stick(input.touch.stick());
     }
+    // Debug mode: Ctrl+click inspects the object under the pointer (copied to the clipboard); the
+    // click is consumed so the game does not also act on it. Plain clicks are untouched.
+    if c.debug_mode.on() && c.input.button_pressed(MouseButton::Left) && (c.input.key("ControlLeft") || c.input.key("ControlRight")) {
+        c.input.consume_press(MouseButton::Left);
+        let p = if c.input.pointer_locked { Vec2::new(c.canvas.client_width() as f32, c.canvas.client_height() as f32) * 0.5 } else { c.input.pointer };
+        c.inspect_at(p, true);
+    }
     // World panels: hover + clicks become UI actions before the game reads them.
     if !c.panels.is_empty() {
         let p = if c.input.pointer_locked {
@@ -643,6 +724,7 @@ fn frame<G: Game>(c: &mut Ctx, game: &mut G, dt: f32) {
     c.update_streaming();
     c.update_terrain();
     crate::character::update_cameras(c, dt);
+    crate::water::follow_camera(c);
     crate::animation::apply_poses(&mut c.world);
     scene::propagate_transforms(&mut c.world);
     crate::animation::deform_all(c);
@@ -681,7 +763,18 @@ fn frame<G: Game>(c: &mut Ctx, game: &mut G, dt: f32) {
         };
         let v = if c.debug_mode.on() { snap() } else { serde_json::Value::Null }; // only built while logging
         c.debug_mode.record_perf(now, step, frame, c.time.frame_dt * 1000.0, || v);
-        let badge = c.debug_mode.badge_html();
+        let perf = if c.debug_mode.on() {
+            // colour: green at the display rate, amber below 55, red below 30 fps
+            let fps = c.time.fps;
+            let col = if fps >= 55.0 { "#4ade80" } else if fps >= 30.0 { "#fbbf24" } else { "#f87171" };
+            let gpu = c.renderer.stats.gpu_ms.filter(|g| g.samples > 0).map(|g| format!(" · GPU {:.1} ms", g.total)).unwrap_or_default();
+            let scale = c.renderer.settings.render_scale;
+            let res = if scale < 0.999 { format!(" · res {:.0}%", scale * 100.0) } else { String::new() };
+            format!("<b style='color:{col}'>{fps:.0} fps</b> · CPU {:.1} ms{gpu}{res}", c.time.frame_ms)
+        } else {
+            String::new()
+        };
+        let badge = c.debug_mode.badge_html(&perf);
         c.ui.set("debugmode", &badge);
     }
     c.audio.step = c.time.step;
@@ -696,6 +789,10 @@ fn frame<G: Game>(c: &mut Ctx, game: &mut G, dt: f32) {
     c.audio.update(&c.world, cam);
 
     let t_engine = log::now_ms();
+    {
+        let r = &mut c.renderer;
+        crate::sky::update(&mut r.settings, &mut r.sky, c.time.sim_time);
+    }
     match c.renderer.render(&c.world) {
         Ok(()) => c.last_render_error = None,
         Err(e) => {

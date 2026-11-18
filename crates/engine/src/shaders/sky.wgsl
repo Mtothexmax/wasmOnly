@@ -1,5 +1,6 @@
 // Sky: fullscreen triangle at the far plane, drawn at the end of the opaque pass with depth test
-// less-equal, so it only shades pixels no geometry covered. Colour from common.wgsl's sky_radiance.
+// less-equal, so it only shades pixels no geometry covered. Colour from common.wgsl's sky_full
+// (atmosphere or gradient, skybox, stars, moon, clouds, sun disk).
 
 struct SkyOut {
     @builtin(position) pos: vec4f,
@@ -19,7 +20,7 @@ fn vs_sky(@builtin(vertex_index) i: u32) -> SkyOut {
 fn fs_sky(i: SkyOut) -> @location(0) vec4f {
     let far = g.inv_view_proj * vec4f(i.ndc, 1.0, 1.0);
     let dir = normalize(far.xyz / far.w - g.camera_pos.xyz);
-    var c = sky_radiance(dir) + sun_disk(dir);
+    var c = sky_full(dir, true);
     if (g.fog.x > 0.0 && g.fog_color.w > 0.5) {
         c = mix(c, g.fog_color.rgb, g.fog.w);
     }

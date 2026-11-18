@@ -65,6 +65,15 @@ pub struct Material {
     /// Water: wave height (world units) and wave frequency scale.
     pub wave_height: f32,
     pub wave_scale: f32,
+    /// Water: Gerstner choppiness 0..1.5 (sharp crests, horizontal motion, crest foam).
+    pub water_chop: f32,
+    /// Water: metres of water after which ~63% of the light is absorbed (clear pool 6, sea 2, murky pond 0.6).
+    pub water_clarity: f32,
+    /// Water: foam amount at the shore and on crests (0 = none).
+    pub water_foam: f32,
+    /// Water: vertex spacing (m) of the mesh near the camera; `spawn_water`/`spawn_ocean` build
+    /// meshes this dense, and vertex waves shorter than ~2 spacings are left to the pixel shader.
+    pub water_vertex_spacing: f32,
     /// Terrain splat shading: `texture` = 2x2 layer atlas, `normal_texture` = splat map (RGBA
     /// weights), UVs from world XZ. Set up by `Ctx::set_terrain`.
     pub terrain: bool,
@@ -110,6 +119,10 @@ impl Default for Material {
             water: false,
             wave_height: 0.0,
             wave_scale: 1.0,
+            water_chop: 0.6,
+            water_clarity: 2.0,
+            water_foam: 1.0,
+            water_vertex_spacing: 0.25,
             terrain: false,
             terrain_params: [0.0, 0.0, 1.0, 0.0],
             terrain_tiling: [6.0; 4],
@@ -171,9 +184,11 @@ impl Material {
         self.displacement = amount;
         self
     }
-    /// Water surface: animated waves, Fresnel sky reflection, sun glint, colour by water depth
-    /// (`shallow` -> `deep` sRGB hex), foam and soft edges at the shore. Drawn in the blend pass;
-    /// use a tessellated mesh (`MeshData::grid`) so the waves can move the vertices.
+    /// Water surface: Gerstner waves + ripples, refraction with depth absorption (`shallow` ->
+    /// `deep` sRGB hex), caustics, screen-space reflections over the sky, sun specular, subsurface
+    /// glow, shore + crest foam. Drawn in the blend pass. Spawn it with `ctx.spawn_water` (bounded)
+    /// or `ctx.spawn_ocean` (endless) so the mesh is dense enough for the vertex waves; tune
+    /// `wave_height`, `wave_scale`, `water_chop`, `water_clarity`, `water_foam`.
     pub fn water(deep: u32, shallow: u32) -> Self {
         Self {
             name: "water".into(),
@@ -184,6 +199,9 @@ impl Material {
             water: true,
             wave_height: 0.035,
             wave_scale: 1.0,
+            water_chop: 0.6,
+            water_clarity: 2.0,
+            water_foam: 1.0,
             ..Default::default()
         }
     }
@@ -253,6 +271,48 @@ pub struct RenderSettings {
     pub fog_max: f32,
     /// Fixed fog colour; None = the sky colour towards the horizon (fog blends into the sky).
     pub fog_color: Option<Vec3>,
+    // ---- sky + day/night (see `crate::sky`) ----
+    /// 0 = gradient (`sky_zenith`/`sky_horizon`), 1 = physically based atmosphere (follows the sun).
+    pub sky_mode: u32,
+    /// Atmosphere brightness (sun irradiance in scene units).
+    pub atmosphere_intensity: f32,
+    /// Cloud coverage 0..1 (0 = no clouds) and drift speed.
+    pub clouds: f32,
+    pub cloud_speed: f32,
+    /// Star brightness at night (0 = none).
+    pub stars: f32,
+    /// Time of day in hours (0..24). With `day_cycle` it places sun + moon and drives the lighting.
+    pub time_of_day: f32,
+    /// Let `time_of_day` drive sun/moon direction, light colour and intensity, ambient and sky.
+    /// Overwrites `sun_dir`, `sun_color`, `sun_intensity`, `sky_color`, `ground_color`, `sky_zenith`, `sky_horizon`.
+    pub day_cycle: bool,
+    /// Real-time minutes per 24 h of game time (0 = the clock stands still). Follows the simulation clock.
+    pub day_length_minutes: f32,
+    /// Sunrise direction (degrees around Y from +X) and the sun's height at noon (degrees).
+    pub sun_azimuth_deg: f32,
+    pub sun_max_elevation_deg: f32,
+    /// Sun intensity at noon (the cycle scales it by the atmosphere's transmittance).
+    pub daylight_intensity: f32,
+    /// Moon brightness (moonlight, disk, moonlit sky).
+    pub moon_intensity: f32,
+    /// Brighten the image at night (exposure x up to 2.6).
+    pub day_cycle_exposure: bool,
+    /// Lens flare when looking towards the sun (glow, starburst, coloured ghosts); 0 = off. Hidden
+    /// by anything in front of the sun disk (objects, clouds).
+    pub lens_flare: f32,
+    /// Skybox image (`ctx.load_skybox`): blend over the procedural sky by day / by night (0..1),
+    /// rotation around Y, brightness.
+    pub skybox_blend: f32,
+    pub skybox_night_blend: f32,
+    pub skybox_rotation_deg: f32,
+    pub skybox_intensity: f32,
+    // ---- water ----
+    /// Screen-space reflections on water (off = sky only).
+    pub water_ssr: bool,
+    /// Refraction strength (screen-space distortion of what is below the surface).
+    pub water_refraction: f32,
+    /// Caustics brightness on the ground below water.
+    pub water_caustics: f32,
     // ---- post-processing ----
     pub exposure: f32,
     pub bloom: bool,
@@ -318,6 +378,27 @@ impl Default for RenderSettings {
             fog_start: 15.0,
             fog_max: 0.9,
             fog_color: None,
+            sky_mode: 0,
+            atmosphere_intensity: 12.0,
+            clouds: 0.0,
+            cloud_speed: 1.0,
+            stars: 1.0,
+            time_of_day: 14.0,
+            day_cycle: false,
+            day_length_minutes: 0.0,
+            sun_azimuth_deg: 20.0,
+            sun_max_elevation_deg: 60.0,
+            daylight_intensity: 3.2,
+            moon_intensity: 1.0,
+            day_cycle_exposure: true,
+            lens_flare: 1.0,
+            skybox_blend: 1.0,
+            skybox_night_blend: 1.0,
+            skybox_rotation_deg: 0.0,
+            skybox_intensity: 1.0,
+            water_ssr: true,
+            water_refraction: 1.0,
+            water_caustics: 1.0,
             exposure: 1.0,
             bloom: true,
             bloom_intensity: 0.35,
@@ -411,7 +492,25 @@ struct Globals {
     cascade_texel: [f32; 4],
     cluster: [f32; 4],
     screen: [f32; 4],
+    sky_sun: [f32; 4],
+    sky_sun_color: [f32; 4],
+    sky_moon: [f32; 4],
+    sky_params: [f32; 4],
+    skybox: [f32; 4],
+    misc: [f32; 4],
 }
+
+/// Sky resources shared by every view: the atmosphere LUT (rendered per view), its sampler, the
+/// skybox image (1x1 dummy until `set_skybox`) and the LUT pipeline.
+struct SkyGpu {
+    lut_view: GpuTextureView,
+    sampler: GpuSampler,
+    skybox_view: GpuTextureView,
+    pipeline: GpuRenderPipeline,
+    group: GpuBindGroup,
+}
+
+const SKY_LUT_SIZE: (u32, u32) = (192, 108);
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -497,6 +596,10 @@ pub struct Renderer {
     /// Group 0 for the blend pass: bgl0 + the opaque scene depth (binding 5).
     bgl0_t: GpuBindGroupLayout,
     bind0_t: Option<GpuBindGroup>,
+    sky_gpu: SkyGpu,
+    skybox: Option<TextureId>,
+    /// Derived sky / day-night state (sun, moon, daylight, night), see `crate::sky`.
+    pub sky: crate::sky::SkyState,
     globals_buf: GpuBuffer,
     instance_buf: GpuBuffer,
     /// Instance indices drawn by the main pass (identity on CPU path, written by cull.wgsl on GPU path).
@@ -636,6 +739,21 @@ impl Renderer {
         let s = GpuSamplerBindingLayout::new();
         s.set_type(GpuSamplerBindingType::Comparison);
         shadow_samp_entry.set_sampler(&s);
+        // sky LUT (10), sky sampler (11), skybox (12); scene colour (9, blend pass only)
+        let float_tex = |binding: u32| {
+            let e = GpuBindGroupLayoutEntry::new(binding, gpu_shader_stage::FRAGMENT);
+            let t = GpuTextureBindingLayout::new();
+            t.set_sample_type(GpuTextureSampleType::Float);
+            e.set_texture(&t);
+            e
+        };
+        let sky_samp = || {
+            let e = GpuBindGroupLayoutEntry::new(11, gpu_shader_stage::FRAGMENT);
+            let s = GpuSamplerBindingLayout::new();
+            s.set_type(GpuSamplerBindingType::Filtering);
+            e.set_sampler(&s);
+            e
+        };
 
         let bgl0 = device
             .create_bind_group_layout(&GpuBindGroupLayoutDescriptor::new(&[
@@ -647,6 +765,9 @@ impl Renderer {
                 storage_entry(6, gpu_shader_stage::FRAGMENT),
                 storage_entry(7, gpu_shader_stage::FRAGMENT),
                 storage_entry(8, gpu_shader_stage::FRAGMENT),
+                float_tex(10),
+                sky_samp(),
+                float_tex(12),
             ]))
             .map_err(js_err)?;
         let bgl0_shadow = device
@@ -711,6 +832,10 @@ impl Renderer {
                 storage_entry(6, gpu_shader_stage::FRAGMENT),
                 storage_entry(7, gpu_shader_stage::FRAGMENT),
                 storage_entry(8, gpu_shader_stage::FRAGMENT),
+                float_tex(9),
+                float_tex(10),
+                sky_samp(),
+                float_tex(12),
             ]))
             .map_err(js_err)?;
 
@@ -911,6 +1036,7 @@ impl Renderer {
         let instance_cap = 1024;
         let instance_buf = Self::make_instance_buffer(&device, instance_cap)?;
         let visible_buf = Self::make_visible_buffer(&device, instance_cap)?;
+        let sky_gpu = Self::make_sky(&device, common, &globals_buf)?;
         let (bind0, bind0_shadow) = Self::make_bind0(
             &device,
             &bgl0,
@@ -922,6 +1048,7 @@ impl Renderer {
             &shadow_sampler,
             &light_bufs,
             &cascade_buf,
+            &sky_gpu,
         );
         let cull = if gpu_cull_supported {
             match crate::gpu_cull::GpuCull::new(&device) {
@@ -959,6 +1086,9 @@ impl Renderer {
             bgl_mat,
             bgl0_t,
             bind0_t: None,
+            sky_gpu,
+            skybox: None,
+            sky: Default::default(),
             globals_buf,
             instance_buf,
             visible_buf,
@@ -1070,6 +1200,7 @@ impl Renderer {
         shadow_sampler: &GpuSampler,
         lb: &LightBufs,
         cascade_buf: &GpuBuffer,
+        sky: &SkyGpu,
     ) -> (GpuBindGroup, Vec<GpuBindGroup>) {
         let full = device.create_bind_group(&GpuBindGroupDescriptor::new(
             &[
@@ -1081,6 +1212,9 @@ impl Renderer {
                 GpuBindGroupEntry::new_with_gpu_buffer(6, &lb.lights),
                 GpuBindGroupEntry::new_with_gpu_buffer(7, &lb.grid),
                 GpuBindGroupEntry::new_with_gpu_buffer(8, &lb.indices),
+                GpuBindGroupEntry::new_with_gpu_texture_view(10, &sky.lut_view),
+                GpuBindGroupEntry::new(11, &sky.sampler),
+                GpuBindGroupEntry::new_with_gpu_texture_view(12, &sky.skybox_view),
             ],
             bgl0,
         ));
@@ -1102,6 +1236,90 @@ impl Renderer {
         (full, shadow)
     }
 
+    /// Sky LUT target + pipeline (uniform globals only), sky sampler, 1x1 skybox placeholder.
+    fn make_sky(device: &GpuDevice, common: &str, globals: &GpuBuffer) -> Result<SkyGpu, String> {
+        use gpu_texture_usage::{RENDER_ATTACHMENT as RA, TEXTURE_BINDING as TB};
+        let td = GpuTextureDescriptor::new(crate::post::HDR_FORMAT, &nums(&[SKY_LUT_SIZE.0, SKY_LUT_SIZE.1]), RA | TB);
+        td.set_label("sky-lut");
+        let lut_view = device.create_texture(&td).map_err(js_err)?.create_view().map_err(js_err)?;
+        let bd = GpuTextureDescriptor::new(crate::post::HDR_FORMAT, &nums(&[1, 1]), TB);
+        bd.set_label("skybox-none");
+        let skybox_view = device.create_texture(&bd).map_err(js_err)?.create_view().map_err(js_err)?;
+        let sd = GpuSamplerDescriptor::new();
+        sd.set_mag_filter(GpuFilterMode::Linear);
+        sd.set_min_filter(GpuFilterMode::Linear);
+        sd.set_address_mode_u(GpuAddressMode::Repeat);
+        sd.set_address_mode_v(GpuAddressMode::ClampToEdge);
+        let sampler = device.create_sampler_with_descriptor(&sd);
+        let e = GpuBindGroupLayoutEntry::new(0, gpu_shader_stage::VERTEX | gpu_shader_stage::FRAGMENT);
+        let b = GpuBufferBindingLayout::new();
+        b.set_type(GpuBufferBindingType::Uniform);
+        e.set_buffer(&b);
+        let bgl = device.create_bind_group_layout(&GpuBindGroupLayoutDescriptor::new(&[e])).map_err(js_err)?;
+        let src = format!("{common}\n{}", include_str!("shaders/sky_lut.wgsl"));
+        let module = device.create_shader_module(&GpuShaderModuleDescriptor::new(&src));
+        module.set_label("sky_lut.wgsl");
+        crate::debug::report_shader_errors(&module, "sky_lut.wgsl");
+        let layout = device.create_pipeline_layout(&GpuPipelineLayoutDescriptor::new(&[JsNullable::wrap(bgl.clone())]));
+        let vs = GpuVertexState::new(&module);
+        vs.set_entry_point("vs_lut");
+        let fs = GpuFragmentState::new(&module, &[JsNullable::wrap(GpuColorTargetState::new(crate::post::HDR_FORMAT))]);
+        fs.set_entry_point("fs_lut");
+        let d = GpuRenderPipelineDescriptor::new(&layout, &vs);
+        d.set_label("sky-lut");
+        d.set_fragment(&fs);
+        let pipeline = device.create_render_pipeline(&d).map_err(js_err)?;
+        let group = device.create_bind_group(&GpuBindGroupDescriptor::new(&[GpuBindGroupEntry::new_with_gpu_buffer(0, globals)], &bgl));
+        Ok(SkyGpu { lut_view, sampler, skybox_view, pipeline, group })
+    }
+
+    /// Lens flare parameters for the composite pass: sun position on screen, strength (fades as the
+    /// sun leaves the screen, sets or is off), disk radius, colour and the brightness an unblocked
+    /// sun disk has in the HDR image (the shader compares against it to find clouds/objects in front).
+    fn lens_flare(&self, view_proj: Mat4, cam_pos: Vec3) -> ([f32; 4], [f32; 4]) {
+        let s = &self.settings;
+        let sun = self.sky.sun.normalize_or(Vec3::Y);
+        if s.lens_flare <= 0.0 || !s.sky || s.sun_size_deg <= 0.0 || sun.y < -0.02 {
+            return ([0.0; 4], [0.0; 4]);
+        }
+        let project = |d: Vec3| {
+            let c = view_proj * (cam_pos + d * 1000.0).extend(1.0);
+            (c.w > 0.0).then(|| glam::Vec2::new(c.x / c.w * 0.5 + 0.5, 0.5 - c.y / c.w * 0.5))
+        };
+        let Some(uv) = project(sun) else { return ([0.0; 4], [0.0; 4]) };
+        let side = sun.cross(Vec3::Y).normalize_or(Vec3::X);
+        let edge = project((sun + side * s.sun_size_deg.to_radians().tan()).normalize()).unwrap_or(uv);
+        let aspect = self.size.0 as f32 / self.size.1.max(1) as f32;
+        let radius = ((edge - uv) * glam::Vec2::new(aspect, 1.0)).length().max(1e-4);
+        // fade out as the sun leaves the screen (ghosts would swing wildly) and near the horizon
+        let out = (uv - glam::Vec2::splat(0.5)).abs().max_element();
+        let on_screen = 1.0 - ((out - 0.45) / 0.2).clamp(0.0, 1.0);
+        let col = self.sky.sun_radiance;
+        let lum = col.dot(Vec3::new(0.2126, 0.7152, 0.0722));
+        if on_screen <= 0.0 || lum <= 1e-4 {
+            return ([0.0; 4], [0.0; 4]);
+        }
+        let tint = col / col.max_element().max(1e-4);
+        let strength = s.lens_flare * on_screen * (lum / 3.0).clamp(0.0, 1.0) * self.sky.daylight.max(0.15);
+        // sun_disk() in common.wgsl: radiance * 12, limb-darkened to ~0.8 inside
+        ([uv.x, uv.y, strength, radius], [tint.x, tint.y, tint.z, lum * 12.0 * 0.8])
+    }
+
+    /// Equirectangular skybox image (a texture from `add_texture_*` / `ctx.load_skybox`), or None.
+    /// Blended over the procedural sky by `skybox_blend` (day) / `skybox_night_blend` (night).
+    pub fn set_skybox(&mut self, tex: Option<TextureId>) {
+        // public texture ids are offset by one (index 0 = internal white texture)
+        self.skybox = tex.filter(|t| (t.0 as usize + 1) < self.tex_views.len());
+        if let Some(t) = self.skybox {
+            self.sky_gpu.skybox_view = self.tex_views[t.0 as usize + 1].clone();
+        }
+        self.rebuild_bind0();
+    }
+
+    pub fn skybox(&self) -> Option<TextureId> {
+        self.skybox
+    }
+
     fn rebuild_bind0(&mut self) {
         let (a, b) = Self::make_bind0(
             &self.device,
@@ -1114,6 +1332,7 @@ impl Renderer {
             &self.shadow_sampler,
             &self.light_bufs,
             &self.cascade_buf,
+            &self.sky_gpu,
         );
         self.bind0 = a;
         self.bind0_shadow = b;
@@ -1739,14 +1958,14 @@ impl Renderer {
     /// One view: the main camera into the canvas (`rtt` None) or a render texture's camera into it.
     fn render_view(&mut self, world: &World, rtt: Option<usize>) -> Result<(), String> {
         let main = rtt.is_none();
-        let (msaa, depth, hdr_view) = match rtt {
-            None => match (self.msaa_view.clone(), self.depth_view.clone(), self.targets.as_ref().map(|t| t.hdr_view.clone())) {
-                (Some(m), Some(d), Some(h)) => (m, d, h),
+        let (msaa, depth, hdr_view, scene_color) = match rtt {
+            None => match (self.msaa_view.clone(), self.depth_view.clone(), self.targets.as_ref()) {
+                (Some(m), Some(d), Some(t)) => (m, d, t.hdr_view.clone(), t.scene_color.clone()),
                 _ => return Ok(()),
             },
             Some(i) => {
                 let t = &self.rtts[i].targets;
-                (t.msaa.clone(), t.depth.clone(), t.hdr_view.clone())
+                (t.msaa.clone(), t.depth.clone(), t.hdr_view.clone(), t.scene_color.clone())
             }
         };
         let Some((view, proj, cam_pos, near, far, layers)) = self.view_setup(world, rtt) else {
@@ -1854,6 +2073,17 @@ impl Renderer {
             cascade_texel: texels,
             cluster: [near, cluster_far, crate::lights::CLUSTER_Z as f32 / (cluster_far / near).ln(), 0.0],
             screen: [vw as f32, vh as f32, 1.0 / vw.max(1) as f32, 1.0 / vh.max(1) as f32],
+            sky_sun: self.sky.sun.normalize_or(Vec3::Y).extend(1.0).into(),
+            sky_sun_color: self.sky.sun_radiance.extend(self.sky.night).into(),
+            sky_moon: self.sky.moon.normalize_or(Vec3::NEG_Y).extend(self.sky.moon_brightness).into(),
+            sky_params: [s.sky_mode as f32, s.clouds.clamp(0.0, 1.0), shader_t * s.cloud_speed * 0.004, s.stars.max(0.0)],
+            skybox: [
+                if self.skybox.is_some() { s.skybox_blend + (s.skybox_night_blend - s.skybox_blend) * self.sky.night } else { 0.0 },
+                s.skybox_rotation_deg.to_radians(),
+                s.skybox_intensity,
+                self.skybox.is_some() as u32 as f32,
+            ],
+            misc: [s.water_ssr as u32 as f32, s.water_refraction.max(0.0), s.water_caustics.max(0.0), s.atmosphere_intensity.max(0.0)],
         };
         self.queue
             .write_buffer_with_u32_and_u8_slice(&self.globals_buf, 0, bytemuck::bytes_of(&globals))
@@ -1873,6 +2103,7 @@ impl Renderer {
         let mut visible: Vec<(u8, u32, u32, InstanceRaw, [f32; 4], u32)> = vec![];
         // (view depth, double_sided, texture, mesh, instance, model index)
         let mut blended: Vec<(f32, bool, u32, u32, InstanceRaw, u32)> = vec![];
+        let mut has_water = false;
         // (alpha-tested, texture, mesh, instance, model index, bounding sphere)
         let mut casters: Vec<(bool, u32, u32, InstanceRaw, u32, Vec3, f32)> = vec![];
         // Model matrices; normal matrices (inverse-transpose) are computed afterwards with the job system.
@@ -1914,12 +2145,18 @@ impl Renderer {
                 model: model.to_cols_array_2d(),
                 normal: [[0.0; 4]; 4], // filled below (jobs::par_map)
                 base_color: mat.base_color.into(),
-                emissive_metallic: if mat.terrain { mat.terrain_params } else { mat.emissive.extend(mat.metallic).into() },
-                params: [mat.roughness, mat.checker, shading, alpha],
+                emissive_metallic: if mat.terrain {
+                    mat.terrain_params
+                } else if mat.water {
+                    mat.emissive.extend(mat.water_foam).into()
+                } else {
+                    mat.emissive.extend(mat.metallic).into()
+                },
+                params: [mat.roughness, if mat.water { mat.water_clarity } else { mat.checker }, shading, alpha],
                 maps: if mat.terrain {
                     mat.terrain_tiling
                 } else if mat.water {
-                    [0.0, mat.wave_height, 0.0, mat.wave_scale]
+                    [mat.water_vertex_spacing, mat.wave_height, mat.water_chop, mat.wave_scale]
                 } else {
                     [
                         if mat.normal_texture.is_some() { mat.normal_scale } else { 0.0 },
@@ -1950,6 +2187,7 @@ impl Renderer {
             let in_frustum = planes.iter().all(|p| p.truncate().dot(center) + p.w >= -radius);
             if is_blend {
                 if in_frustum {
+                    has_water |= mat.water;
                     blended.push(((center - cam_pos).dot(cam_fwd_n), mat.double_sided, tex, mesh_id.0, raw, mi));
                 } else {
                     culled += 1;
@@ -2059,6 +2297,10 @@ impl Renderer {
                     GpuBindGroupEntry::new_with_gpu_buffer(6, &self.light_bufs.lights),
                     GpuBindGroupEntry::new_with_gpu_buffer(7, &self.light_bufs.grid),
                     GpuBindGroupEntry::new_with_gpu_buffer(8, &self.light_bufs.indices),
+                    GpuBindGroupEntry::new_with_gpu_texture_view(9, &scene_color.1),
+                    GpuBindGroupEntry::new_with_gpu_texture_view(10, &self.sky_gpu.lut_view),
+                    GpuBindGroupEntry::new(11, &self.sky_gpu.sampler),
+                    GpuBindGroupEntry::new_with_gpu_texture_view(12, &self.sky_gpu.skybox_view),
                 ],
                 &self.bgl0_t,
             )));
@@ -2094,6 +2336,18 @@ impl Renderer {
             t.begin_frame();
         }
         let encoder = self.device.create_command_encoder();
+
+        // --- Sky-view LUT (atmosphere), only when the atmosphere sky is on ---------------------
+        if self.settings.sky_mode == 1 {
+            let att = GpuRenderPassColorAttachment::new_with_gpu_texture_view(GpuLoadOp::Clear, GpuStoreOp::Store, &self.sky_gpu.lut_view);
+            let desc = GpuRenderPassDescriptor::new(&[JsNullable::wrap(att)]);
+            desc.set_label("sky-lut");
+            let pass = encoder.begin_render_pass(&desc).map_err(js_err)?;
+            pass.set_pipeline(&self.sky_gpu.pipeline);
+            pass.set_bind_group(0, Some(&self.sky_gpu.group));
+            pass.draw(3);
+            pass.end();
+        }
 
         // --- GPU culling (compute) ----------------------------------------------------------
         if gpu {
@@ -2197,6 +2451,10 @@ impl Renderer {
         // --- Opaque pass (indirect on the GPU path); keeps colour + depth for the blend pass ---
         {
             let att = GpuRenderPassColorAttachment::new_with_gpu_texture_view(GpuLoadOp::Clear, GpuStoreOp::Store, &msaa);
+            if has_water {
+                // water refracts and reflects the resolved opaque scene (copied below)
+                att.set_resolve_target_gpu_texture_view(&hdr_view);
+            }
             let cc = self.settings.clear_color; // linear HDR target, alpha 1 = tonemapped
             let clear_a = if rtt.is_some_and(|i| self.rtts[i].opts.transparent) { 0.0 } else { 1.0 };
             att.set_clear_value_gpu_color_dict(&GpuColorDict::new(clear_a, cc.z as f64, cc.y as f64, cc.x as f64));
@@ -2248,6 +2506,13 @@ impl Renderer {
                 pass.draw(3);
             }
             pass.end();
+        }
+
+        if has_water {
+            let src = GpuTexelCopyTextureInfo::new(&scene_color.2);
+            let dst = GpuTexelCopyTextureInfo::new(&scene_color.0);
+            let size: Vec<Number> = [vw, vh].iter().map(|x| Number::from(*x)).collect();
+            encoder.copy_texture_to_texture_with_u32_sequence(&src, &dst, &size).map_err(js_err)?;
         }
 
         // --- Blend pass: back to front, depth read-only *and* bound as a texture (water) -----
@@ -2304,6 +2569,8 @@ impl Renderer {
         }
 
         // --- Post: bloom + depth darkening + tonemap -> canvas ------------------------------
+        self.post.exposure_mul = self.sky.exposure_mul;
+        self.post.flare = if main { self.lens_flare(view_proj, cam_pos) } else { ([0.0; 4], [0.0; 4]) };
         {
             let ts = self.timing.as_mut().filter(|_| main).and_then(|t| t.split_writes(crate::gpu_timing::POST));
             let nf = (near * (1.0 + self.settings.depth_jitter), far);

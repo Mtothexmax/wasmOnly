@@ -2,7 +2,7 @@
 //   prefilter  : HDR -> bloom mip 0 (quarter res), soft threshold, scene-colour pixels only (alpha mask)
 //   down       : bloom mip i -> mip i+1 (dual-filter downsample, 5 taps)
 //   up         : bloom mip i -> mip i-1, added on top (dual-filter upsample, 8 taps)
-//   composite  : HDR + bloom, depth darkening (unsharp-masked depth), exposure, ACES, gamma
+//   composite  : HDR + bloom, depth darkening (unsharp-masked depth), lens flare, exposure, ACES, gamma
 // Alpha of the scene colour is the tonemap mask: 1 = scene, 0 = UI panels / debug views (as-is).
 
 struct Params {
@@ -10,6 +10,7 @@ struct Params {
     b: vec4f,
     c: vec4f,
     d: vec4f,
+    e: vec4f,
 }
 
 @group(0) @binding(0) var src: texture_2d<f32>;
@@ -30,6 +31,13 @@ fn vs_full(@builtin(vertex_index) i: u32) -> VsOut {
     return o;
 }
 
+// NaN / inf / absurd HDR values never reach bloom or the tonemapper (one bad pixel = a black dot with
+// a white halo). Comparisons with NaN are false, so NaN lanes take the 0 branch.
+fn sanitize(c: vec3f) -> vec3f {
+    let ok = (c >= vec3f(0.0)) & (c <= vec3f(6.0e4));
+    return select(vec3f(0.0), min(c, vec3f(2.0e3)), ok);
+}
+
 fn luma(c: vec3f) -> f32 {
     return dot(c, vec3f(0.2126, 0.7152, 0.0722));
 }
@@ -44,7 +52,7 @@ fn fs_prefilter(i: VsOut) -> @location(0) vec4f {
     let offs = array<vec2f, 4>(vec2f(-0.5, -0.5), vec2f(0.5, -0.5), vec2f(-0.5, 0.5), vec2f(0.5, 0.5));
     for (var k = 0; k < 4; k++) {
         let s = textureSampleLevel(src, samp, i.uv + offs[k] * t * 2.0, 0.0);
-        let c = s.rgb * clamp(s.a, 0.0, 1.0);
+        let c = sanitize(s.rgb) * clamp(s.a, 0.0, 1.0);
         let w = 1.0 / (1.0 + luma(c));
         acc += c * w;
         wsum += w;
@@ -106,14 +114,89 @@ fn lin_depth(z: f32) -> f32 {
     return n * f / (f - z * (f - n));
 }
 
+// --- Lens flare ---------------------------------------------------------------------------------
+// d = (sun uv x, sun uv y, strength (0 = off), sun disk radius in uv height units)
+// e = (sun colour rgb, expected HDR luminance of the visible sun disk)
+
+// How much of the sun disk is visible: 6 taps inside the disk in the HDR scene, compared with the
+// brightness of an unobstructed disk. Geometry, clouds and the horizon all hide it.
+fn sun_visibility(aspect: f32) -> f32 {
+    let r = p.d.w * 0.7;
+    var vis = 0.0;
+    for (var k = 0; k < 6; k++) {
+        let a = f32(k) * 2.39996;
+        let rr = r * sqrt((f32(k) + 0.5) / 6.0);
+        let uv = p.d.xy + vec2f(cos(a) * rr / aspect, sin(a) * rr);
+        if (any(uv < vec2f(0.0)) || any(uv > vec2f(1.0))) { continue; }
+        let l = luma(sanitize(textureSampleLevel(src, samp, uv, 0.0).rgb));
+        vis += clamp((l / max(p.e.w, 1e-3) - 0.25) * 2.0, 0.0, 1.0);
+    }
+    return vis / 6.0;
+}
+
+fn ghost(q: vec2f, center: vec2f, size: f32, ring: bool) -> f32 {
+    let d = length(q - center) / size;
+    if (d >= 1.0) { return 0.0; } // most pixels: no atan2
+    if (ring) {
+        return smoothstep(0.75, 0.93, d) * (1.0 - smoothstep(0.93, 1.0, d));
+    }
+    // hexagonal aperture ghost (6 blades), soft edge, brighter rim
+    let v = q - center;
+    let ang = atan2(v.y, v.x);
+    let seg = 3.14159265 / 3.0;
+    let x = ang + seg * 0.5;
+    let hex = cos(seg * 0.5) / cos(x - floor(x / seg) * seg - seg * 0.5);
+    let dh = d / hex;
+    return (1.0 - smoothstep(0.85, 1.0, dh)) * (0.55 + 0.45 * smoothstep(0.4, 0.95, dh));
+}
+
+// Classic game lens flare: glow + starburst at the sun, a faint halo ring, and a chain of coloured
+// hexagon/ring ghosts along the line from the sun through the screen centre.
+fn lens_flare(uv: vec2f) -> vec3f {
+    let aspect = p.c.w;
+    let vis = sun_visibility(aspect);
+    if (vis <= 0.0) { return vec3f(0.0); }
+    let k = p.d.z * vis;
+    let sun = vec2f(p.d.x * aspect, p.d.y);
+    let q = vec2f(uv.x * aspect, uv.y);
+    let ctr = vec2f(0.5 * aspect, 0.5);
+    let col = p.e.rgb;
+    var c = vec3f(0.0);
+    // glow + 6-ray starburst around the sun
+    let v = q - sun;
+    let d = length(v);
+    let ang = atan2(v.y, v.x);
+    c += col * (0.045 / (d * 9.0 + 0.04)) * 0.5;
+    let fall = exp(-d * 5.0);
+    if (fall > 0.004) {
+        let rays = pow(abs(cos(ang * 3.0 + 0.3)), 60.0) + 0.6 * pow(abs(cos(ang * 3.0 + 1.35)), 90.0);
+        c += col * rays * fall * 1.4;
+    }
+    // halo ring with a faint rainbow edge
+    let hr = abs(d - 0.32);
+    c += vec3f(1.0, 0.75, 0.55) * col * exp(-hr * hr * 9000.0) * 0.05;
+    c += vec3f(0.45, 0.6, 1.0) * col * exp(-(hr - 0.012) * (hr - 0.012) * 9000.0) * 0.04;
+    // ghosts: position t along sun -> centre -> beyond, size, colour, ring?
+    let axis = ctr - sun;
+    c += vec3f(1.0, 0.55, 0.2) * ghost(q, sun + axis * 0.45, 0.035, false) * 0.29;
+    c += vec3f(0.35, 1.0, 0.45) * ghost(q, sun + axis * 0.72, 0.022, false) * 0.25;
+    c += vec3f(0.4, 0.55, 1.0) * ghost(q, sun + axis * 1.12, 0.06, false) * 0.20;
+    c += vec3f(1.0, 0.85, 0.4) * ghost(q, sun + axis * 1.3, 0.016, false) * 0.36;
+    c += vec3f(0.7, 0.4, 1.0) * ghost(q, sun + axis * 1.55, 0.09, true) * 0.22;
+    c += vec3f(0.3, 0.9, 1.0) * ghost(q, sun + axis * 1.8, 0.03, false) * 0.25;
+    c += vec3f(1.0, 0.45, 0.35) * ghost(q, sun + axis * 2.2, 0.12, false) * 0.11;
+    return c * k;
+}
+
 // a = (exposure, bloom intensity, darkening strength, darkening radius in px at 1 m)
 // b = (near, far, bloom on, darkening range in m)
-// c = (vignette, saturation, transparent background (alpha = scene mask), _)
+// c = (vignette, saturation, transparent background (alpha = scene mask), aspect w/h)
 @fragment
 fn fs_composite(i: VsOut) -> @location(0) vec4f {
     // the scene may be rendered smaller than the canvas (render_scale): sample by UV, read depth at
     // the matching scene pixel
-    let s = textureSampleLevel(src, samp, i.uv, 0.0);
+    let raw = textureSampleLevel(src, samp, i.uv, 0.0);
+    let s = vec4f(sanitize(raw.rgb), select(0.0, raw.a, raw.a == raw.a));
     let px = vec2i(i.uv * vec2f(textureDimensions(depth_tex)));
     let mask = clamp(s.a, 0.0, 1.0);
     var c = s.rgb;
@@ -152,6 +235,9 @@ fn fs_composite(i: VsOut) -> @location(0) vec4f {
     if (p.b.z > 0.5) {
         let bl = textureSampleLevel(bloom_tex, samp, i.uv, 0.0).rgb;
         c += bl * p.a.y * mask;
+    }
+    if (p.d.z > 0.0) {
+        c += lens_flare(i.uv);
     }
     var mapped = aces(c * p.a.x);
     // saturation

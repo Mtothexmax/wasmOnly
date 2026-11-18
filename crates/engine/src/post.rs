@@ -23,6 +23,7 @@ pub(crate) struct PostParams {
     pub b: [f32; 4],
     pub c: [f32; 4],
     pub d: [f32; 4],
+    pub e: [f32; 4],
 }
 
 /// Size-dependent resources of one render target (the canvas, or one render texture).
@@ -31,6 +32,8 @@ pub(crate) struct PostTargets {
     pub msaa: GpuTextureView,
     pub depth: GpuTextureView,
     pub hdr_view: GpuTextureView,
+    /// Copy of the resolved opaque scene for water refraction/reflection: (copy texture, its view, the hdr texture it is copied from).
+    pub scene_color: (GpuTexture, GpuTextureView, GpuTexture),
     bloom_views: Vec<GpuTextureView>,
     bloom_sizes: Vec<(u32, u32)>,
     params: GpuBuffer,
@@ -43,6 +46,11 @@ pub(crate) struct PostTargets {
 
 pub(crate) struct Post {
     pub sky_pipeline: GpuRenderPipeline,
+    /// Exposure multiplier from the day/night cycle (set by the renderer each frame).
+    pub exposure_mul: f32,
+    /// Lens flare for the next composite: (sun uv x, y, strength, disk radius in uv height) and
+    /// (sun colour rgb, expected disk luminance). Set by the renderer per view; strength 0 = off.
+    pub flare: ([f32; 4], [f32; 4]),
     pub particle_additive: GpuRenderPipeline,
     pub particle_alpha: GpuRenderPipeline,
     pub bgl_particles: GpuBindGroupLayout,
@@ -224,6 +232,8 @@ impl Post {
         let sampler = device.create_sampler_with_descriptor(&sd);
         Ok(Self {
             sky_pipeline,
+            exposure_mul: 1.0,
+            flare: ([0.0; 4], [0.0; 4]),
             particle_additive,
             particle_alpha,
             bgl_particles,
@@ -275,7 +285,10 @@ impl Post {
         let msaa = tex(HDR_FORMAT, (w, h), RA, samples, 1, "msaa-hdr")?.create_view().map_err(js_err)?;
         // TEXTURE_BINDING: Hi-Z, water and particles read this frame's depth
         let depth = tex(depth_format, (w, h), RA | TB, samples, 1, "msaa-depth")?.create_view().map_err(js_err)?;
-        let hdr_view = tex(HDR_FORMAT, (w, h), RA | TB, 1, 1, "hdr")?.create_view().map_err(js_err)?;
+        let hdr_tex = tex(HDR_FORMAT, (w, h), RA | TB | gpu_texture_usage::COPY_SRC, 1, 1, "hdr")?;
+        let hdr_view = hdr_tex.create_view().map_err(js_err)?;
+        let sc = tex(HDR_FORMAT, (w, h), TB | gpu_texture_usage::COPY_DST, 1, 1, "scene-color")?;
+        let scene_color = (sc.clone(), sc.create_view().map_err(js_err)?, hdr_tex);
         // bloom starts at quarter resolution (the glow is soft; half res costs ~4x for no visible gain)
         let (bw, bh) = ((w / 4).max(1), (h / 4).max(1));
         let mips = (32 - bw.min(bh).max(1).leading_zeros()).saturating_sub(2).clamp(1, MAX_BLOOM_MIPS);
@@ -319,7 +332,7 @@ impl Post {
             ],
             &self.bgl_comp,
         ));
-        Ok(PostTargets { size: (w, h), msaa, depth, hdr_view, bloom_views, bloom_sizes, params, pre_group, down_groups, up_groups, comp_group })
+        Ok(PostTargets { size: (w, h), msaa, depth, hdr_view, scene_color, bloom_views, bloom_sizes, params, pre_group, down_groups, up_groups, comp_group })
     }
 
     /// Bloom + composite into `output` (canvas texture or an sRGB render texture).
@@ -344,10 +357,11 @@ impl Post {
         put(
             slots - 1,
             PostParams {
-                a: [s.exposure, s.bloom_intensity, dark, s.depth_darkening_radius * t.size.1 as f32 / 1000.0],
+                a: [s.exposure * self.exposure_mul, s.bloom_intensity, dark, s.depth_darkening_radius * t.size.1 as f32 / 1000.0],
                 b: [near_far.0, near_far.1, if bloom { 1.0 } else { 0.0 }, s.depth_darkening_range],
-                c: [s.vignette, s.saturation, if transparent { 1.0 } else { 0.0 }, 0.0],
-                d: [0.0; 4],
+                c: [s.vignette, s.saturation, if transparent { 1.0 } else { 0.0 }, t.size.0 as f32 / t.size.1.max(1) as f32],
+                d: if s.debug_view == 0 { self.flare.0 } else { [0.0; 4] },
+                e: self.flare.1,
             },
         );
         queue.write_buffer_with_u32_and_u8_slice(&t.params, 0, &data).map_err(js_err)?;

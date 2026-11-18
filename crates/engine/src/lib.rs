@@ -32,6 +32,7 @@ pub mod render_texture;
 pub mod renderer;
 pub mod save;
 pub mod screens;
+pub mod sky;
 pub mod scene;
 pub mod streaming;
 pub mod terrain;
@@ -39,6 +40,7 @@ pub mod texgen;
 pub mod touch;
 pub mod ui;
 pub mod vegetation;
+pub mod water;
 pub mod zfight;
 
 pub use app::{run, Ctx, Game, Time};
@@ -58,6 +60,7 @@ pub mod prelude {
     pub use crate::character::{CharacterController, ThirdPersonCamera};
     pub use crate::input::{Input, MouseButton};
     pub use crate::lights::SpotLight;
+    pub use crate::water::Ocean;
     pub use crate::panel::{Panel, PanelId, WorldPanel};
     pub use crate::particles::{ParticleEmitter, ParticlePreset, ParticleShape, ParticleSystem};
     pub use crate::physics::{rapier, Body, Physics};

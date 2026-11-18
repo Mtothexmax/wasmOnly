@@ -39,6 +39,9 @@ normal `cargo` output above it.
 - **Debug mode / session logs:** the user presses ` (German: ^) to record keys, mouse buttons and the
   camera pose (1/s) into `logs/debug-*.log` (JSON lines: `t`, `step`, `frame`, `kind`, ...). Read the newest
   file to see exactly what the user did. Toggle from the API with `call debug_mode '{"on":true}'`.
+  In debug mode **Ctrl+click** on an object copies its identity (name#id, scene, local/absolute position, mesh,
+  material, parent chain, `engine.call("entity", {id})`) to the clipboard and logs a `"kind":"pick"` line, so the
+  user can paste exactly which object they mean. Same data from the API: `call inspect '{"x":640,"y":360}'`.
 - **Errors:** Rust panics, WebGPU validation errors and WGSL compile errors (with line numbers)
   all land in the log at level `error` and in a red overlay (`#engine-error`). Startup failures
   set `window.engine.fatal`.
@@ -90,6 +93,14 @@ normal `cargo` output above it.
 - **Visual checks:** `render '{"debug_view":1}'` = normals, `2` = shadow term, `0` = lit.
 - **3D UI:** `call panels` gives every world-panel widget with its on-screen centre (`screen`, CSS px);
   click it for real with `input {x,y}` + `input {button:0}`, or directly with `panel_click {id, widget}`.
+- **Sky / day-night:** `call sky` = mode, `time_of_day`, sun/moon elevation, `daylight`, `night`, which body lights
+  the scene, ambient; `sky {time: 18.5}` (turns the cycle on), `{cycle, day_length (min per day, 0 = still), mode:
+  "atmosphere"|"gradient", clouds, stars, moon, skybox: url|null, skybox_blend, skybox_night_blend}`. The clock follows
+  the simulation (`pause` + `step` are deterministic). Everything else via `render` (`sun_azimuth_deg`, ...).
+  Lens flare: `render {lens_flare: 0..}` (0 = off); test `games/demo/tests/flare.txt` (visible / hidden behind the tower).
+- **Water:** `Material::water` + `ctx.spawn_water(name, mat, size, t)` / `ctx.spawn_ocean(mat, y)`; tune `wave_height`,
+  `wave_scale`, `water_chop`, `water_clarity`, `water_foam`, `water_vertex_spacing`; `render {water_ssr, water_refraction,
+  water_caustics}`. `render {debug_view:1}` shows the water normals. Test: `games/demo/tests/sky.txt`.
 - **Music:** `call music` -> tracks with `state` (buffering/playing/paused/blocked/error), `time`, `duration`,
   `buffered_pct`; transitions are logged. Simulate a slow network for one path only:
   `curl -X POST "http://localhost:8080/__throttle?kbps=48&match=assets/music"` (`kbps=0` = off).
@@ -125,6 +136,8 @@ normal `cargo` output above it.
 | `crates/engine/src/save.rs` | save slots (localStorage, versioned JSON) + blobs (IndexedDB) |
 | `crates/engine/src/geom.rs` | geometry kit for procedural content (`MeshBuilder`: parts, walls with openings, extrude, sweep, lathe) + generator registry |
 | `crates/engine/src/batch.rs` | static batching (`batch_static`) + `Motion` (spin/sway/bob instance animation) |
+| `crates/engine/src/sky.rs` | atmosphere model (CPU twin of `shaders/sky_lut.wgsl`), day/night cycle, `SkyState`, skybox loading, `sky` command |
+| `crates/engine/src/water.rs` | `spawn_water`, `spawn_ocean` (camera-following radial mesh), `Ocean` |
 | `crates/engine/src/lights.rs` | clustered lighting (16x9x24 froxels, point + `SpotLight`, up to 2048) |
 | `crates/engine/src/terrain.rs` | heightmap terrain: chunk LOD + skirts, splat material, heightfield colliders, streaming, edits, scatter rules |
 | `crates/engine/src/vegetation.rs` | GPU grass (vertex-shader placed blades) |

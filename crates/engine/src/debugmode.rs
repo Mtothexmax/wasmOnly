@@ -33,6 +33,8 @@ struct Shared {
 
 #[derive(Default)]
 pub struct DebugMode {
+    /// Last Ctrl+click inspection result shown in the badge.
+    pub(crate) toast: Option<String>,
     on: bool,
     file: Option<String>,
     pending: Vec<String>,
@@ -101,6 +103,17 @@ impl DebugMode {
     fn push(&mut self, v: serde_json::Value) {
         self.pending.push(v.to_string());
         self.lines += 1;
+    }
+
+    /// Any other event line (e.g. `{"kind":"pick", ...}` from Ctrl+click inspection).
+    pub fn record_event(&mut self, now: f64, step: u64, frame: u64, mut v: serde_json::Value) {
+        if !self.on {
+            return;
+        }
+        v["t"] = json!((now * 10.0).round() / 10.0);
+        v["step"] = json!(step);
+        v["frame"] = json!(frame);
+        self.push(v);
     }
 
     /// Key or mouse-button edge. `code` is `KeyboardEvent.code` or `Mouse0..2`.
@@ -232,7 +245,8 @@ impl DebugMode {
     }
 
     /// Small HUD badge (empty when off).
-    pub(crate) fn badge_html(&self) -> String {
+    /// `perf`: live frame-rate text shown in the badge (fps, frame/GPU ms, resolution scale).
+    pub(crate) fn badge_html(&self, perf: &str) -> String {
         if !self.on {
             return String::new();
         }
@@ -241,9 +255,10 @@ impl DebugMode {
             .map(|c| format!("{:.1} {:.1} {:.1}", c[0], c[1], c[2]))
             .unwrap_or_default();
         format!(
-            "<div class='panel debugmode'><b style='color:#f87171'>● DEBUG</b> cam {cam} · {} inputs · logs/{}</div>",
+            "<div class='panel debugmode'><b style='color:#f87171'>● DEBUG</b> {perf}<br>cam {cam} · {} inputs · logs/{}<br><small>Ctrl+click an object: copy its info</small>{}</div>",
             self.keys,
-            self.file.as_deref().unwrap_or("?")
+            self.file.as_deref().unwrap_or("?"),
+            self.toast.as_ref().map(|t| format!("<br><b style='color:#93c5fd'>{}</b>", t.replace('<', "&lt;"))).unwrap_or_default()
         )
     }
 

@@ -31,7 +31,9 @@ would from a real web server.
 
 Debug mode: press <kbd>`</kbd> (on German keyboards <kbd>^</kbd>). Key presses, mouse clicks, the camera
 pose, and once per second frame timings, character states and the game state are written to
-`logs/debug-*.log` in the project folder; press again to close the file.
+`logs/debug-*.log` in the project folder; press again to close the file. While it is on, the badge shows fps, CPU/GPU time and resolution, and
+**Ctrl+click** on an object copies its identifying properties (name#id, scene, position, mesh, material, parent
+chain) to the clipboard (`engine.call("inspect", {x, y})` returns the same data).
 
 Debugging in DevTools: the dev build contains DWARF for engine and game code. With the Chrome extension
 "C/C++ DevTools Support (DWARF)" you can set breakpoints directly in `.rs` files.
@@ -45,7 +47,7 @@ Debugging in DevTools: the dev build contains DWARF for engine and game code. Wi
 | Graphics | WebGPU directly via `web-sys` (unstable cfg), WGSL incl. compute shaders | ✅ |
 | Rendering | Forward PBR (GGX) into an HDR target, 4× MSAA, ACES tonemapping, adaptive render resolution | ✅ |
 | Material maps | Normal mapping (tangent frame from screen-space derivatives, no vertex tangents needed), height maps for **vertex displacement** (on `MeshData::grid/disk`) and **parallax occlusion mapping**; normal/height maps from any texture preset (`ctx.generate_maps`) | ✅ · shadows use the undisplaced mesh |
-| Water | `Material::water(deep, shallow)`: waves (vertex + fragment), fine ripples from noise gradients, Fresnel sky reflection, sun glint, colour by water depth, foam and soft edges at the shore (reads the scene depth in the blend pass), wave anti-aliasing in the distance | ✅ |
+| Water | `Material::water(deep, shallow)` (Unreal-style): 8 **Gerstner waves** with deep-water dispersion (vertex displacement + per-pixel analytic normal) and drifting ripple octaves; **refraction** of the opaque scene with per-channel absorption (`water_clarity`) and in-scattering towards the deep colour; **caustics** on the ground below; **screen-space reflections** with fallback to the full sky (atmosphere, clouds, moon, skybox); GGX sun specular + glint; subsurface glow through crests; shore and crest foam (`water_foam`, `water_chop`); soft shore edge. Meshes: `ctx.spawn_water` (bounded, tessellated to `water_vertex_spacing`), `ctx.spawn_ocean` (endless, camera-following radial mesh, 5 km). Render settings `water_ssr`, `water_refraction`, `water_caustics` | ✅ · planar reflections missing (off-screen objects reflect as sky) |
 | Transparency | `AlphaMode::Opaque / Mask(cutoff) / Blend` and `double_sided` (also from glTF). Mask = alpha test with cut-out shadows, batched and GPU-culled like opaque geometry. Blend = own pass after all opaque geometry, sorted back to front per instance, no depth write | ✅ |
 | Lighting | Sun with **cascaded shadow maps** (1–4 cascades up to `shadow_distance`, stable bounding spheres, texel snapping, casters culled per cascade, blend band), **clustered lighting** (16×9×24 froxels, up to 2048 point and **spot lights**, CPU assignment ~0.2 ms for 400 lights), hemispheric ambient. Debug views for cascades and lights per cluster | ✅ · IBL and spot-light shadows missing |
 | Culling / draws | GPU-driven: a compute shader does frustum and Hi-Z occlusion culling per instance and writes the arguments for `drawIndexedIndirect`. Fallback: CPU frustum culling with direct draws | ✅ |
@@ -67,7 +69,8 @@ Debugging in DevTools: the dev build contains DWARF for engine and game code. Wi
 | Screens & scenes | `ScreenStack` of `Screen`s (title, game, pause, …) with `Push/Pop/Switch/Reset`; every screen has its scene, everything created in it (including glTF nodes loaded later, static colliders, particles) is unloaded when it exits; overlays pause the simulation below | ✅ |
 | Save games | Slots in `localStorage` (versioned JSON, migration by version), large data in IndexedDB | ✅ |
 | Character & camera | `CharacterController` (rapier KCC: slopes, steps, ground snapping, coyote time, jump buffer, pushes bodies, jumps work against walls, logs a warning when input has no effect), `ThirdPersonCamera` (orbit, zoom, sphere-cast collision, smoothing) | ✅ |
-| Atmosphere | Gradient sky with sun, exponential height fog (colour = sky at the horizon), HDR target, bloom (mip chain from quarter resolution), depth darkening (unsharp masking of the depth buffer), exposure, ACES, vignette | ✅ |
+| Atmosphere & sky | `sky_mode` 0 = gradient, 1 = **physically based atmosphere** (Rayleigh + Mie + ozone single scattering with a multiple-scattering term, rendered per frame into a 192×108 sky-view LUT used by sky, fog, clouds and reflections); procedural **clouds** (coverage, drift, self-shadowing, silver lining), **stars**, **moon** with phases; **skybox** images (`ctx.load_skybox`, equirectangular, blended by day/night); exponential height fog (colour = sky at the horizon), HDR target, bloom, depth darkening, **lens flare** (glow, starburst, coloured hexagon/ring ghosts; hidden by objects and clouds in front of the sun, `render.lens_flare`), exposure, ACES, vignette | ✅ |
+| Day/night | `day_cycle` + `time_of_day` move sun and moon along their arcs (`sun_azimuth_deg`, `sun_max_elevation_deg`) and drive light direction, colour (atmospheric transmittance: orange sunsets) and intensity, moonlight at night, ambient sky/ground colours and a night exposure boost; advances with the simulation clock (`day_length_minutes`, pause stops it). `ctx.renderer.sky` = sun, moon, `daylight`, `night` for game logic (lamps). AI API `sky {time, cycle, day_length, ...}` | ✅ |
 | Particles | CPU simulation in the fixed step, 8 presets (fire, smoke, sparks, fireflies, dust, magic, rain, splash), instanced billboards, additive or sorted, soft against the scene depth, sparks stretched along their velocity | ✅ |
 | Render to texture | A camera renders the full pipeline into a texture (material, or PNG export as a blob URL for the DOM), render layers, transparent background, once or every frame | ✅ |
 | Terrain | Heightmap (noise with island falloff or your own data), chunks with 4 LOD levels and skirts, splat material (4 layers from an atlas, splat map), heightfield collider per chunk, chunk streaming around the camera, editing (flatten for roads and building plots, raise, paint), height/normal/splat queries, scatter rules for trees, bushes, rocks | ✅ |
@@ -81,7 +84,7 @@ Debugging in DevTools: the dev build contains DWARF for engine and game code. Wi
 | AI tooling | `window.engine.call`, structured logs, deterministic stepping, CDP bridge, MCP, `.claude/` skills | ✅ |
 | Z-fighting / flicker | `engine.call("zfight")` finds coplanar, overlapping surfaces of different objects (runs automatically in debug builds within 80 m of the camera after scene changes and warns in the log; `{radius}` for big worlds). `bridge flicker` compares screenshots with reversed draw order and shifted depth mapping (pixels stay put) and names the flickering objects. `bridge check` / `dev.mjs build --check` is the build check (exit code 1 on problems) | ✅ |
 | Performance | `bridge perf [--profile]`: real frame intervals (p50/p95/p99, missed frames), CPU time per engine phase, GPU time per pass (WebGPU timestamp queries), optional CPU profile via CDP, with a verdict (smooth/gpu-bound/cpu-bound/stutter). Opaque pipelines without `discard` (early-Z), alpha test through separate mask pipelines. Adaptive resolution keeps the GPU inside the frame budget | ✅ |
-| Debug mode | Key <kbd>`</kbd> (left of 1; on German keyboards <kbd>^</kbd> or Shift+´): logs every key and mouse press, once per second the camera, frame timings, characters and the game state as JSON lines in `logs/debug-YYYYMMDD-hhmmss.log` (via the dev server), shows a DEBUG badge | ✅ |
+| Debug mode | Key <kbd>`</kbd> (left of 1; on German keyboards <kbd>^</kbd> or Shift+´): logs every key and mouse press, once per second the camera, frame timings, characters and the game state as JSON lines in `logs/debug-YYYYMMDD-hhmmss.log` (via the dev server), shows a DEBUG badge with fps, CPU/GPU time and resolution; **Ctrl+click** copies an object's identifying properties to the clipboard (`inspect {x, y}` in the API) | ✅ |
 
 ## Architecture
 
@@ -192,6 +195,6 @@ and newer. `tools/asset-cook/vendor/russimp-sys` therefore contains a copy that 
 `engine.call("help")` lists every command. The most important: `stats`, `entities`, `entity`, `set`,
 `spawn`, `despawn`, `pause`, `resume`, `step`, `time_scale`, `seed`, `input`, `logs`, `render`, `camera`,
 `raycast`, `pick`, `ui`, `debug_mode`, `music`, `zfight`, `panels`, `panel_click`, `audio`, `audio_play`,
-`audio_stop`, `audio_set`, `sfx`, `texgen`, `assets`, `screens`, `scenes`, `save`, `characters`,
+`audio_stop`, `audio_set`, `sfx`, `sky`, `inspect`, `texgen`, `assets`, `screens`, `scenes`, `save`, `characters`,
 `animation`, `particles`, `lights`, `render_texture`, `terrain`, `grass`, `world`, `generate`, `batch`,
 `game_state` and the game's own commands. See [AGENTS.md](AGENTS.md).

@@ -54,6 +54,11 @@ impl Default for Scenes {
 }
 
 impl Scenes {
+    /// Scene name of a tag.
+    pub fn name_of(&self, tag: SceneTag) -> &str {
+        self.names.get(tag.0 as usize).map(|s| s.as_str()).unwrap_or("?")
+    }
+
     pub fn current(&self) -> &str {
         &self.names[self.current as usize]
     }
