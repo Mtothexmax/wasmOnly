@@ -1,88 +1,108 @@
-# wasmOnly — Chrome-only 3D-Engine in Rust/WASM, AI-first
+# wasmOnly — Chrome-only 3D engine in Rust/WASM, AI-first
 
-Eine Engine, die ausschließlich für `wasm32-unknown-unknown` baut und in Chrome läuft
-(WebGPU über `web-sys`, WGSL, hecs, rapier). Sie ist „AI-first“: Jeder Laufzeitzustand ist als
-JSON über `window.engine.call(...)` abfragbar und steuerbar, und eine Chrome-Debug-Bridge
-(CDP) macht das per CLI und als MCP-Server für Agenten nutzbar. Anleitungen für Agenten liegen in
-[`.claude/`](.claude/README.md).
+An engine that builds exclusively for `wasm32-unknown-unknown` and runs in Chrome (WebGPU via
+`web-sys`, WGSL, hecs, rapier). It is "AI-first": every piece of runtime state can be queried and
+controlled as JSON through `window.engine.call(...)`, and a Chrome debug bridge (CDP) exposes that as a
+CLI and an MCP server for agents. Agent instructions live in [`.claude/`](.claude/README.md); starting a
+new game in another repository: [HANDOFF.md](HANDOFF.md).
 
-## Schnellstart
+## Quick start
 
-Voraussetzungen: `rustup` (die Toolchain ist in `rust-toolchain.toml` auf **1.99.0** festgelegt und
-wird automatisch installiert), `wasm-bindgen-cli` **in exakt der Version aus `Cargo.toml`**
-(aktuell 0.2.129), Node ≥ 22 und Chrome. Für das optionale Thread-Backend kommt ein festgelegtes
-Nightly dazu (siehe [Threads](#threads-optional-nightly)).
+Requirements: `rustup` (the toolchain is pinned to **1.99.0** in `rust-toolchain.toml` and installed
+automatically), `wasm-bindgen-cli` **in exactly the version from `Cargo.toml`** (currently 0.2.129),
+Node ≥ 22 and Chrome. The optional threads backend additionally needs a pinned nightly (see
+[Threads](#threads-optional-nightly)).
 
 ```bash
-node tools/make-sample-assets.mjs   # einmalig: tree.glb, crate.glb, rock.obj erzeugen
-node tools/dev.mjs watch            # bauen, http://localhost:8080 ausliefern, bei Änderungen neu bauen und neu laden
-node tools/bridge.mjs launch        # Chrome mit Remote-Debugging (Port 9222) öffnen, stumm (--sound für Ton)
-node tools/bridge.mjs call stats    # Engine abfragen
-node tools/dev.mjs build --check    # Build + Check (Z-Fighting, Engine-Fehler) im Debug-Chrome
+node tools/make-sample-assets.mjs   # once: generates tree.glb, crate.glb, critter.glb, rock.obj
+node tools/dev.mjs watch            # build, serve http://localhost:8080, rebuild + reload on change
+node tools/bridge.mjs launch        # Chrome with remote debugging (port 9222), muted (--sound for audio)
+node tools/bridge.mjs call stats    # query the engine
+node tools/dev.mjs build --check    # build + check (z-fighting, engine errors) in the debug Chrome
+node tools/bridge.mjs run games/demo/tests/smoke.txt   # scripted test run
 ```
 
-Langsames Netz testen: `curl -X POST "http://localhost:8080/__throttle?kbps=48&match=assets/music"` drosselt
-nur passende Pfade (`kbps=0` hebt es auf). Der Dev-Server beantwortet Range-Requests, Musik streamt also
-wie auf einem echten Webserver.
+New game in its own folder/repository: `node tools/new-game.mjs ../my-game`, then
+`node tools/dev.mjs watch --game-dir ../my-game` (see [HANDOFF.md](HANDOFF.md)).
 
-Debug-Modus: <kbd>`</kbd> bzw. <kbd>^</kbd> drücken. Ab dann landen Tastendrücke, Mausklicks und die
-Kameraposition (jede Sekunde) in `logs/debug-*.log` im Projektordner; nochmal drücken beendet die Datei.
+Slow network test: `curl -X POST "http://localhost:8080/__throttle?kbps=48&match=assets/music"` throttles
+only matching paths (`kbps=0` turns it off). The dev server answers range requests, so music streams as it
+would from a real web server.
 
-Debugging in den DevTools: Der Dev-Build enthält DWARF für Engine- und Spielcode. Mit der
-Chrome-Erweiterung „C/C++ DevTools Support (DWARF)“ setzt du Breakpoints direkt in `.rs`-Dateien.
+Debug mode: press <kbd>`</kbd> (on German keyboards <kbd>^</kbd>). Key presses, mouse clicks, the camera
+pose, and once per second frame timings, character states and the game state are written to
+`logs/debug-*.log` in the project folder; press again to close the file.
 
-## Entscheidungen und Stand
+Debugging in DevTools: the dev build contains DWARF for engine and game code. With the Chrome extension
+"C/C++ DevTools Support (DWARF)" you can set breakpoints directly in `.rs` files.
 
-| Bereich | Entscheidung | Stand |
+## Decisions and status
+
+| Area | Decision | Status |
 |---|---|---|
 | Target | `wasm32-unknown-unknown`, `wasm-bindgen`, `web-sys` | ✅ |
-| SIMD | `+simd128` für den ganzen Build (glam und rapier nutzen es) | ✅ |
-| Grafik | WebGPU direkt über `web-sys` (unstable cfg), WGSL inkl. Compute-Shader | ✅ |
-| Rendering | Forward-PBR (GGX), 4× MSAA, ACES-Tonemapping | ✅ |
-| Material-Maps | Normal Mapping (Tangentenraum aus Bildschirm-Ableitungen, kein Vertex-Tangent nötig), Height-Maps für **Vertex-Displacement** (auf `MeshData::grid/disk`) und **Parallax Occlusion Mapping**; Normal-/Height-Maps aus jedem Textur-Preset (`ctx.generate_maps`) | ✅ · Schatten nutzen das unverschobene Mesh |
-| Wasser | `Material::water(tief, flach)`: Wellen (Vertex + Fragment), feine Kräuselung aus Rausch-Gradienten, Fresnel-Himmelsreflexion, Sonnenglitzern, Farbe nach Wassertiefe, Schaum und weiche Kanten am Ufer (liest die Szenentiefe im Blend-Pass), Wellen-Antialiasing in der Ferne | ✅ |
-| Transparenz | `AlphaMode::Opaque / Mask(cutoff) / Blend` und `double_sided` (auch aus glTF). Mask = Alpha-Test mit ausgestanzten Schatten, batcht und wird auf der GPU gecullt wie deckende Geometrie. Blend = eigener Durchgang nach allem Deckenden, pro Instanz von hinten nach vorne sortiert, ohne Tiefenschreiben | ✅ |
-| Licht | 1 Richtungslicht mit Shadow-Map (3×3 PCF, texel-snapped), bis zu 16 Punktlichter, Hemisphären-Ambient | ✅ · Clustered Lighting, CSM, Spots und IBL fehlen |
-| Culling/Draws | GPU-driven: Ein Compute-Shader macht Frustum- und Hi-Z-Occlusion-Culling pro Instanz und schreibt die Argumente für `drawIndexedIndirect`. Fallback: CPU-Frustum-Culling mit direkten Draws | ✅ |
-| Instancing | Ein Storage-Buffer für alle Instanzen, ein Draw pro (Textur, Mesh) | ✅ (5000 Würfel: 60 fps, 7 Draw Calls) |
-| LOD | `Lod`-Komponente, Distanz relativ zur Objektgröße. Automatische Stufen per Vertex-Clustering für glTF-Meshes ab 256 Dreiecken; die eingebaute Kugel hat drei Stufen | ✅ |
-| Szene | hecs-ECS, `Transform` + `Parent` → `GlobalTransform` | ✅ |
-| Assets | Laufzeit nur glTF 2.0 (`.glb`), Bilder über `createImageBitmap`, Cache pro URL, alles asynchron. Mipmaps werden auf der GPU erzeugt, 8× anisotrope Filterung | ✅ · KTX2 und Textur-Streaming fehlen |
-| Fremdformate | `tools/asset-cook` (russimp/Assimp, nativ): OBJ/FBX/DAE/3DS/… → `.glb` | ✅ |
-| Physik | rapier3d 0.36 als festes Modul, `Body`-Komponente, Raycasts, CCD | ✅ |
-| GUI/HUD | DOM-Overlay: HUD-Slots, `data-action`-Klicks, `WorldLabel` (weltverankert) | ✅ |
-| 3D-GUI | **World Panels**: 2D-Widgets (Label, Button, Balken, Rechteck) per Canvas2D in einer Textur auf einem 3D-Quad. Klicks per Strahl und UV, Verdeckung durch Physik, gleiche Aktions-Queue wie das HUD | ✅ · SVG→Textur (resvg) fehlt |
-| Input | Tastatur, Pointer, Rad, Pointer Lock, Gamepad; DOM-UI und World Panels haben Vorrang | ✅ |
-| Touch (Android) | Mehrere Finger über Pointer Events. Gesten: virtueller Joystick (linke Bildschirmseite, fließt in `move_axis()`), Umschauen, Pinch-Zoom, Tippen (klickt World Panels), Halten, Wischen. Joystick wird gezeichnet. iOS ist bewusst kein Ziel | ✅ |
-| Audio | Web Audio: Master-Gain, 3D-Sound über `PannerNode` (HRTF), Listener folgt der Kamera, Dateien per `decodeAudioData`. Verliert der Tab den Fokus, wird der AudioContext angehalten und läuft bei Fokus an derselben Stelle weiter (abschaltbar: `set_pause_on_blur(false)`) | ✅ |
-| Musik | **Streaming**: lange Tracks laufen über ein `<audio>`-Element mit HTTP-Range-Requests, starten sobald genug gepuffert ist und blockieren nie das Spiel. Überblendung, Prefetch, eigener Musik- und SFX-Bus mit getrennter Lautstärke, Autoplay-Retry, Fokus-Pause. `ctx.audio.play_music(url, MusicOpts)` | ✅ |
-| Prozedurales Audio | Deterministischer Synth (`engine::audio::synth`): Sinus/Rechteck/Sägezahn/Dreieck, weißes/rosa/braunes Rauschen, ADSR, Pitch-Slide, Vibrato, Arpeggio, Obertöne (Klangfarbe), Bitcrush. 16 Presets (coin, laser, explosion, powerup, …, Schleifen wind/rain/engine). Effekte beim Abspielen als Web-Audio-Nodes: Tief-/Hoch-/Bandpass, Echo mit Feedback, Hall (Convolver), Verzerrung, Pitch/Detune, Stereo-Pan | ✅ |
-| Prozedurale Texturen | `engine::texgen` mit dem `noise`-Crate: 18 nahtlos kachelnde Presets (noise, clouds, marble, wood, stone, grass, sand, dirt, lava, water, bricks, tiles, metal, rust, camo, checker und mit Alpha: blades, leaves), parallel über das Job-System | ✅ |
-| Animation | Skinning, Clips, Morph Targets | ❌ |
-| Threads | Optionales Backend: Web-Worker-Pool (rayon über `wasm-bindgen-rayon`), Shared Memory (SharedArrayBuffer), Atomics. Die Job-API `engine::jobs` ist in beiden Builds gleich | ✅ · Asset-Aufbereitung in Workern fehlt |
-| Build | `tools/dev.mjs` (cargo + wasm-bindgen, `wasm-opt` falls vorhanden). Toolchains festgelegt: Stable 1.99.0, Thread-Backend nightly-2026-11-01 | ✅ |
-| AI-Tooling | `window.engine.call`, strukturierte Logs, deterministisches Stepping, CDP-Bridge, MCP, `.claude/`-Skills | ✅ |
-| Z-Fighting / Flackern | `engine.call("zfight")` findet koplanare, überlappende Flächen verschiedener Objekte (läuft im Debug-Build automatisch nach Szenenänderungen und warnt im Log). `bridge flicker` vergleicht Screenshots mit umgekehrter Zeichenreihenfolge und verschobener Tiefenabbildung (Pixel bleiben stehen) und nennt die flackernden Objekte. `bridge check` / `dev.mjs build --check` ist der Build-Check (Exit-Code 1 bei Problemen) | ✅ |
-| Performance | `bridge perf [--profile]`: echte Frame-Intervalle (p50/p95/p99, verpasste Frames), CPU-Zeit pro Engine-Phase, GPU-Zeit pro Pass (WebGPU-Timestamp-Queries), optional CPU-Profil per CDP, mit Urteil (smooth/gpu-bound/cpu-bound/stutter). Deckende Pipelines ohne `discard` (Early-Z), Alpha-Test über eigene Mask-Pipelines. Im Debug-Modus landet jede Sekunde eine `perf`-Zeile im Log | ✅ |
-| Debug-Modus | Taste <kbd>`</kbd> (Taste links neben 1, auf deutschen Tastaturen <kbd>^</kbd> oder Shift+´): protokolliert jeden Tasten- und Mausdruck und einmal pro Sekunde die Kamera als JSON-Zeilen in `logs/debug-JJJJMMTT-hhmmss.log` (über den Dev-Server), zeigt ein DEBUG-Badge | ✅ |
+| SIMD | `+simd128` for the whole build (glam and rapier use it) | ✅ |
+| Graphics | WebGPU directly via `web-sys` (unstable cfg), WGSL incl. compute shaders | ✅ |
+| Rendering | Forward PBR (GGX) into an HDR target, 4× MSAA, ACES tonemapping, adaptive render resolution | ✅ |
+| Material maps | Normal mapping (tangent frame from screen-space derivatives, no vertex tangents needed), height maps for **vertex displacement** (on `MeshData::grid/disk`) and **parallax occlusion mapping**; normal/height maps from any texture preset (`ctx.generate_maps`) | ✅ · shadows use the undisplaced mesh |
+| Water | `Material::water(deep, shallow)`: waves (vertex + fragment), fine ripples from noise gradients, Fresnel sky reflection, sun glint, colour by water depth, foam and soft edges at the shore (reads the scene depth in the blend pass), wave anti-aliasing in the distance | ✅ |
+| Transparency | `AlphaMode::Opaque / Mask(cutoff) / Blend` and `double_sided` (also from glTF). Mask = alpha test with cut-out shadows, batched and GPU-culled like opaque geometry. Blend = own pass after all opaque geometry, sorted back to front per instance, no depth write | ✅ |
+| Lighting | Sun with **cascaded shadow maps** (1–4 cascades up to `shadow_distance`, stable bounding spheres, texel snapping, casters culled per cascade, blend band), **clustered lighting** (16×9×24 froxels, up to 2048 point and **spot lights**, CPU assignment ~0.2 ms for 400 lights), hemispheric ambient. Debug views for cascades and lights per cluster | ✅ · IBL and spot-light shadows missing |
+| Culling / draws | GPU-driven: a compute shader does frustum and Hi-Z occlusion culling per instance and writes the arguments for `drawIndexedIndirect`. Fallback: CPU frustum culling with direct draws | ✅ |
+| Instancing | One storage buffer for all instances, one draw per (texture, mesh) | ✅ (5000 cubes: 60 fps, 7 draw calls) |
+| LOD | `Lod` component, distance relative to object size. Automatic levels by vertex clustering for glTF meshes from 256 triangles; the built-in sphere has three levels | ✅ |
+| Scene | hecs ECS, `Transform` + `Parent` → `GlobalTransform` | ✅ |
+| Assets | Runtime only glTF 2.0 (`.glb`), images via `createImageBitmap`, cache per URL, all asynchronous. Mipmaps generated on the GPU, 8× anisotropic filtering | ✅ · KTX2 and texture streaming missing |
+| Foreign formats | `tools/asset-cook` (russimp/Assimp, native): OBJ/FBX/DAE/3DS/… → `.glb` | ✅ |
+| Physics | rapier3d 0.36 as the fixed module, `Body` component, raycasts, CCD | ✅ |
+| GUI / HUD | DOM overlay: HUD slots, `data-action` clicks, `WorldLabel` (anchored in the world) | ✅ |
+| 3D GUI | **World panels**: 2D widgets (label, button, bar, rect) drawn with Canvas2D into a texture on a 3D quad. Clicks by ray and UV, occlusion by physics, same action queue as the HUD | ✅ · SVG→texture (resvg) missing |
+| Input | Keyboard, pointer, wheel, pointer lock, gamepad; DOM UI and world panels take precedence | ✅ |
+| Touch (Android) | Multiple fingers via pointer events. Gestures: virtual joystick (left side of the screen, feeds `move_axis()`), look, pinch zoom, tap (clicks world panels), hold, swipe. The joystick is drawn. iOS is deliberately not a target | ✅ |
+| Audio | Web Audio: master gain, 3D sound via `PannerNode` (HRTF), listener follows the camera, files via `decodeAudioData`. When the tab loses focus the AudioContext is suspended and resumes at the same position (opt-out: `set_pause_on_blur(false)`) | ✅ |
+| Music | **Streaming**: long tracks play through an `<audio>` element with HTTP range requests, start as soon as enough is buffered and never block the game. Crossfade, prefetch, separate music and SFX buses, autoplay retry, focus pause. `ctx.audio.play_music(url, MusicOpts)` | ✅ |
+| Procedural audio | Deterministic synth (`engine::audio::synth`): sine/square/saw/triangle, white/pink/brown noise, ADSR, pitch slide, vibrato, arpeggio, harmonics (timbre), bitcrush. 16 presets (coin, laser, explosion, powerup, …, loops wind/rain/engine). Playback effects as Web Audio nodes: low/high/band pass, echo with feedback, reverb (convolver), distortion, pitch/detune, stereo pan | ✅ |
+| Procedural textures | `engine::texgen` with the `noise` crate: 18 seamlessly tiling presets (noise, clouds, marble, wood, stone, grass, sand, dirt, lava, water, bricks, tiles, metal, rust, camo, checker and with alpha: blades, leaves), parallel via the job system | ✅ |
+| Animation | glTF clips (step, linear with slerp, cubic spline) for translation/rotation/scale and morph weights, `Animator` with crossfade, speed and looping; skinning and morph targets on the CPU into a per-instance vertex buffer (shadows, culling and z-fighting tools see the deformed mesh). Time advances in the fixed step (deterministic) | ✅ · GPU skinning missing |
+| Screens & scenes | `ScreenStack` of `Screen`s (title, game, pause, …) with `Push/Pop/Switch/Reset`; every screen has its scene, everything created in it (including glTF nodes loaded later, static colliders, particles) is unloaded when it exits; overlays pause the simulation below | ✅ |
+| Save games | Slots in `localStorage` (versioned JSON, migration by version), large data in IndexedDB | ✅ |
+| Character & camera | `CharacterController` (rapier KCC: slopes, steps, ground snapping, coyote time, jump buffer, pushes bodies, jumps work against walls, logs a warning when input has no effect), `ThirdPersonCamera` (orbit, zoom, sphere-cast collision, smoothing) | ✅ |
+| Atmosphere | Gradient sky with sun, exponential height fog (colour = sky at the horizon), HDR target, bloom (mip chain from quarter resolution), depth darkening (unsharp masking of the depth buffer), exposure, ACES, vignette | ✅ |
+| Particles | CPU simulation in the fixed step, 8 presets (fire, smoke, sparks, fireflies, dust, magic, rain, splash), instanced billboards, additive or sorted, soft against the scene depth, sparks stretched along their velocity | ✅ |
+| Render to texture | A camera renders the full pipeline into a texture (material, or PNG export as a blob URL for the DOM), render layers, transparent background, once or every frame | ✅ |
+| Terrain | Heightmap (noise with island falloff or your own data), chunks with 4 LOD levels and skirts, splat material (4 layers from an atlas, splat map), heightfield collider per chunk, chunk streaming around the camera, editing (flatten for roads and building plots, raise, paint), height/normal/splat queries, scatter rules for trees, bushes, rocks | ✅ |
+| Vegetation | **GPU grass**: blades are created entirely in the vertex shader (camera-centred grid, height from the heightmap texture, density from a splat channel, distance thinning, wind), ~120,000 blades in one draw call, with cascaded shadows, clustered lights and fog; bushes/trees via scatter rules (instanced, LOD cull) | ✅ |
+| Streaming & precision | Streaming layers: world cells whose generator runs when the camera approaches and whose scene is unloaded when it leaves (budget per frame, hysteresis). **Floating origin**: `ctx.origin` (f64) shifts automatically when the camera is farther than `origin_shift_distance`; transforms, bodies, colliders, particles and the camera move along | ✅ |
+| Procedural content | Geometry kit `MeshBuilder` (parts per material, transform stack, world UVs, boxes, polygons, extrusion, walls with door/window openings, sweep, lathe), generator registry (results cached per parameter set → instancing), parallel generation in the job system, callable live through the AI API. The engine deliberately contains no building generators | ✅ |
+| Static batching & motion | `batch_static` merges static props per material and cell into few draws; `Motion` (spin, sway, bob) moves instances without game code (Ferris wheel, cranes, carousel) | ✅ |
+| Test scripts | `bridge run` / MCP `run_script`: list of input, `step`, waits, `expect`/`wait_for` on JSON paths and screenshots, report per step, exit code 1 on failure | ✅ |
+| Threads | Optional backend: Web Worker pool (rayon via `wasm-bindgen-rayon`), shared memory (SharedArrayBuffer), atomics. The job API `engine::jobs` is the same in both builds | ✅ · asset processing in workers missing |
+| Build | `tools/dev.mjs` (cargo + wasm-bindgen, `wasm-opt` if available), `--game-dir` for games in other repositories, `tools/new-game.mjs` scaffold. Toolchains pinned: stable 1.99.0, threads backend nightly-2026-11-01 | ✅ |
+| AI tooling | `window.engine.call`, structured logs, deterministic stepping, CDP bridge, MCP, `.claude/` skills | ✅ |
+| Z-fighting / flicker | `engine.call("zfight")` finds coplanar, overlapping surfaces of different objects (runs automatically in debug builds within 80 m of the camera after scene changes and warns in the log; `{radius}` for big worlds). `bridge flicker` compares screenshots with reversed draw order and shifted depth mapping (pixels stay put) and names the flickering objects. `bridge check` / `dev.mjs build --check` is the build check (exit code 1 on problems) | ✅ |
+| Performance | `bridge perf [--profile]`: real frame intervals (p50/p95/p99, missed frames), CPU time per engine phase, GPU time per pass (WebGPU timestamp queries), optional CPU profile via CDP, with a verdict (smooth/gpu-bound/cpu-bound/stutter). Opaque pipelines without `discard` (early-Z), alpha test through separate mask pipelines. Adaptive resolution keeps the GPU inside the frame budget | ✅ |
+| Debug mode | Key <kbd>`</kbd> (left of 1; on German keyboards <kbd>^</kbd> or Shift+´): logs every key and mouse press, once per second the camera, frame timings, characters and the game state as JSON lines in `logs/debug-YYYYMMDD-hhmmss.log` (via the dev server), shows a DEBUG badge | ✅ |
 
-## Architektur
+## Architecture
 
 ```
-games/<spiel>  (Rust, implementiert engine::Game)
+games/<game>  (Rust, implements engine::Game, usually as a ScreenStack of Screens)
    │
-crates/engine ── app (Loop, Ctx) · scene · input · physics · gltf_loader · ui · panel · audio · jobs · debug (AI-API) · log
+crates/engine ── app (loop, Ctx) · scene · screens · save · input · physics · character · animation · terrain
+   │             streaming · geom · batch · particles · lights · gltf_loader · ui · panel · audio · jobs · debug (AI API) · log
    │
-renderer ─────── WebGPU: [Compute: Culling] → Shadow-Pass → PBR-Pass (MSAA, indirect) → [Compute: Hi-Z]
+renderer ─────── WebGPU: [compute: culling] → shadow cascades → opaque (+ grass, sky) → blend (+ particles)
+   │             → [compute: Hi-Z] → bloom → composite (depth darkening, tonemap) — per view (canvas, render textures)
    │
-Browser ──────── web-sys: WebGPU · DOM · OffscreenCanvas · Web Audio · fetch · createImageBitmap · Gamepad · Worker
+Browser ──────── web-sys: WebGPU · DOM · OffscreenCanvas · Web Audio · fetch · createImageBitmap · Gamepad · Worker · IndexedDB
 ```
 
-Frame: `requestAnimationFrame` → fester Schritt mit 1/60 s (`Game::fixed_update`, danach
-rapier) → World Panels (Hover, Klicks → Aktionen) → `Game::update(dt)` → Transforms propagieren →
-Panels neu zeichnen → Audio-Listener → rendern → `WorldLabel`s positionieren.
+Frame: `requestAnimationFrame` → fixed steps of 1/60 s (`Game::fixed_update`, characters, particles,
+animation clocks, motion, rapier) → world panels (hover, clicks → actions) → `Game::update(dt)` →
+streaming + terrain → third-person cameras → animation poses → transform propagation → skinning →
+panel redraw → audio listener → render → position `WorldLabel`s.
 
-## Ein Spiel schreiben
+## Writing a game
 
 ```rust
 use engine::prelude::*;
@@ -99,64 +119,79 @@ impl Game for MyGame {
         let b = ctx.spawn_cube("box", Vec3::new(0., 4., 0.), Vec3::ONE, 0xff8800);
         ctx.physics.add(&mut ctx.world, b, RigidBodyBuilder::dynamic(), ColliderBuilder::cuboid(0.5, 0.5, 0.5));
         ctx.load_gltf("assets/tree.glb", Transform::from_xyz(2., 0., 0.));
-        ctx.ui.set("title", "<div class='panel'>Hallo</div>");
+        ctx.ui.set("title", "<div class='panel'>Hello</div>");
 
-        // anklickbare 3D-GUI: Klick auf "Start" landet als Aktion "start" in ctx.ui.take_actions()
-        let panel = Panel::new(512, 256).label("t", [24., 20., 460., 40.], "Hallo 3D", 32.).button("go", [24., 140., 220., 70.], "Start", "start");
+        // clickable 3D GUI: a click on "Start" arrives as action "start" in ctx.ui.take_actions()
+        let panel = Panel::new(512, 256).label("t", [24., 20., 460., 40.], "Hello 3D", 32.).button("go", [24., 140., 220., 70.], "Start", "start");
         ctx.spawn_panel("menu", panel, Transform::from_xyz(0., 2., 0.).with_scale(Vec3::new(2., 1., 1.)));
 
-        // Sound ohne Asset-Dateien
+        // sound without asset files
         ctx.audio.add_samples("zap", &synth::zap(), synth::RATE);
         ctx.audio.play_named("zap", Play::new().at(Vec3::ZERO));
     }
 }
 ```
 
-Das Beispiel `games/demo` („Tumble“) nutzt alle Systeme: Ball steuern, Kistenturm von der Insel
-stoßen, schießen, HUD-Buttons, ein Terminal als World Panel (Neustart, Schatten, Zeitlupe, Ton),
-einen Teich (Steinrand mit Normal- und Parallax-Mapping, Kiesboden mit Displacement, Wasser-Shader),
-ein Meer mit demselben Wasser-Shader, 3D-Sound mit Effekten (Laser mit Echo, Aufprall mit Hall, Wind als Ambience), prozedurale Texturen für
-Boden, Klippe und Metall, glTF-Bäume, gekochte Felsen und dynamische glTF-Kisten.
+A fuller skeleton (screens, save game, character controller, third-person camera, debug state, test
+script) is what `node tools/new-game.mjs <dir>` creates.
 
-## Threads (optional, Nightly)
+The example `games/demo` ("Tumble") uses every system: roll a ball, push the crate tower off the island,
+shoot, HUD buttons, a terminal as a world panel (restart, shadows, slow motion, sound), a pond (stone rim
+with normal and parallax mapping, gravel bed with displacement, water shader), a sea with the same water
+shader, 3D sound with effects (laser with echo, impacts with reverb, wind ambience), procedural textures
+for ground, cliff and metal, glTF trees, cooked rocks and dynamic glTF crates. On top: screens (title
+with a card portrait via render to texture, game, pause overlay), a save game (best score, wins, rounds),
+an animated creature (`critter.glb`: skinning, morph targets, three clips) as a second playable figure
+with a character controller (key <kbd>C</kbd>), third-person camera, glowing mushrooms with fireflies
+(bloom), a campfire with smoke, and splashes when crates fall into the sea.
+Smoke test: `node tools/bridge.mjs run games/demo/tests/smoke.txt`.
+The **open world** (title → "Open world" or key <kbd>O</kbd>): 1 km island terrain with a town plaza and a
+ring road, streamed cells with street lamps (hundreds of lights, <kbd>N</kbd> = night), fences via static
+batching, pines and rocks via scatter rules, GPU grass, a Ferris wheel and a car with headlights (spot
+lights) via `Motion`, teleport to the island edge (<kbd>T</kbd>) with an origin shift. The generators (pine,
+lamp, fence, pavilion, Ferris wheel) are game code in `games/demo/src/world.rs`.
+Test: `node tools/bridge.mjs run games/demo/tests/world.txt`.
 
-Der Engine-Kern baut auf Stable. Nur das Thread-Backend braucht Nightly, weil die Standardbibliothek
-mit `+atomics,+bulk-memory` neu gebaut werden muss (`-Z build-std`). Die Version ist in `Cargo.toml`
-unter `[workspace.metadata.wasmonly] threads-toolchain` festgelegt:
+## Threads (optional, nightly)
+
+The engine core builds on stable. Only the threads backend needs nightly, because the standard library
+has to be rebuilt with `+atomics,+bulk-memory` (`-Z build-std`). The version is pinned in `Cargo.toml`
+under `[workspace.metadata.wasmonly] threads-toolchain`:
 
 ```bash
 rustup toolchain install nightly-2026-11-01 --profile minimal --component rust-src --target wasm32-unknown-unknown
-node tools/dev.mjs build --threads     # oder: watch --threads; Ausgabe in target/threads
+node tools/dev.mjs build --threads     # or: watch --threads; output in target/threads
 ```
 
-Das Ergebnis nutzt gemeinsamen Speicher (SharedArrayBuffer, braucht COOP/COEP, die der Dev-Server
-sendet) und startet vor `Game::init` einen Worker-Pool mit `navigator.hardwareConcurrency` Threads.
-Spielcode benutzt `engine::jobs::{par_map, par_for_each_mut}`: ohne Backend seriell, mit Backend
-parallel, mit identischem Ergebnis. `stats.jobs` zeigt, was aktiv ist. Das Feature `threads-physics`
-lässt zusätzlich rapier parallel rechnen; das ist schneller, aber die Reihenfolge der Kontakte ist
-zwischen Läufen nicht garantiert.
+The result uses shared memory (SharedArrayBuffer, needs COOP/COEP, which the dev server sends) and starts
+a worker pool with `navigator.hardwareConcurrency` threads before `Game::init`. Game code uses
+`engine::jobs::{par_map, par_for_each_mut}`: serial without the backend, parallel with it, with identical
+results. `stats.jobs` shows what is active. The feature `threads-physics` additionally lets rapier run in
+parallel; that is faster, but the order of contacts is not guaranteed between runs.
 
-## Asset-Cooker (russimp)
+## Asset cooker (russimp)
 
-Assimp ist C++ und lässt sich nicht nach `wasm32-unknown-unknown` bauen. Deshalb läuft russimp
-als natives Build-Werkzeug, und die Engine sieht zur Laufzeit nur `.glb`:
+Assimp is C++ and cannot be built for `wasm32-unknown-unknown`. So russimp runs as a native build tool,
+and the engine only sees `.glb` at runtime:
 
 ```bash
 cargo run --release --manifest-path tools/asset-cook/Cargo.toml -- games/demo/assets-src/rock.obj games/demo/assets/rock.glb
 cargo run --release --manifest-path tools/asset-cook/Cargo.toml -- --batch games/demo/assets-src games/demo/assets
 ```
 
-`russimp-sys` braucht beim Bauen **libclang** (für bindgen): LLVM installieren
-(`winget install LLVM.LLVM`) oder `LIBCLANG_PATH` auf ein Verzeichnis mit `libclang.dll` setzen.
-Das Feature `prebuilt` lädt die vorgebaute Assimp-Bibliothek herunter, CMake ist dafür nicht nötig.
+`russimp-sys` needs **libclang** at build time (for bindgen): install LLVM (`winget install LLVM.LLVM`)
+or point `LIBCLANG_PATH` at a folder containing `libclang.dll`. The `prebuilt` feature downloads the
+prebuilt Assimp library, so CMake is not needed.
 
-`russimp-sys` 2.0.2 bringt bindgen 0.63 mit. Mit libclang ab Version 16 erzeugt das leere
-`aiNode`/`aiScene`-Structs. Deshalb liegt unter `tools/asset-cook/vendor/russimp-sys` eine Kopie,
-die nur bindgen auf 0.72 anhebt (eingebunden über `[patch.crates-io]`).
+`russimp-sys` 2.0.2 ships bindgen 0.63, which generates empty `aiNode`/`aiScene` structs with libclang 16
+and newer. `tools/asset-cook/vendor/russimp-sys` therefore contains a copy that only bumps bindgen to
+0.72 (wired in via `[patch.crates-io]`).
 
-## AI-API (Auszug)
+## AI API (excerpt)
 
-`engine.call("help")` listet alle Befehle. Die wichtigsten: `stats`, `entities`, `entity`, `set`,
-`spawn`, `despawn`, `pause`, `resume`, `step`, `time_scale`, `seed`, `input`, `logs`, `render`,
-`camera`, `raycast`, `pick`, `ui`, `debug_mode`, `music`, `zfight`, `panels`, `panel_click`, `audio`, `audio_play`, `audio_stop`, `audio_set`, `sfx`, `texgen`,
-`assets`, `game_state` und die eigenen Befehle des Spiels. Siehe [AGENTS.md](AGENTS.md).
+`engine.call("help")` lists every command. The most important: `stats`, `entities`, `entity`, `set`,
+`spawn`, `despawn`, `pause`, `resume`, `step`, `time_scale`, `seed`, `input`, `logs`, `render`, `camera`,
+`raycast`, `pick`, `ui`, `debug_mode`, `music`, `zfight`, `panels`, `panel_click`, `audio`, `audio_play`,
+`audio_stop`, `audio_set`, `sfx`, `texgen`, `assets`, `screens`, `scenes`, `save`, `characters`,
+`animation`, `particles`, `lights`, `render_texture`, `terrain`, `grass`, `world`, `generate`, `batch`,
+`game_state` and the game's own commands. See [AGENTS.md](AGENTS.md).

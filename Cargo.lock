@@ -123,6 +123,7 @@ version = "0.1.0"
 dependencies = [
  "engine",
  "glam 0.33.12",
+ "serde",
  "serde_json",
  "wasm-bindgen",
 ]

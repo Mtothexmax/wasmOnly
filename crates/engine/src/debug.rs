@@ -23,11 +23,23 @@ use wasm_bindgen::JsCast;
 
 pub const COMMANDS: &[(&str, &str)] = &[
     ("help", "List commands."),
+    ("characters", "Character controllers: pos, grounded, velocity, jumps, held jump, wish, blocked time, touching entities. args: {id?, pos?: [x,y,z] (place)}"),
+    ("world", "Open world: floating origin + streaming layers (loaded cells, loads/unloads). args: {shift?: [x,y,z], origin_shift_distance?: m, layer?: name, radius?: m, enabled?: bool}"),
+    ("grass", "GPU grass settings + blade count. args: any GrassSettings field (enabled, radius, spacing, height, width, layer, full_density, color_base, color_tip, wind)"),
+    ("terrain", "Heightmap terrain: info, streaming state. args: {height_at?: [x,z] (absolute), flatten?: {center:[x,z], radius, height?, falloff?}, raise?: {center, radius, amount, falloff?}, paint?: {layer 0-3, center, radius, strength?, falloff?}, chunks?: true}"),
+    ("lights", "Clustered lights: counts + last frame stats. args: {add?: {pos, color?, intensity?, range?, spot?: true, dir?, inner_deg?, outer_deg?}, grid?: {n, spacing?, center?} (stress test), clear_test?: true}"),
+    ("generate", "Procedural generators (geom kit). No args: list. args: {name, params?: {...}, seed?: 1, pos?: [x,y,z], yaw_deg?, regenerate?: true (drop cache)}"),
+    ("batch", "Static batches + moving (Motion) instances. args: {id?: root entity to batch now, cell?: 64}"),
+    ("render_texture", "Render textures (portraits, mirrors). args: {id?, render?: true (re-render once), export?: true (PNG blob URL -> url)}"),
+    ("animation", "Animators (glTF clips, skinning, morph targets). args: {id?, play?: clip, fade?: 0.2, speed?: 1, looped?: true, stop?: true, morph?: index, weight?: w}"),
+    ("particles", "Particle emitters + live counts. args: {preset?: 'fire'|'smoke'|'sparks'|'fireflies'|'dust'|'magic'|'rain'|'splash', pos?: [x,y,z], burst?: n}"),
+    ("scenes", "Scenes (entity groups) with counts. args: {unload?: name, begin?: name}"),
+    ("save", "Save slots (localStorage) + blobs (IndexedDB). args: {op?: 'list'|'get'|'set'|'delete'|'blobs'|'delete_blob', slot?, data?, key?}"),
     ("stats", "Frame/sim timing, renderer stats, entity and body counts."),
     ("entities", "List entities. args: {name?: substring, limit?: 200, with?: 'mesh'|'body'|'light'|'label'|'camera'}"),
     ("entity", "Full detail of one entity. args: {id}"),
     ("set", "Modify an entity. args: {id, pos?: [x,y,z], rot?: [deg x,y,z], scale?: [x,y,z], vel?: [x,y,z], color?: '#rrggbb'}"),
-    ("spawn", "Spawn a primitive. args: {shape: 'cube'|'sphere', pos, size?: 1, color?: '#rrggbb', body?: 'dynamic'|'fixed'|'none', name?}"),
+    ("spawn", "Spawn a primitive or a glTF model. args: {shape: 'cube'|'sphere', pos, size?: 1, color?: '#rrggbb', body?: 'dynamic'|'fixed'|'none', name?} or {gltf: 'assets/x.glb', pos, size?: scale}"),
     ("despawn", "Remove entity and children. args: {id}"),
     ("pause", "Pause simulation (rendering continues)."),
     ("resume", "Resume simulation."),
@@ -36,12 +48,12 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("seed", "Reseed the engine RNG (ctx.rng). args: {value}"),
     ("input", "Inject input. args: {key?: 'KeyW', down?: bool} | {button?: 0|1|2, down?} | {x?, y?: pointer position, CSS px} | {dx?, dy?} | {action?: 'ui-action'} | {touch: {id, x, y, phase: 'start'|'move'|'end'}} | {release_all: true}. Returns keys, buttons and touch gestures"),
     ("logs", "Structured log entries. args: {since?: seq, level?: 'debug'|'info'|'warn'|'error', limit?: 100}"),
-    ("render", "Get/set render settings. args: {shadows?, debug_view?: 0|1|2, sun_dir?, sun_intensity?, shadow_extent?, clear_color?, gpu_culling?, occlusion_culling?, camera_jitter?: [x,y,z], depth_jitter?: relative near-plane change, reverse_draw_order?, freeze_time?}. Result includes gpu_culling_supported."),
+    ("render", "Get/set any render setting by name (call without args to list them): shadows, debug_view 0|1|2, sun_dir, sun_intensity, sky, sky_zenith, sky_horizon, fog_density, fog_height_falloff, fog_start, fog_max, fog_color ([r,g,b] or null), exposure, bloom, bloom_intensity, bloom_threshold, depth_darkening, vignette, saturation, particles, gpu_culling, occlusion_culling, camera_jitter, depth_jitter, reverse_draw_order, freeze_time, ... Result includes gpu_culling_supported."),
     ("camera", "Camera pose + projection; args {pos?, look_at?} moves it."),
     ("raycast", "Physics ray cast. args: {origin, dir, max?: 1000}"),
     ("pick", "Entity under a canvas point (CSS px). args: {x, y, mesh?: true = test rendered meshes instead of physics colliders; also returns depth_ties (z-fighting partners)}"),
     ("ui", "HUD slot contents."),
-    ("zfight", "Find z-fighting: coplanar, same-facing, overlapping triangles of different entities (opaque/masked). args: {eps?: 0.002 plane distance, tolerance?: 0.002 overlap, limit?: 50}. Returns pair count and the worst pairs with entities, world point and screen position."),
+    ("zfight", "args: {radius?: m around the camera (use in big worlds)}. Find z-fighting: coplanar, same-facing, overlapping triangles of different entities (opaque/masked). args: {eps?: 0.002 plane distance, tolerance?: 0.002 overlap, limit?: 50}. Returns pair count and the worst pairs with entities, world point and screen position."),
     ("debug_mode", "Debug mode (also the ` key): logs every key/mouse press and the camera pose once per second to logs/debug-*.log via the dev server, shows a badge. args: {on?: bool}. Returns file, line counts, last camera, last error."),
     ("audio", "Audio state: context state, sounds (ready/loading/failed, plays), active voices with 3D position, last 32 plays with sim step."),
     ("audio_play", "Play a sound by name. args: {sound, volume?: 1, pitch?: 1, pos?: [x,y,z], loop?, lowpass?: hz, highpass?: hz, bandpass?: [hz,q], echo?: [delay_s, feedback, mix?], reverb?: secs | [secs, mix], distort?: drive, pan?: -1..1, detune?: cents}. Returns the voice id."),
@@ -415,6 +427,12 @@ pub(crate) fn handle<G: Game>(
             Ok(entity_detail(ctx, e))
         }
         "spawn" => {
+            if let Some(url) = a.get("gltf").and_then(|v| v.as_str()) {
+                let pos = a.get("pos").and_then(v3).unwrap_or(Vec3::ZERO);
+                let scale = a.get("size").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+                let e = ctx.load_gltf(url, Transform::from_translation(pos).with_scale(Vec3::splat(scale)));
+                return Ok(json!({"id": e.id(), "loading": ctx.assets_pending() > 0}));
+            }
             let shape = a.get("shape").and_then(|v| v.as_str()).unwrap_or("cube");
             let pos = a
                 .get("pos")
@@ -549,42 +567,16 @@ pub(crate) fn handle<G: Game>(
             Ok(json!({"next": log::next_seq(), "entries": log::entries_since(since, level, limit)}))
         }
         "render" => {
-            let s = &mut ctx.renderer.settings;
-            if let Some(v) = a.get("shadows").and_then(|v| v.as_bool()) {
-                s.shadows = v;
-            }
-            if let Some(v) = a.get("debug_view").and_then(|v| v.as_u64()) {
-                s.debug_view = v as u32;
-            }
-            if let Some(v) = a.get("sun_dir").and_then(v3) {
-                s.sun_dir = v;
-            }
-            if let Some(v) = a.get("sun_intensity").and_then(|v| v.as_f64()) {
-                s.sun_intensity = v as f32;
-            }
-            if let Some(v) = a.get("shadow_extent").and_then(|v| v.as_f64()) {
-                s.shadow_extent = v as f32;
-            }
-            if let Some(v) = a.get("clear_color").and_then(v3) {
-                s.clear_color = v;
-            }
-            if let Some(v) = a.get("gpu_culling").and_then(|v| v.as_bool()) {
-                s.gpu_culling = v;
-            }
-            if let Some(v) = a.get("occlusion_culling").and_then(|v| v.as_bool()) {
-                s.occlusion_culling = v;
-            }
-            if let Some(v) = a.get("camera_jitter").and_then(v3) {
-                s.camera_jitter = v;
-            }
-            if let Some(v) = a.get("reverse_draw_order").and_then(|v| v.as_bool()) {
-                s.reverse_draw_order = v;
-            }
-            if let Some(v) = a.get("depth_jitter").and_then(|v| v.as_f64()) {
-                s.depth_jitter = v as f32;
-            }
-            if let Some(v) = a.get("freeze_time").and_then(|v| v.as_bool()) {
-                s.freeze_time = v;
+            // any RenderSettings field by name (unknown names are an error, types are checked)
+            if let Some(obj) = a.as_object().filter(|o| !o.is_empty()) {
+                let mut cur = json!(ctx.renderer.settings);
+                for (k, v) in obj {
+                    if cur.get(k).is_none() {
+                        return Err(format!("unknown render setting '{k}'; known: {:?}", cur.as_object().map(|o| o.keys().cloned().collect::<Vec<_>>())));
+                    }
+                    cur[k] = v.clone();
+                }
+                ctx.renderer.settings = serde_json::from_value(cur).map_err(|e| format!("render: {e}"))?;
             }
             let mut out = json!(ctx.renderer.settings);
             out["gpu_culling_supported"] = json!(ctx.renderer.gpu_culling_supported);
@@ -594,6 +586,7 @@ pub(crate) fn handle<G: Game>(
             let cam = ctx
                 .world
                 .query::<(Entity, &Camera)>()
+                .without::<&crate::render_texture::RenderTextureCamera>()
                 .iter()
                 .next()
                 .map(|(e, _)| e)
@@ -640,13 +633,66 @@ pub(crate) fn handle<G: Game>(
             })
         }
         "ui" => Ok(json!({"slots": ctx.ui.slots()})),
+        "save" => ctx.save.command(a),
+        "particles" => ctx.particles_command(a),
+        "characters" => ctx.characters_command(a),
+        "world" => ctx.world_command(a),
+        "grass" => {
+            if let Some(obj) = a.as_object().filter(|o| !o.is_empty()) {
+                let mut cur = json!(ctx.renderer.grass.settings);
+                for (k, v) in obj {
+                    if cur.get(k).is_none() {
+                        return Err(format!("unknown grass setting '{k}'"));
+                    }
+                    cur[k] = v.clone();
+                }
+                ctx.renderer.grass.settings = serde_json::from_value(cur).map_err(|e| e.to_string())?;
+            }
+            Ok(json!({"settings": ctx.renderer.grass.settings, "blades_last_frame": ctx.renderer.grass.last_blades, "has_terrain": ctx.terrain.is_some()}))
+        }
+        "terrain" => ctx.terrain_command(a),
+        "lights" => ctx.lights_command(a),
+        "generate" => ctx.generate_command(a),
+        "batch" => ctx.batch_command(a),
+        "animation" => ctx.animation_command(a),
+        "render_texture" => {
+            if let Some(id) = a["id"].as_u64() {
+                let rt = crate::render_texture::RenderTextureId(id as u32);
+                if ctx.renderer.rtts.get(id as usize).is_none() {
+                    return Err(format!("no render texture {id}"));
+                }
+                if a["render"].as_bool() == Some(true) {
+                    ctx.refresh_render_texture(rt);
+                }
+                if a["export"].as_bool() == Some(true) {
+                    ctx.export_render_texture(rt);
+                }
+                return Ok(ctx.renderer.rtts[id as usize].describe(id as usize));
+            }
+            Ok(json!({"render_textures": ctx.renderer.rtts.iter().enumerate().map(|(i, r)| r.describe(i)).collect::<Vec<_>>()}))
+        }
+        "scenes" => {
+            if let Some(n) = a["unload"].as_str() {
+                let removed = ctx.unload_scene(n);
+                return Ok(json!({"unloaded": n, "entities": removed, "now": ctx.scenes.describe(&ctx.world)}));
+            }
+            if let Some(n) = a["begin"].as_str() {
+                ctx.begin_scene(n);
+            }
+            Ok(ctx.scenes.describe(&ctx.world))
+        }
         "zfight" => {
             let eps = a.get("eps").and_then(|v| v.as_f64()).unwrap_or(0.002) as f32;
             let tol = a.get("tolerance").and_then(|v| v.as_f64()).unwrap_or(0.002) as f32;
             let limit = a.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
             crate::scene::propagate_transforms(&mut ctx.world);
             let css = Vec2::new(ctx.canvas.client_width() as f32, ctx.canvas.client_height() as f32);
-            Ok(crate::zfight::find(&ctx.world, &ctx.renderer, eps, tol, limit, ctx.renderer.last_view_proj, css))
+            // radius: only instances near the camera (big worlds: a full check takes seconds)
+            let near = a.get("radius").and_then(|v| v.as_f64()).and_then(|r| {
+                let cam = ctx.world.query::<(&Camera, &crate::scene::GlobalTransform)>().without::<&crate::render_texture::RenderTextureCamera>().iter().next().map(|(_, g)| g.translation())?;
+                Some((cam, r as f32))
+            });
+            Ok(crate::zfight::find_near(&ctx.world, &ctx.renderer, eps, tol, limit, ctx.renderer.last_view_proj, css, near))
         }
         "debug_mode" => {
             if let Some(on) = a.get("on").and_then(|v| v.as_bool()) {

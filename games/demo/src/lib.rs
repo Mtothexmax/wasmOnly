@@ -1,18 +1,29 @@
 //! Demo: "Tumble" — roll a ball, knock the crate tower off the island.
 //!
-//! Exercises every engine system: PBR + shadows, point lights, glTF models (static + dynamic),
-//! rapier physics, input (keyboard, mouse, wheel, gamepad), DOM HUD with actions, world labels,
-//! and game-specific AI debug commands.
+//! Exercises every engine system: screens + scenes (title / play / pause), save games, PBR +
+//! shadows, sky, fog, bloom, depth darkening, particles, point lights, glTF models (static,
+//! dynamic, skinned + morph-animated), render-to-texture (title card portrait), rapier physics,
+//! character controller + third-person camera, input (keyboard, mouse, wheel, gamepad, touch),
+//! DOM HUD with actions, world panels, world labels, audio, and game-specific AI debug commands.
 
 use engine::physics::rapier::prelude::{ColliderBuilder, RigidBodyBuilder};
 use engine::prelude::*;
 use engine::renderer::Material;
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use wasm_bindgen::prelude::*;
 
+mod world;
+
 #[wasm_bindgen(start)]
 pub fn main() {
-    engine::run(Tumble::default());
+    engine::run(
+        ScreenStack::new(Data::default(), Box::new(Title::default()))
+            .register("title", || Box::new(Title::default()))
+            .register("play", || Box::new(PlayScreen::default()))
+            .register("pause", || Box::new(Pause))
+            .register("world", || Box::new(world::WorldScreen::default())),
+    );
 }
 
 const PLAYER_SPAWN: Vec3 = Vec3::new(0.0, 1.0, 9.0);
@@ -20,20 +31,236 @@ const PLAYER_SPAWN: Vec3 = Vec3::new(0.0, 1.0, 9.0);
 const POND: Vec3 = Vec3::new(-6.5, 0.0, 7.5);
 const POND_R: f32 = 2.1;
 const ISLAND_HALF: f32 = 14.0;
+const CAMPFIRE: Vec3 = Vec3::new(-8.0, 0.0, -1.5);
 /// A jump press stays valid this many fixed steps (pressed slightly before landing still jumps).
 const JUMP_BUFFER_STEPS: u32 = 8;
 /// After leaving the ground a jump is still allowed for this many steps ("coyote time").
 const COYOTE_STEPS: u32 = 6;
 /// After a jump, ground contact is ignored this long (no double impulse while still touching).
 const JUMP_COOLDOWN_STEPS: u32 = 12;
+/// Portrait subjects live on this render layer; the main cameras skip it.
+const PORTRAIT_LAYER: u8 = 1;
+
+// ---------------------------------------------------------------------------------------------
+// Shared data (all screens) + save game
+
+/// Saved in localStorage slot "progress" (namespace "tumble").
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct Progress {
+    best: u32,
+    wins: u32,
+    plays: u32,
+}
 
 #[derive(Default)]
-struct Tumble {
+struct Data {
+    progress: Progress,
+    started: bool,
+    /// Title card portrait (created once, its camera is re-attached on every title visit).
+    portrait: Option<(RenderTextureId, Option<TextureId>)>,
+}
+
+impl Data {
+    /// Once per page: save namespace, saved progress, sounds, music.
+    fn ensure(&mut self, ctx: &mut Ctx) {
+        if self.started {
+            return;
+        }
+        self.started = true;
+        ctx.save.set_namespace("tumble", 1);
+        self.progress = ctx.save.read("progress").unwrap_or_default();
+        // Sounds from synth presets (engine::audio::synth) — no asset files. Effects are applied
+        // at playback (echo, reverb, filters) so one recipe serves several moods.
+        for p in [SfxPreset::Laser, SfxPreset::Jump, SfxPreset::Click, SfxPreset::Powerup, SfxPreset::Chime, SfxPreset::Wind] {
+            ctx.audio.add_preset(p, 0);
+        }
+        ctx.audio.add_sfx("thud", &Sfx::preset(SfxPreset::Thud).mutate(3, 0.5));
+        ctx.audio.play_named("wind", Play::new().looped().volume(0.18).lowpass(900.0)); // ambience
+        // Music is streamed (<audio> + range requests): the game runs at once, the track starts
+        // when enough is buffered. Nothing waits for the download.
+        ctx.audio.play_music("assets/music/where_the_banners_fall.mp3", MusicOpts { fade: 3.0, volume: 0.45, looped: true });
+    }
+
+    fn save(&self, ctx: &Ctx) {
+        if let Err(e) = ctx.save.write("progress", &self.progress) {
+            engine::log_warn!("save failed: {e}");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Title screen: animated critter, particles, a card with a render-to-texture portrait.
+
+#[derive(Default)]
+struct Title {
+    critter: Option<Entity>,
+    portrait_model: Option<Entity>,
+    /// 0 waiting for the model, 1 rendered (export next), 2 exporting, 3 shown
+    portrait_state: u8,
+    frames: u32,
+}
+
+impl Title {
+    fn hud(&self, ctx: &mut Ctx, data: &Data) {
+        let url = data.portrait.and_then(|(rt, _)| ctx.renderer.render_texture_url(rt));
+        let img = url.map(|u| format!("<img src='{u}' alt='critter'>")).unwrap_or_else(|| "<img alt=''>".into());
+        let p = &data.progress;
+        ctx.ui.set(
+            "menu",
+            &format!(
+                "<div class='panel menu'><h1>Tumble</h1><div>Push every crate off the island</div>\
+                 <div style='margin:14px 0 4px'><div class='card'>{img}<div class='name'>Critter</div>\
+                 <div class='stats'>Skinning · Morph · Clips</div></div></div>\
+                 <div class='stats'>Best: {} · Wins: {} · Rounds: {}</div>\
+                 <button data-action='play'>Play (Enter)</button>                 <button data-action='world'>Open world (O)</button></div>",
+                p.best, p.wins, p.plays
+            ),
+        );
+    }
+}
+
+impl Screen<Data> for Title {
+    fn name(&self) -> &'static str {
+        "title"
+    }
+
+    fn enter(&mut self, ctx: &mut Ctx, data: &mut Data) {
+        data.ensure(ctx);
+        ctx.world.spawn((
+            Name("title-camera".into()),
+            Transform::from_xyz(0.0, 1.5, 5.0).looking_at(Vec3::new(0.0, 1.0, 0.0), Vec3::Y),
+            Camera { layers: !(1u32 << PORTRAIT_LAYER), ..Default::default() },
+        ));
+        let stone = ctx.renderer.add_material(Material::color(0x59606b).rough(0.8));
+        ctx.spawn_mesh("pedestal", ctx.renderer.builtin.cube, stone, Transform::from_xyz(0.0, -0.2, 0.0).with_scale(Vec3::new(3.0, 0.4, 3.0)));
+        let ground = ctx.renderer.add_material(Material::color(0x3f6b3a).rough(1.0));
+        ctx.spawn_mesh("title-ground", ctx.renderer.builtin.cube, ground, Transform::from_xyz(0.0, -0.6, 0.0).with_scale(Vec3::new(60.0, 0.4, 60.0)));
+        // left of the centred menu
+        self.critter = Some(ctx.load_gltf("assets/critter.glb", Transform::from_xyz(-2.1, 0.0, 0.6).with_rotation(Quat::from_rotation_y(0.7))));
+        let lamp = ctx.world.spawn((Transform::from_xyz(1.5, 2.2, 1.5), PointLight { color: Vec3::new(1.0, 0.7, 0.4), intensity: 18.0, range: 8.0 }));
+        let _ = lamp;
+        ctx.spawn_particles("title-fireflies", Vec3::new(0.0, 1.2, 0.0), ParticleEmitter::preset(ParticlePreset::Fireflies));
+        ctx.spawn_particles("title-magic", Vec3::new(0.0, 0.1, 0.0), ParticleEmitter { rate: 12.0, area: Vec3::new(1.2, 0.0, 1.2), ..ParticleEmitter::preset(ParticlePreset::Magic) });
+
+        // Card portrait: a second critter far away on its own render layer, filmed by a
+        // render-texture camera (transparent background), exported as PNG for the DOM card.
+        let pm = ctx.load_gltf("assets/critter.glb", Transform::from_xyz(50.0, 0.0, 0.0).with_rotation(Quat::from_rotation_y(-0.5)));
+        ctx.set_layer(pm, PORTRAIT_LAYER);
+        self.portrait_model = Some(pm);
+        let (rt, tex) = *data.portrait.get_or_insert_with(|| ctx.create_render_texture(304, 380, RenderTextureOpts::portrait()));
+        let _ = tex;
+        let cam = ctx.world.spawn((
+            Name("portrait-camera".into()),
+            Transform::from_xyz(50.0, 1.25, 3.4).looking_at(Vec3::new(50.0, 1.05, 0.0), Vec3::Y),
+            Camera { fov_y_deg: 42.0, layers: 1 << PORTRAIT_LAYER, ..Default::default() },
+        ));
+        let lamp2 = ctx.world.spawn((Transform::from_xyz(51.5, 2.0, 2.0), PointLight { color: Vec3::new(0.6, 0.7, 1.0), intensity: 14.0, range: 6.0 }));
+        let _ = lamp2;
+        ctx.set_render_texture_camera(rt, cam);
+        self.portrait_state = 0;
+        self.hud(ctx, data);
+    }
+
+    fn exit(&mut self, ctx: &mut Ctx, _data: &mut Data) {
+        ctx.ui.set("menu", "");
+    }
+
+    fn update(&mut self, ctx: &mut Ctx, data: &mut Data, _dt: f32) -> Trans<Data> {
+        self.frames += 1;
+        if let Some(c) = self.critter {
+            ctx.play_animation(c, "idle", PlayOpts::looped());
+        }
+        // portrait: wait for the model, pose it, render once, export to PNG, show in the card
+        if let (Some(pm), Some((rt, _))) = (self.portrait_model, data.portrait) {
+            match self.portrait_state {
+                0 if ctx.world.get::<&Animator>(pm).is_ok() => {
+                    ctx.play_animation(pm, "wave", PlayOpts::looped().fade(0.0));
+                    ctx.refresh_render_texture(rt);
+                    self.portrait_state = 1;
+                    self.frames = 0;
+                }
+                1 if self.frames > 20 => {
+                    ctx.refresh_render_texture(rt); // pose from the running clip
+                    ctx.export_render_texture(rt);
+                    self.portrait_state = 2;
+                }
+                2 if ctx.renderer.render_texture_url(rt).is_some() => {
+                    self.portrait_state = 3;
+                    self.hud(ctx, data);
+                }
+                _ => {}
+            }
+        }
+        let mut go = ctx.input.key_pressed("Enter") || ctx.input.key_pressed("NumpadEnter");
+        let mut world = ctx.input.key_pressed("KeyO");
+        for a in ctx.ui.take_actions() {
+            ctx.audio.play_named("click", Play::new().volume(0.5));
+            go |= a == "play";
+            world |= a == "world";
+        }
+        if world {
+            return Trans::Switch(Box::new(world::WorldScreen::default()));
+        }
+        ctx.ui.set("fps", &format!("<div class='panel fps'>{:.0} fps · {:.1} ms</div>", ctx.time.fps, ctx.time.frame_ms));
+        if go {
+            return Trans::Switch(Box::new(PlayScreen::default()));
+        }
+        Trans::None
+    }
+
+    fn debug_state(&self, _ctx: &Ctx, data: &Data) -> Value {
+        json!({"progress": data.progress, "portrait_state": self.portrait_state})
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Pause overlay
+
+struct Pause;
+
+impl Screen<Data> for Pause {
+    fn name(&self) -> &'static str {
+        "pause"
+    }
+    fn enter(&mut self, ctx: &mut Ctx, _data: &mut Data) {
+        ctx.exit_pointer_lock();
+        ctx.ui.set(
+            "menu",
+            "<div class='panel menu'><h1>Pause</h1><button data-action='resume'>Resume (P)</button>\
+             <button data-action='menu'>Main menu</button></div>",
+        );
+    }
+    fn exit(&mut self, ctx: &mut Ctx, _data: &mut Data) {
+        ctx.ui.set("menu", "");
+    }
+    fn update(&mut self, ctx: &mut Ctx, _data: &mut Data, _dt: f32) -> Trans<Data> {
+        let mut t = Trans::None;
+        if ctx.input.key_pressed("KeyP") || ctx.input.key_pressed("Escape") {
+            t = Trans::Pop;
+        }
+        for a in ctx.ui.take_actions() {
+            ctx.audio.play_named("click", Play::new().volume(0.5));
+            match a.as_str() {
+                "resume" => t = Trans::Pop,
+                "menu" => t = Trans::Reset(Box::new(Title::default())),
+                _ => {}
+            }
+        }
+        t
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Play screen
+
+#[derive(Default)]
+struct PlayScreen {
     player: Option<Entity>,
     camera: Option<Entity>,
-    yaw: f32,
-    pitch: f32,
-    distance: f32,
+    /// Character-controller figure (critter model on a capsule), toggled with C.
+    walker: Option<Entity>,
+    walker_model: Option<Entity>,
+    walker_mode: bool,
     targets: Vec<(Entity, bool)>,
     shots: VecDeque<Entity>,
     score: u32,
@@ -46,14 +273,20 @@ struct Tumble {
     jumps: u32,
     /// World panel (clickable 3D UI) next to the spawn.
     terminal: Option<Entity>,
+    fire_light: Option<Entity>,
     slowmo: bool,
+    won: bool,
 }
 
-impl Tumble {
+impl PlayScreen {
     fn player_pos(&self, ctx: &Ctx) -> Vec3 {
         self.player
             .and_then(|p| ctx.world.get::<&Transform>(p).ok().map(|t| t.translation))
             .unwrap_or(PLAYER_SPAWN)
+    }
+
+    fn camera_yaw(&self, ctx: &Ctx) -> f32 {
+        self.camera.and_then(|c| ctx.world.get::<&ThirdPersonCamera>(c).ok().map(|c| c.yaw)).unwrap_or(0.0)
     }
 
     fn build_tower(&mut self, ctx: &mut Ctx) {
@@ -86,6 +319,7 @@ impl Tumble {
         }
         self.total = n;
         self.score = 0;
+        self.won = false;
     }
 
     fn reset(&mut self, ctx: &mut Ctx) {
@@ -119,7 +353,7 @@ impl Tumble {
         let e = ctx.spawn_sphere("shot", origin + dir * 1.5, 0.25, 0x88ccff);
         if let Ok(m) = ctx.world.get::<&MeshRenderer>(e).map(|m| m.material) {
             if let Some(mat) = ctx.renderer.material_mut(m) {
-                mat.emissive = Vec3::new(0.2, 0.5, 1.0);
+                mat.emissive = Vec3::new(0.6, 1.5, 3.0); // HDR: glows through bloom
                 mat.metallic = 0.8;
                 mat.roughness = 0.2;
             }
@@ -138,24 +372,31 @@ impl Tumble {
         }
         e
     }
-}
 
-impl Game for Tumble {
-    fn init(&mut self, ctx: &mut Ctx) {
-        self.distance = 11.0;
-        self.pitch = 0.45;
-
-        // Sounds from synth presets (engine::audio::synth) — no asset files. Effects are applied
-        // at playback (echo, reverb, filters) so one recipe serves several moods.
-        for p in [SfxPreset::Laser, SfxPreset::Jump, SfxPreset::Click, SfxPreset::Powerup, SfxPreset::Chime, SfxPreset::Wind] {
-            ctx.audio.add_preset(p, 0);
+    fn set_walker_mode(&mut self, ctx: &mut Ctx, on: bool) {
+        self.walker_mode = on;
+        let target = if on { self.walker } else { self.player };
+        if let Some(cam) = self.camera {
+            if let Ok(mut c) = ctx.world.get::<&mut ThirdPersonCamera>(cam) {
+                c.target = target;
+                c.pivot_offset = if on { Vec3::new(0.0, 0.6, 0.0) } else { Vec3::new(0.0, 0.8, 0.0) };
+            }
         }
-        ctx.audio.add_sfx("thud", &Sfx::preset(SfxPreset::Thud).mutate(3, 0.5));
-        ctx.audio.play_named("wind", Play::new().looped().volume(0.18).lowpass(900.0)); // ambience
-        // Music is streamed (<audio> + range requests): the game runs at once, the track starts
-        // when enough is buffered. Nothing waits for the download.
-        ctx.audio.play_music("assets/music/where_the_banners_fall.mp3", MusicOpts { fade: 3.0, volume: 0.45, looped: true });
+        engine::log_info!("control: {}", if on { "walker (character controller)" } else { "ball (physics)" });
+    }
 
+    fn hud_help(&self, ctx: &mut Ctx) {
+        ctx.ui.set(
+            "help",
+            "<div class='panel'><b>Tumble</b> — push every crate off the island<br>\
+             <kbd>WASD</kbd> move · <kbd>Space</kbd> jump · <kbd>Left click</kbd> shoot<br>\
+             <kbd>Right drag</kbd> camera · <kbd>Wheel</kbd> zoom · <kbd>C</kbd> switch figure · <kbd>R</kbd> reset · <kbd>P</kbd> pause<br>\
+             <button data-action='reset'>Restart</button> <button data-action='toggle-shadows'>Shadows</button> \
+             <button data-action='walker'>Switch figure</button></div>",
+        );
+    }
+
+    fn build_world(&mut self, ctx: &mut Ctx) {
         // Procedural, seamless textures (engine::texgen)
         let grass = ctx.generate_texture(&TexGen::new(TexPreset::Grass).size(256).seed(4));
         let dirt = ctx.generate_texture(&TexGen::new(TexPreset::Dirt).size(256).seed(9));
@@ -237,8 +478,8 @@ impl Game for Tumble {
         let mut placed = 0;
         while placed < 300 {
             let (x, z) = (ctx.rng.range(-13.0, 13.0), ctx.rng.range(-13.0, 13.0));
-            if (x.abs() < 4.0 && z > -6.5 && z < 2.0) || (x - POND.x).hypot(z - POND.z) < POND_R + 0.9 {
-                continue; // keep the tower area clear
+            if (x.abs() < 4.0 && z > -6.5 && z < 2.0) || (x - POND.x).hypot(z - POND.z) < POND_R + 0.9 || (x - CAMPFIRE.x).hypot(z - CAMPFIRE.z) < 1.2 {
+                continue; // keep the tower area, pond and campfire clear
             }
             let s = ctx.rng.range(0.5, 0.9);
             let t = Transform::from_xyz(x, 0.0, z).with_rotation(Quat::from_rotation_y(ctx.rng.range(0.0, std::f32::consts::PI))).with_scale(Vec3::new(s, s * 0.8, s));
@@ -263,21 +504,6 @@ impl Game for Tumble {
             cliff,
             Transform::from_xyz(0.0, -3.0, 0.0).with_scale(Vec3::new(ISLAND_HALF * 2.0 - 0.6, 4.0, ISLAND_HALF * 2.0 - 0.6)),
         );
-
-        // Player
-        let pmat = ctx.renderer.add_material(Material::color(0xffc93c).rough(0.25).metal(0.2));
-        let player = ctx.spawn_mesh("player", ctx.renderer.builtin.sphere, pmat, Transform::from_translation(PLAYER_SPAWN));
-        ctx.physics.add(
-            &mut ctx.world,
-            player,
-            RigidBodyBuilder::dynamic().angular_damping(0.8).linear_damping(0.15).ccd_enabled(true).can_sleep(false),
-            ColliderBuilder::ball(0.5).density(2.0).friction(1.2),
-        );
-        let _ = ctx.world.insert_one(player, WorldLabel::new("Du"));
-        self.player = Some(player);
-
-        // Camera
-        self.camera = Some(ctx.world.spawn((Name("camera".into()), Transform::from_xyz(0.0, 6.0, 20.0), Camera::default())));
 
         // Lamps: emissive orb + point light on a pole
         let pole = ctx.renderer.add_material(Material::color(0x333333).metal(0.9).rough(0.35));
@@ -306,15 +532,38 @@ impl Game for Tumble {
             ctx.physics.add(&mut ctx.world, r, RigidBodyBuilder::fixed(), ColliderBuilder::ball(0.8 * s));
         }
 
+        // Glowing mushrooms (emissive > 1 -> bloom) with fireflies above them
+        let stem = ctx.renderer.add_material(Material::color(0xe6dccb).rough(0.8));
+        let cap = ctx.renderer.add_material(Material { emissive: Vec3::new(0.25, 2.4, 1.7), ..Material::color(0x2ad1a0).rough(0.5) });
+        for (k, (x, z)) in [(-9.0f32, 4.2f32), (-8.3, 4.8), (-9.6, 5.1), (10.0, -4.3), (9.3, -3.6), (10.6, -3.4), (7.2, 10.2), (-3.0, -9.6), (-2.2, -10.2)].into_iter().enumerate() {
+            let s = 0.7 + (k % 3) as f32 * 0.25;
+            ctx.spawn_mesh("mushroom-stem", ctx.renderer.builtin.cube, stem, Transform::from_xyz(x, 0.18 * s, z).with_scale(Vec3::new(0.09, 0.36, 0.09) * s));
+            ctx.spawn_mesh("mushroom-cap", ctx.renderer.builtin.sphere, cap, Transform::from_xyz(x, 0.38 * s, z).with_scale(Vec3::new(0.42, 0.2, 0.42) * s));
+        }
+        for p in [Vec3::new(-9.0, 1.0, 4.7), Vec3::new(10.0, 1.0, -3.8)] {
+            ctx.spawn_particles("fireflies", p, ParticleEmitter { area: Vec3::new(1.6, 0.6, 1.6), ..ParticleEmitter::preset(ParticlePreset::Fireflies) });
+        }
+
+        // Campfire: logs, fire + smoke particles, flickering point light
+        let wood = ctx.renderer.add_material(Material::color(0x4a2f1c).rough(0.95));
+        // the second log lies on the first (different heights: crossed logs must not share a plane)
+        for (a, y) in [(0.3f32, 0.08f32), (1.9, 0.2)] {
+            let l = ctx.spawn_mesh("log", ctx.renderer.builtin.cube, wood, Transform::from_translation(CAMPFIRE + Vec3::Y * y).with_rotation(Quat::from_rotation_y(a)).with_scale(Vec3::new(0.9, 0.16, 0.16)));
+            ctx.physics.add(&mut ctx.world, l, RigidBodyBuilder::fixed(), ColliderBuilder::cuboid(0.45, 0.08, 0.08));
+        }
+        ctx.spawn_particles("fire", CAMPFIRE + Vec3::Y * 0.15, ParticleEmitter::preset(ParticlePreset::Fire));
+        ctx.spawn_particles("smoke", CAMPFIRE + Vec3::Y * 1.1, ParticleEmitter::preset(ParticlePreset::Smoke));
+        self.fire_light = Some(ctx.world.spawn((Name("fire-light".into()), Transform::from_translation(CAMPFIRE + Vec3::Y * 0.8), PointLight { color: Vec3::new(1.0, 0.5, 0.15), intensity: 10.0, range: 7.0 })));
+
         // Terminal: a clickable 2D panel on a 3D quad (engine::panel)
         let panel = Panel::new(512, 320)
             .label("title", [28.0, 22.0, 456.0, 40.0], "TUMBLE TERMINAL", 34.0)
             .label("score", [28.0, 76.0, 456.0, 30.0], "", 26.0)
             .bar("progress", [28.0, 116.0, 456.0, 22.0], 0.0, "#34d399")
-            .button("reset", [28.0, 160.0, 220.0, 62.0], "Neu starten", "reset")
-            .button("shadows", [264.0, 160.0, 220.0, 62.0], "Schatten", "toggle-shadows")
-            .button("slowmo", [28.0, 236.0, 220.0, 62.0], "Zeitlupe", "slowmo")
-            .button("sound", [264.0, 236.0, 220.0, 62.0], "Ton", "toggle-sound");
+            .button("reset", [28.0, 160.0, 220.0, 62.0], "Restart", "reset")
+            .button("shadows", [264.0, 160.0, 220.0, 62.0], "Shadows", "toggle-shadows")
+            .button("slowmo", [28.0, 236.0, 220.0, 62.0], "Slow motion", "slowmo")
+            .button("sound", [264.0, 236.0, 220.0, 62.0], "Sound", "toggle-sound");
         let face = Vec3::new(PLAYER_SPAWN.x - 5.5, 0.0, PLAYER_SPAWN.z + 10.0 - 6.0); // towards the default camera
         let rot = Quat::from_rotation_y(face.x.atan2(face.z));
         let t = Transform::from_xyz(5.5, 1.9, 6.0).with_rotation(rot).with_scale(Vec3::new(2.4, 1.5, 1.0));
@@ -324,26 +573,83 @@ impl Game for Tumble {
         let post = ctx.spawn_mesh("terminal-post", ctx.renderer.builtin.cube, post_mat, Transform::from_xyz(5.5, 0.6, 6.0).with_rotation(rot).with_scale(Vec3::new(0.25, 1.2, 0.25)));
         ctx.physics.add(&mut ctx.world, post, RigidBodyBuilder::fixed(), ColliderBuilder::cuboid(0.125, 0.6, 0.125));
         self.terminal = Some(term);
+    }
+}
+
+impl Screen<Data> for PlayScreen {
+    fn name(&self) -> &'static str {
+        "play"
+    }
+
+    fn enter(&mut self, ctx: &mut Ctx, data: &mut Data) {
+        data.ensure(ctx);
+        data.progress.plays += 1;
+        data.save(ctx);
+        self.build_world(ctx);
+
+        // Player: physics ball
+        let pmat = ctx.renderer.add_material(Material::color(0xffc93c).rough(0.25).metal(0.2));
+        let player = ctx.spawn_mesh("player", ctx.renderer.builtin.sphere, pmat, Transform::from_translation(PLAYER_SPAWN));
+        ctx.physics.add(
+            &mut ctx.world,
+            player,
+            RigidBodyBuilder::dynamic().angular_damping(0.8).linear_damping(0.15).ccd_enabled(true).can_sleep(false),
+            ColliderBuilder::ball(0.5).density(2.0).friction(1.2),
+        );
+        let _ = ctx.world.insert_one(player, WorldLabel::new("You"));
+        self.player = Some(player);
+
+        // Walker: character controller (capsule) with the animated critter as its body
+        let cc = CharacterController { speed: 4.5, ..Default::default() };
+        let foot = cc.foot_offset();
+        let walker = ctx.spawn_character("walker", Vec3::new(2.5, 0.0, 10.5), cc);
+        let model = ctx.load_gltf("assets/critter.glb", Transform::from_xyz(0.0, -foot, 0.0).with_scale(Vec3::splat(0.7)));
+        let _ = ctx.world.insert_one(model, Parent(walker));
+        self.walker = Some(walker);
+        self.walker_model = Some(model);
+
+        // Third-person camera (orbit: right drag / pointer lock, wheel + pinch zoom, collision)
+        self.camera = Some(ctx.world.spawn((
+            Name("camera".into()),
+            Transform::from_xyz(0.0, 6.0, 20.0),
+            Camera::default(),
+            ThirdPersonCamera { distance: 11.0, min_distance: 4.0, max_distance: 40.0, pitch: 0.45, min_pitch: -0.2, max_pitch: 1.4, ..ThirdPersonCamera::following(player) },
+        )));
 
         self.build_tower(ctx);
-
-        ctx.ui.set(
-            "help",
-            "<div class='panel'><b>Tumble</b> — stoß alle Kisten von der Insel<br>\
-             <kbd>WASD</kbd> rollen · <kbd>Space</kbd> springen · <kbd>Linksklick</kbd> schießen<br>\
-             <kbd>Rechts ziehen</kbd> Kamera · <kbd>Mausrad</kbd> Zoom · <kbd>R</kbd> Reset<br>\
-             <button data-action='reset'>Neu starten</button> <button data-action='toggle-shadows'>Schatten</button></div>",
-        );
+        self.hud_help(ctx);
         engine::log_info!("Tumble initialised: {} targets", self.total);
     }
 
-    fn fixed_update(&mut self, ctx: &mut Ctx) {
+    fn exit(&mut self, ctx: &mut Ctx, _data: &mut Data) {
+        for slot in ["help", "score", "touch"] {
+            ctx.ui.set(slot, "");
+        }
+        ctx.time.time_scale = 1.0;
+    }
+
+    fn fixed_update(&mut self, ctx: &mut Ctx, data: &mut Data) {
         let dt = ctx.time.fixed_dt;
         let axis = ctx.input.move_axis();
-        let fwd = Vec3::new(-self.yaw.sin(), 0.0, -self.yaw.cos());
+        let yaw = self.camera_yaw(ctx);
+        let fwd = Vec3::new(-yaw.sin(), 0.0, -yaw.cos());
         let right = Vec3::new(-fwd.z, 0.0, fwd.x);
-        let dir = fwd * axis.y + right * axis.x;
+        let dir = if self.walker_mode { Vec3::ZERO } else { fwd * axis.y + right * axis.x };
         let pos = self.player_pos(ctx);
+
+        // Walker: the character controller does the movement; we only set what it wants.
+        if let Some(w) = self.walker {
+            if let Ok(mut cc) = ctx.world.get::<&mut CharacterController>(w) {
+                if self.walker_mode {
+                    cc.drive(axis, yaw);
+                    cc.run = ctx.input.key("ShiftLeft") || ctx.input.key("ShiftRight");
+                    cc.jump = ctx.input.key_down_or_pressed("Space") || self.jump_buffer > 0;
+                } else {
+                    cc.wish = Vec3::ZERO;
+                    cc.jump = false;
+                }
+            }
+        }
 
         // Grounded = any touching contact with an upward normal (<= 60° slope). The old check was a
         // single 0.15 ray straight down from the bottom of the ball: it missed when the ball rested
@@ -357,7 +663,7 @@ impl Game for Tumble {
         } else {
             self.coyote = self.coyote.saturating_sub(1);
         }
-        let jump = self.jump_buffer > 0 && self.coyote > 0;
+        let jump = !self.walker_mode && self.jump_buffer > 0 && self.coyote > 0;
         self.jump_buffer = self.jump_buffer.saturating_sub(1);
         if jump {
             self.jump_buffer = 0;
@@ -389,24 +695,41 @@ impl Game for Tumble {
         }
 
         // scoring: targets that left the island
+        let mut scored = false;
         for (e, counted) in self.targets.iter_mut() {
             let y = ctx.world.get::<&Transform>(*e).map(|t| t.translation.y).unwrap_or(0.0);
             if !*counted && y < -2.0 {
                 *counted = true;
                 self.score += 1;
+                scored = true;
                 let at = ctx.world.get::<&Transform>(*e).map(|t| t.translation).unwrap_or_default();
                 ctx.audio.play_named("thud", Play::new().volume(0.8).at(at).ref_distance(6.0).reverb(1.2).lowpass(2200.0));
-                if self.score == self.total {
-                    ctx.audio.play_named("powerup", Play::new().reverb(2.0));
-                    ctx.audio.play_named("chime", Play::new().echo(0.25, 0.45));
-                }
+                ctx.spawn_particles("splash", Vec3::new(at.x, -2.15, at.z), ParticleEmitter::preset(ParticlePreset::Splash));
                 engine::log_info!("target {} fell off (score {}/{})", e.id(), self.score, self.total);
             }
+        }
+        if scored {
+            data.progress.best = data.progress.best.max(self.score);
+            if self.score == self.total && !self.won {
+                self.won = true;
+                data.progress.wins += 1;
+                ctx.audio.play_named("powerup", Play::new().reverb(2.0));
+                ctx.audio.play_named("chime", Play::new().echo(0.25, 0.45));
+            }
+            data.save(ctx);
         }
         if pos.y < -12.0 {
             self.falls += 1;
             engine::log_info!("player fell ({} falls), respawning", self.falls);
             self.respawn_player(ctx);
+        }
+        if let Some(w) = self.walker {
+            let wy = ctx.world.get::<&Transform>(w).map(|t| t.translation.y).unwrap_or(0.0);
+            if wy < -12.0 {
+                if let Ok(mut t) = ctx.world.get::<&mut Transform>(w) {
+                    t.translation = Vec3::new(2.5, 1.0, 10.5);
+                }
+            }
         }
         // far-away bodies are removed, but stay counted
         let below = |e: &Entity| ctx.world.get::<&Transform>(*e).map(|t| t.translation.y < -40.0).unwrap_or(false);
@@ -417,18 +740,8 @@ impl Game for Tumble {
         }
     }
 
-    fn update(&mut self, ctx: &mut Ctx, _dt: f32) {
+    fn update(&mut self, ctx: &mut Ctx, _data: &mut Data, _dt: f32) -> Trans<Data> {
         let input = &ctx.input;
-        if input.button(MouseButton::Right) || input.pointer_locked {
-            self.yaw -= input.pointer_delta.x * 0.006;
-            self.pitch = (self.pitch + input.pointer_delta.y * 0.004).clamp(-0.2, 1.4);
-        }
-        self.yaw -= input.gamepad_right.x * 0.04;
-        self.pitch = (self.pitch + input.gamepad_right.y * 0.03).clamp(-0.2, 1.4);
-        // touch: drag on the right side looks around, pinch zooms (left side = joystick, in move_axis)
-        self.yaw -= input.touch.look_delta.x * 0.008;
-        self.pitch = (self.pitch + input.touch.look_delta.y * 0.006).clamp(-0.2, 1.4);
-        self.distance = (self.distance * (1.0 + input.wheel * 0.001) * (-input.touch.pinch).exp()).clamp(4.0, 40.0);
         let taps = input.touch.taps.clone();
         let swipe_up = input.touch.swipes.iter().any(|s| s.dir.y < -0.7);
         let touch_device = input.touch.touch_device;
@@ -437,6 +750,8 @@ impl Game for Tumble {
             self.jump_buffer = JUMP_BUFFER_STEPS;
         }
         let reset = input.key_pressed("KeyR");
+        let toggle_walker = input.key_pressed("KeyC");
+        let pause = input.key_pressed("KeyP") || input.key_pressed("Escape");
         if shoot {
             self.shoot(ctx);
         }
@@ -447,14 +762,17 @@ impl Game for Tumble {
             }
         }
         if touch_device {
-            ctx.ui.set("touch", "<div class='touch-buttons'><button data-action='jump'>Springen</button></div>");
+            ctx.ui.set("touch", "<div class='touch-buttons'><button data-action='jump'>Jump</button> <button data-action='pause'>Pause</button></div>");
         }
+        let mut trans = if pause { Trans::Push(Box::new(Pause)) } else { Trans::None };
         for action in ctx.ui.take_actions() {
             ctx.audio.play_named("click", Play::new().volume(0.5));
             match action.as_str() {
                 "reset" => self.reset(ctx),
                 "toggle-shadows" => ctx.renderer.settings.shadows = !ctx.renderer.settings.shadows,
                 "jump" => self.jump_buffer = JUMP_BUFFER_STEPS,
+                "walker" => self.set_walker_mode(ctx, !self.walker_mode),
+                "pause" => trans = Trans::Push(Box::new(Pause)),
                 "toggle-sound" => {
                     let m = !ctx.audio.muted();
                     ctx.audio.set_muted(m);
@@ -469,13 +787,29 @@ impl Game for Tumble {
         if reset {
             self.reset(ctx);
         }
+        if toggle_walker {
+            self.set_walker_mode(ctx, !self.walker_mode);
+        }
 
-        // orbit camera
-        let target = self.player_pos(ctx) + Vec3::Y * 0.8;
-        let offset = Vec3::new(self.yaw.sin() * self.pitch.cos(), self.pitch.sin(), self.yaw.cos() * self.pitch.cos()) * self.distance;
-        if let Some(cam) = self.camera {
-            if let Ok(mut t) = ctx.world.get::<&mut Transform>(cam) {
-                *t = Transform::from_translation(target + offset).looking_at(target, Vec3::Y);
+        // walker animation follows the character state
+        if let (Some(w), Some(m)) = (self.walker, self.walker_model) {
+            let state = ctx.world.get::<&CharacterController>(w).map(|c| (c.grounded, c.velocity.with_y(0.0).length())).ok();
+            if let Some((grounded, speed)) = state {
+                let (clip, speed) = if !grounded {
+                    ("bounce", 1.0)
+                } else if speed > 0.3 {
+                    ("wave", 1.0 + speed * 0.25)
+                } else {
+                    ("idle", 1.0)
+                };
+                ctx.play_animation(m, clip, PlayOpts::looped().fade(0.2).speed(speed));
+            }
+        }
+        // campfire flicker
+        if let Some(l) = self.fire_light {
+            let t = ctx.time.sim_time as f32;
+            if let Ok(mut pl) = ctx.world.get::<&mut PointLight>(l) {
+                pl.intensity = 9.0 + 2.5 * (t * 13.0).sin() * (t * 7.3).cos() + 1.5 * (t * 23.0).sin();
             }
         }
 
@@ -483,7 +817,7 @@ impl Game for Tumble {
         ctx.ui.set(
             "score",
             &format!(
-                "<div class='panel score'>{}{} / {} <small>Kisten</small></div>",
+                "<div class='panel score'>{}{} / {} <small>crates</small></div>",
                 if done { "🏆 " } else { "" },
                 self.score,
                 self.total
@@ -491,13 +825,14 @@ impl Game for Tumble {
         );
         let (score, total, slowmo, shadows, muted) = (self.score, self.total, self.slowmo, ctx.renderer.settings.shadows, ctx.audio.muted());
         if let Some(p) = self.terminal.and_then(|t| ctx.panel_mut(t)) {
-            p.set_text("score", &format!("{score} / {total} Kisten von der Insel"));
+            p.set_text("score", &format!("{score} / {total} crates off the island"));
             p.set_value("progress", if total > 0 { score as f32 / total as f32 } else { 0.0 });
-            p.set_text("slowmo", if slowmo { "Zeitlupe: an" } else { "Zeitlupe: aus" });
-            p.set_text("shadows", if shadows { "Schatten: an" } else { "Schatten: aus" });
-            p.set_text("sound", if muted { "Ton: aus" } else { "Ton: an" });
+            p.set_text("slowmo", if slowmo { "Slow motion: on" } else { "Slow motion: off" });
+            p.set_text("shadows", if shadows { "Shadows: on" } else { "Shadows: off" });
+            p.set_text("sound", if muted { "Sound: off" } else { "Sound: on" });
         }
         ctx.ui.set("fps", &format!("<div class='panel fps'>{:.0} fps · {:.1} ms</div>", ctx.time.fps, ctx.time.frame_ms));
+        trans
     }
 
     fn debug_commands(&self) -> Vec<(&'static str, &'static str)> {
@@ -505,10 +840,11 @@ impl Game for Tumble {
             ("reset", "Rebuild the tower and respawn the player."),
             ("teleport", "Move the player. args: {pos: [x,y,z]}"),
             ("shoot_at", "Fire a shot from the camera towards a world point. args: {target: [x,y,z]}"),
+            ("control", "Switch control between the physics ball and the character-controller walker. args: {walker: bool, pos?: [x,y,z] (place the walker, capsule centre)}"),
         ]
     }
 
-    fn debug_command(&mut self, ctx: &mut Ctx, name: &str, args: &Value) -> Option<Result<Value, String>> {
+    fn debug_command(&mut self, ctx: &mut Ctx, _data: &mut Data, name: &str, args: &Value) -> Option<Result<Value, String>> {
         Some(match name {
             "reset" => {
                 self.reset(ctx);
@@ -540,12 +876,30 @@ impl Game for Tumble {
                 let e = self.shoot_from(ctx, origin, dir);
                 Ok(json!({"id": e.id()}))
             }
+            "control" => {
+                let on = args.get("walker").and_then(|v| v.as_bool()).unwrap_or(!self.walker_mode);
+                self.set_walker_mode(ctx, on);
+                if let (Some(w), Some(p)) = (self.walker, args.get("pos").and_then(|v| v.as_array())) {
+                    let f = |i: usize| p.get(i).and_then(|x| x.as_f64()).unwrap_or(0.0) as f32;
+                    if let Ok(mut t) = ctx.world.get::<&mut Transform>(w) {
+                        t.translation = Vec3::new(f(0), f(1), f(2));
+                    }
+                }
+                Ok(json!({"walker": self.walker_mode}))
+            }
             _ => return None,
         })
     }
 
-    fn debug_state(&self, ctx: &Ctx) -> Value {
+    fn debug_state(&self, ctx: &Ctx, data: &Data) -> Value {
         let p = self.player_pos(ctx);
+        let cam = self.camera.and_then(|c| ctx.world.get::<&ThirdPersonCamera>(c).ok().map(|c| json!({"yaw": c.yaw, "pitch": c.pitch, "distance": c.distance, "current_distance": c.current_distance})));
+        let walker = self.walker.and_then(|w| {
+            let t = ctx.world.get::<&Transform>(w).ok()?.translation;
+            let cc = ctx.world.get::<&CharacterController>(w).ok()?;
+            Some(json!({"pos": [t.x, t.y, t.z], "grounded": cc.grounded, "velocity": cc.velocity.to_array(), "jumps": cc.jumps, "sliding": cc.sliding}))
+        });
+        let anim = self.walker_model.and_then(|m| ctx.world.get::<&Animator>(m).ok().and_then(|a| a.current_name().map(|s| s.to_string())));
         json!({
             "score": self.score,
             "total": self.total,
@@ -557,9 +911,13 @@ impl Game for Tumble {
             "coyote": self.coyote,
             "slowmo": self.slowmo,
             "player_pos": [p.x, p.y, p.z],
-            "camera": {"yaw": self.yaw, "pitch": self.pitch, "distance": self.distance},
+            "camera": cam,
+            "control": if self.walker_mode { "walker" } else { "ball" },
+            "walker": walker,
+            "walker_animation": anim,
             "shots_alive": self.shots.len(),
             "targets_remaining": self.targets.iter().filter(|(_, c)| !c).map(|(e, _)| e.id()).collect::<Vec<_>>(),
+            "progress": data.progress,
         })
     }
 }

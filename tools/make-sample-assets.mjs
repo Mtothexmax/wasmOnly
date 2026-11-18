@@ -141,6 +141,90 @@ function cylinder(r0, r1, y0, y1, seg, jitter = 0) {
   g.write(path.join(OUT, 'crate.glb'));
 }
 
+// critter.glb — skinned body (3 joints) + head with 2 morph targets + 3 clips
+// (LINEAR rotations + morph weights, CUBICSPLINE translation, STEP scale). Tests engine::animation.
+{
+  const g = new Glb();
+  const data = (arr, type, comp = 5126, minmax = false) => {
+    const Typed = comp === 5123 ? Uint16Array : Float32Array;
+    const view = g.view(Buffer.from(new Typed(arr).buffer));
+    const n = { SCALAR: 1, VEC3: 3, VEC4: 4, MAT4: 16 }[type];
+    const a = { bufferView: view, componentType: comp, count: arr.length / n, type };
+    if (minmax) { a.min = [Math.min(...arr)]; a.max = [Math.max(...arr)]; }
+    g.accessors.push(a); return g.accessors.length - 1;
+  };
+  // body: smooth cylinder r 0.3, y 0..1.8, weights blend between joints at y = 0, 0.6, 1.2
+  const seg = 12, rings = 18, H = 1.8, pos = [], nrm = [], idx = [], jnt = [], wgt = [];
+  for (let r = 0; r <= rings; r++) {
+    const y = (r / rings) * H, t = Math.min(y / 0.6, 2.0), i = Math.min(Math.floor(t), 2), f = i === 2 ? 0 : t - i;
+    for (let s = 0; s <= seg; s++) {
+      const a = (s / seg) * Math.PI * 2; const rad = 0.3 * (1 - 0.25 * (y / H));
+      pos.push(Math.cos(a) * rad, y, Math.sin(a) * rad); nrm.push(Math.cos(a), 0, Math.sin(a));
+      jnt.push(i, Math.min(i + 1, 2), 0, 0); wgt.push(1 - f, f, 0, 0);
+    }
+  }
+  for (let r = 0; r < rings; r++) for (let s = 0; s < seg; s++) {
+    const a = r * (seg + 1) + s, b = a + 1, c = a + seg + 1, d = c + 1;
+    idx.push(a, c, b, b, c, d);
+  }
+  const body = { attributes: { POSITION: g.floats(pos, 'VEC3', 3, true), NORMAL: g.floats(nrm, 'VEC3', 3), JOINTS_0: data(jnt, 'VEC4', 5123), WEIGHTS_0: data(wgt, 'VEC4') }, indices: g.indices(idx), material: 0 };
+  // head: sphere r 0.35 + morph targets "squash" and "spikes"
+  const lat = 12, lon = 16, hp = [], hn = [], hi = [], sq = [], sp = [];
+  for (let i = 0; i <= lat; i++) for (let j = 0; j <= lon; j++) {
+    const t = (i / lat) * Math.PI, p = (j / lon) * Math.PI * 2;
+    const n = [Math.sin(t) * Math.cos(p), Math.cos(t), Math.sin(t) * Math.sin(p)];
+    hp.push(...n.map((x) => x * 0.35)); hn.push(...n);
+    sq.push(n[0] * 0.12, -n[1] * 0.16, n[2] * 0.12);
+    const spike = Math.max(0, Math.sin(t * 4) * Math.sin(p * 4)) * 0.18; sp.push(...n.map((x) => x * spike));
+  }
+  for (let i = 0; i < lat; i++) for (let j = 0; j < lon; j++) {
+    const a = i * (lon + 1) + j, b = a + 1, c = a + lon + 1, d = c + 1;
+    hi.push(a, b, c, b, d, c);
+  }
+  const head = { attributes: { POSITION: g.floats(hp, 'VEC3', 3, true), NORMAL: g.floats(hn, 'VEC3', 3) }, indices: g.indices(hi), material: 1,
+    targets: [{ POSITION: g.floats(sq, 'VEC3', 3, true) }, { POSITION: g.floats(sp, 'VEC3', 3, true) }] };
+  const ibm = data([...[1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1], ...[1,0,0,0, 0,1,0,0, 0,0,1,0, 0,-0.6,0,1], ...[1,0,0,0, 0,1,0,0, 0,0,1,0, 0,-1.2,0,1]], 'MAT4');
+  const qz = (a) => [0, 0, Math.sin(a / 2), Math.cos(a / 2)], qy = (a) => [0, Math.sin(a / 2), 0, Math.cos(a / 2)];
+  const anims = [];
+  const sampler = (times, values, type, interpolation = 'LINEAR') => ({ input: data(times, 'SCALAR', 5126, true), output: data(values, type), interpolation });
+  { // wave: spine + neck sway (LINEAR quaternions), head squash (LINEAR weights)
+    const T = [0, 0.5, 1, 1.5, 2];
+    const s = [sampler(T, [0, 0.35, 0, -0.35, 0].flatMap(qz), 'VEC4'), sampler(T, [0, 0.5, 0, -0.5, 0].flatMap(qz), 'VEC4'), sampler(T, [0, 0, 1, 0, 0, 0, 1, 0, 0, 0], 'SCALAR')];
+    anims.push({ name: 'wave', samplers: s, channels: [{ sampler: 0, target: { node: 2, path: 'rotation' } }, { sampler: 1, target: { node: 3, path: 'rotation' } }, { sampler: 2, target: { node: 5, path: 'weights' } }] });
+  }
+  { // bounce: hip jump (CUBICSPLINE: in-tangent, value, out-tangent), head squashes on landing (STEP scale)
+    const T = [0, 0.4, 0.8];
+    const tr = [0, 0, 0, 0, 0, 0, 0, 2.5, 0, /**/ 0, 0, 0, 0, 0.5, 0, 0, 0, 0, /**/ 0, -2.5, 0, 0, 0, 0, 0, 0, 0];
+    const s = [sampler(T, tr, 'VEC3', 'CUBICSPLINE'), sampler([0, 0.4, 0.7], [1.25, 0.8, 1.25, 1, 1, 1, 1.25, 0.8, 1.25], 'VEC3', 'STEP')];
+    anims.push({ name: 'bounce', samplers: s, channels: [{ sampler: 0, target: { node: 1, path: 'translation' } }, { sampler: 1, target: { node: 5, path: 'scale' } }] });
+  }
+  { // idle: slow turn + spikes pulse
+    const T = [0, 1.5, 3];
+    const s = [sampler(T, [0, 0.5, 0].flatMap(qy), 'VEC4'), sampler(T, [0, 0, 0, 0.8, 0, 0], 'SCALAR')];
+    anims.push({ name: 'idle', samplers: s, channels: [{ sampler: 0, target: { node: 1, path: 'rotation' } }, { sampler: 1, target: { node: 5, path: 'weights' } }] });
+  }
+  Object.assign(g.json, {
+    scene: 0, scenes: [{ nodes: [0] }],
+    nodes: [
+      { name: 'critter', children: [1, 4] },
+      { name: 'hip', children: [2] },
+      { name: 'spine', translation: [0, 0.6, 0], children: [3] },
+      { name: 'neck', translation: [0, 0.6, 0], children: [5] },
+      { name: 'body', mesh: 0, skin: 0 },
+      { name: 'head', translation: [0, 0.75, 0], mesh: 1 },
+    ],
+    meshes: [{ name: 'body', primitives: [body] }, { name: 'head', primitives: [head], weights: [0, 0], extras: { targetNames: ['squash', 'spikes'] } }],
+    skins: [{ name: 'spine', joints: [1, 2, 3], inverseBindMatrices: ibm, skeleton: 1 }],
+    animations: anims,
+    materials: [
+      { name: 'skin', pbrMetallicRoughness: { baseColorFactor: [0.2, 0.55, 0.65, 1], metallicFactor: 0, roughnessFactor: 0.6 } },
+      { name: 'glow', pbrMetallicRoughness: { baseColorFactor: [1, 0.55, 0.2, 1], metallicFactor: 0, roughnessFactor: 0.4 }, emissiveFactor: [1, 0.45, 0.12], extensions: { KHR_materials_emissive_strength: { emissiveStrength: 1.3 } } },
+    ],
+    extensionsUsed: ['KHR_materials_emissive_strength'],
+  });
+  g.write(path.join(OUT, 'critter.glb'));
+}
+
 // rock.obj (source asset for tools/asset-cook)
 {
   let seed = 3; const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;

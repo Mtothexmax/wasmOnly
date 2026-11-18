@@ -16,7 +16,9 @@ pub(crate) const SHADOW: usize = 1;
 pub(crate) const OPAQUE: usize = 2;
 pub(crate) const BLEND: usize = 3;
 pub(crate) const HIZ: usize = 4;
-const N: usize = 5;
+/// Bloom + composite (begin on the first post pass, end on the last).
+pub(crate) const POST: usize = 5;
+const N: usize = 6;
 
 #[derive(Clone, Copy, Debug, Default, Serialize)]
 pub struct GpuTimes {
@@ -25,6 +27,8 @@ pub struct GpuTimes {
     pub opaque: f32,
     pub blend: f32,
     pub hiz: f32,
+    /// Bloom + depth darkening + tonemap.
+    pub post: f32,
     /// Sum of the measured passes (ms).
     pub total: f32,
     /// Number of completed measurements so far.
@@ -71,6 +75,19 @@ impl GpuTiming {
         w.set_beginning_of_pass_write_index((slot * 2) as u32);
         w.set_end_of_pass_write_index((slot * 2 + 1) as u32);
         Some(w)
+    }
+
+    /// Split writes for a sequence of passes: (begin-only for the first, end-only for the last).
+    pub fn split_writes(&mut self, slot: usize) -> Option<(GpuRenderPassTimestampWrites, GpuRenderPassTimestampWrites)> {
+        if !self.active {
+            return None;
+        }
+        self.used[slot] = true;
+        let b = GpuRenderPassTimestampWrites::new(&self.qs);
+        b.set_beginning_of_pass_write_index((slot * 2) as u32);
+        let e = GpuRenderPassTimestampWrites::new(&self.qs);
+        e.set_end_of_pass_write_index((slot * 2 + 1) as u32);
+        Some((b, e))
     }
 
     pub fn compute_writes(&mut self, slot: usize) -> Option<GpuComputePassTimestampWrites> {
@@ -124,7 +141,8 @@ impl GpuTiming {
                     l.opaque = mix(l.opaque, ms[OPAQUE]);
                     l.blend = mix(l.blend, ms[BLEND]);
                     l.hiz = mix(l.hiz, ms[HIZ]);
-                    l.total = l.cull + l.shadow + l.opaque + l.blend + l.hiz;
+                    l.post = mix(l.post, ms[POST]);
+                    l.total = l.cull + l.shadow + l.opaque + l.blend + l.hiz + l.post;
                     l.samples += 1;
                 }
                 buf.unmap();

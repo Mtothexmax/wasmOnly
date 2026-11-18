@@ -67,7 +67,10 @@ pub struct AutoCheck {
 }
 
 impl AutoCheck {
-    pub(crate) fn tick(&mut self, world: &World, renderer: &Renderer, pending_models: usize, now: f64) {
+    /// Automatic check radius around the camera (m): big streamed worlds would take seconds.
+    pub const RADIUS: f32 = 80.0;
+
+    pub(crate) fn tick(&mut self, world: &World, renderer: &Renderer, pending_models: usize, now: f64, camera: Option<Vec3>) {
         if !cfg!(debug_assertions) {
             return;
         }
@@ -83,7 +86,7 @@ impl AutoCheck {
         }
         self.due_ms = None;
         self.runs += 1;
-        let r = find(world, renderer, 0.002, 0.002, 3, Mat4::IDENTITY, Vec2::ZERO);
+        let r = find_near(world, renderer, 0.002, 0.002, 3, Mat4::IDENTITY, Vec2::ZERO, camera.map(|c| (c, Self::RADIUS)));
         let pairs = r["pairs"].as_u64().unwrap_or(0) as u32;
         self.last_pairs = pairs;
         let report = if pairs == 0 {
@@ -107,6 +110,12 @@ impl AutoCheck {
 }
 
 pub fn find(world: &World, renderer: &Renderer, eps: f32, tolerance: f32, limit: usize, view_proj: Mat4, css: Vec2) -> Value {
+    find_near(world, renderer, eps, tolerance, limit, view_proj, css, None)
+}
+
+/// Like [`find`], limited to instances whose bounds touch the sphere `near` (centre, radius).
+#[allow(clippy::too_many_arguments)]
+pub fn find_near(world: &World, renderer: &Renderer, eps: f32, tolerance: f32, limit: usize, view_proj: Mat4, css: Vec2, near: Option<(Vec3, f32)>) -> Value {
     let mut owners: Vec<Entity> = vec![];
     let mut tris: Vec<Tri> = vec![];
     let mut skipped: HashMap<&'static str, u32> = HashMap::new();
@@ -121,6 +130,13 @@ pub fn find(world: &World, renderer: &Renderer, eps: f32, tolerance: f32, limit:
             continue;
         }
         let Some(mesh) = renderer.mesh(mr.mesh) else { continue };
+        if let Some((c, r)) = near {
+            let scale = g.0.x_axis.truncate().length().max(g.0.y_axis.truncate().length()).max(g.0.z_axis.truncate().length());
+            if g.0.transform_point3(mesh.bounds_center).distance(c) > r + mesh.bounds_radius * scale {
+                *skipped.entry("outside radius").or_default() += 1;
+                continue;
+            }
+        }
         let Some(cpu) = &mesh.cpu else {
             *skipped.entry("mesh too large for CPU copy").or_default() += 1;
             continue;

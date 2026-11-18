@@ -6,7 +6,9 @@ use crate::app::Ctx;
 use crate::mesh::{MeshData, Vertex};
 use crate::renderer::{AlphaMode, Lod, Material, MaterialId, MeshId, TextureId};
 use crate::scene::{MeshRenderer, Name, Parent, Transform};
-use glam::{Quat, Vec3, Vec4};
+use crate::animation::{AnimationClip, Animator, Channel, ChannelValues, DeformSource, Deformer, Interp};
+use glam::{Mat4, Quat, Vec3, Vec4};
+use std::sync::Arc;
 use hecs::Entity;
 use js_sys::{Array, Uint8Array};
 use std::collections::HashMap;
@@ -23,6 +25,9 @@ pub struct ModelTemplate {
     pub nodes: Vec<NodeTemplate>,
     pub roots: Vec<usize>,
     pub triangles: usize,
+    /// (joint node indices, inverse bind matrices)
+    pub skins: Vec<(Vec<usize>, Arc<Vec<Mat4>>)>,
+    pub clips: Arc<Vec<AnimationClip>>,
 }
 
 #[derive(Clone, Debug)]
@@ -31,6 +36,11 @@ pub struct NodeTemplate {
     pub transform: Transform,
     /// (mesh, material, automatic LOD chain for meshes >= AUTO_LOD_MIN_TRIANGLES)
     pub prims: Vec<(MeshId, MaterialId, Option<Lod>)>,
+    /// Per prim: CPU source when skinned or morphed (each instance gets its own GPU mesh).
+    pub deform: Vec<Option<Arc<DeformSource>>>,
+    pub skin: Option<usize>,
+    /// Default morph weights of the node's mesh.
+    pub morph_weights: Vec<f32>,
     pub children: Vec<usize>,
 }
 
@@ -44,11 +54,15 @@ pub struct ModelCache {
 
 /// CPU-side result of parsing (before GPU upload).
 struct Parsed {
-    meshes: Vec<Vec<(MeshData, Option<usize>)>>,
+    meshes: Vec<Vec<(MeshData, Option<usize>, Option<DeformSource>)>>,
+    mesh_weights: Vec<Vec<f32>>,
     materials: Vec<(Material, Option<usize>)>,
     images: Vec<Option<ImageBitmap>>,
-    nodes: Vec<(String, Transform, Option<usize>, Vec<usize>)>,
+    /// (name, transform, mesh, children, skin)
+    nodes: Vec<(String, Transform, Option<usize>, Vec<usize>, Option<usize>)>,
     roots: Vec<usize>,
+    skins: Vec<(Vec<usize>, Vec<Mat4>)>,
+    clips: Vec<AnimationClip>,
 }
 
 pub async fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
@@ -215,9 +229,71 @@ async fn parse(url: &str, bytes: Vec<u8>) -> Result<Parsed, String> {
             if normals.is_none() {
                 compute_normals(&mut md);
             }
-            prims.push((md, p.material().index()));
+            // skinning attributes + morph targets -> CPU deformation source
+            let joints: Option<Vec<[u16; 4]>> = reader.read_joints(0).map(|j| j.into_u16().collect());
+            let weights: Option<Vec<[f32; 4]>> = reader.read_weights(0).map(|w| w.into_f32().collect());
+            let targets: Vec<(Vec<[f32; 3]>, Vec<[f32; 3]>)> = reader
+                .read_morph_targets()
+                .map(|(pos, nor, _)| (pos.map(|i| i.collect()).unwrap_or_default(), nor.map(|i| i.collect()).unwrap_or_default()))
+                .collect();
+            let deform = (joints.is_some() && weights.is_some() || !targets.is_empty()).then(|| DeformSource {
+                base: md.vertices.clone(),
+                joints: joints.unwrap_or_default(),
+                weights: weights.unwrap_or_default(),
+                targets,
+            });
+            prims.push((md, p.material().index(), deform));
         }
         meshes.push(prims);
+    }
+    let mesh_weights: Vec<Vec<f32>> = doc.meshes().map(|m| m.weights().map(|w| w.to_vec()).unwrap_or_default()).collect();
+
+    let skins: Vec<(Vec<usize>, Vec<Mat4>)> = doc
+        .skins()
+        .map(|sk| {
+            let joints: Vec<usize> = sk.joints().map(|j| j.index()).collect();
+            let ibm: Vec<Mat4> = sk
+                .reader(|b| buffers.get(b.index()).map(|v| v.as_slice()))
+                .read_inverse_bind_matrices()
+                .map(|it| it.map(|m| Mat4::from_cols_array_2d(&m)).collect())
+                .unwrap_or_else(|| vec![Mat4::IDENTITY; joints.len()]);
+            (joints, ibm)
+        })
+        .collect();
+
+    let mut clips = vec![];
+    for (ai, anim) in doc.animations().enumerate() {
+        let mut channels = vec![];
+        let mut duration = 0.0f32;
+        for ch in anim.channels() {
+            let r = ch.reader(|b| buffers.get(b.index()).map(|v| v.as_slice()));
+            let (Some(inputs), Some(outputs)) = (r.read_inputs(), r.read_outputs()) else { continue };
+            let times: Vec<f32> = inputs.collect();
+            duration = duration.max(times.last().copied().unwrap_or(0.0));
+            use gltf::animation::util::ReadOutputs;
+            let values = match outputs {
+                ReadOutputs::Translations(t) => ChannelValues::Translation(t.map(Vec3::from).collect()),
+                ReadOutputs::Rotations(q) => ChannelValues::Rotation(q.into_f32().map(Quat::from_array).collect()),
+                ReadOutputs::Scales(s) => ChannelValues::Scale(s.map(Vec3::from).collect()),
+                ReadOutputs::MorphTargetWeights(w) => {
+                    let all: Vec<f32> = w.into_f32().collect();
+                    let keys = times.len().max(1) * if ch.sampler().interpolation() == gltf::animation::Interpolation::CubicSpline { 3 } else { 1 };
+                    let n = all.len() / keys;
+                    ChannelValues::Weights(all, n)
+                }
+            };
+            channels.push(Channel {
+                node: ch.target().node().index(),
+                interp: match ch.sampler().interpolation() {
+                    gltf::animation::Interpolation::Step => Interp::Step,
+                    gltf::animation::Interpolation::Linear => Interp::Linear,
+                    gltf::animation::Interpolation::CubicSpline => Interp::CubicSpline,
+                },
+                times,
+                values,
+            });
+        }
+        clips.push(AnimationClip { name: anim.name().map(|n| n.to_string()).unwrap_or_else(|| format!("clip{ai}")), duration, channels });
     }
 
     let nodes = doc
@@ -234,6 +310,7 @@ async fn parse(url: &str, bytes: Vec<u8>) -> Result<Parsed, String> {
                 tr,
                 n.mesh().map(|m| m.index()),
                 n.children().map(|c| c.index()).collect(),
+                n.skin().map(|s| s.index()),
             )
         })
         .collect();
@@ -244,10 +321,13 @@ async fn parse(url: &str, bytes: Vec<u8>) -> Result<Parsed, String> {
     let roots = scene.nodes().map(|n| n.index()).collect();
     Ok(Parsed {
         meshes,
+        mesh_weights,
         materials,
         images,
         nodes,
         roots,
+        skins,
+        clips,
     })
 }
 
@@ -293,22 +373,26 @@ fn upload(ctx: &mut Ctx, url: &str, p: Parsed) -> ModelTemplate {
         .collect();
     let default_mat = ctx.renderer.builtin.default_material;
     let mut triangles = 0;
+    let mut mesh_deform: Vec<Vec<Option<Arc<DeformSource>>>> = vec![];
     let mesh_prims: Vec<Vec<(MeshId, MaterialId, Option<Lod>)>> = p
         .meshes
-        .iter()
+        .into_iter()
         .enumerate()
         .map(|(mi, prims)| {
-            prims
-                .iter()
+            let mut deforms = vec![];
+            let out = prims
+                .into_iter()
                 .enumerate()
-                .map(|(pi, (md, mat))| {
+                .map(|(pi, (md, mat, deform))| {
                     triangles += md.indices.len() / 3;
                     let name = format!("{url}#mesh{mi}.{pi}");
-                    let (id, lod) = if md.indices.len() / 3 >= AUTO_LOD_MIN_TRIANGLES {
-                        let (id, lod) = ctx.renderer.add_mesh_with_lods(&name, md, &[0.5, 0.25]);
+                    let deformable = deform.is_some();
+                    deforms.push(deform.map(Arc::new));
+                    let (id, lod) = if !deformable && md.indices.len() / 3 >= AUTO_LOD_MIN_TRIANGLES {
+                        let (id, lod) = ctx.renderer.add_mesh_with_lods(&name, &md, &[0.5, 0.25]);
                         (id, (lod.meshes.len() > 1).then_some(lod))
                     } else {
-                        (ctx.renderer.add_mesh(&name, md), None)
+                        (ctx.renderer.add_mesh(&name, &md), None)
                     };
                     (
                         id,
@@ -317,59 +401,98 @@ fn upload(ctx: &mut Ctx, url: &str, p: Parsed) -> ModelTemplate {
                         lod,
                     )
                 })
-                .collect()
+                .collect();
+            mesh_deform.push(deforms);
+            out
         })
         .collect();
     let nodes = p
         .nodes
         .into_iter()
-        .map(|(name, transform, mesh, children)| NodeTemplate {
+        .map(|(name, transform, mesh, children, skin)| NodeTemplate {
             name,
             transform,
             prims: mesh.map(|m| mesh_prims[m].clone()).unwrap_or_default(),
+            deform: mesh.map(|m| mesh_deform[m].clone()).unwrap_or_default(),
+            skin,
+            morph_weights: mesh.and_then(|m| p.mesh_weights.get(m).cloned()).unwrap_or_default(),
             children,
         })
         .collect();
+    if !p.clips.is_empty() || !p.skins.is_empty() {
+        crate::log_info!("{url}: {} skins, {} clips {:?}", p.skins.len(), p.clips.len(), p.clips.iter().map(|c| c.name.as_str()).collect::<Vec<_>>());
+    }
     ModelTemplate {
         url: url.to_string(),
         nodes,
         roots: p.roots,
         triangles,
+        skins: p.skins.into_iter().map(|(j, m)| (j, Arc::new(m))).collect(),
+        clips: Arc::new(p.clips),
     }
 }
 
-/// Spawns the template's node tree as children of `root`.
+/// Spawns the template's node tree as children of `root`. Skinned / morphed primitives get their
+/// own GPU mesh and a [`Deformer`]; models with clips get an [`Animator`] on `root`.
 pub fn instantiate(ctx: &mut Ctx, root: Entity, model: &ModelTemplate) {
-    fn spawn_node(ctx: &mut Ctx, parent: Entity, model: &ModelTemplate, idx: usize) {
-        let n = &model.nodes[idx];
-        let e = ctx
-            .world
-            .spawn((n.transform, Name(n.name.clone()), Parent(parent)));
-        let attach = |ctx: &mut Ctx,
-                      target: Entity,
-                      (mesh, mat, lod): &(MeshId, MaterialId, Option<Lod>)| {
-            let _ = ctx.world.insert_one(target, MeshRenderer::new(*mesh, *mat));
-            if let Some(l) = lod {
-                let _ = ctx.world.insert_one(target, l.clone());
-            }
-        };
-        if n.prims.len() == 1 {
-            attach(ctx, e, &n.prims[0]);
-        } else {
-            for p in &n.prims {
-                let child = ctx.world.spawn((Transform::default(), Parent(e)));
-                attach(ctx, child, p);
-            }
-        }
-        for &c in &n.children {
-            spawn_node(ctx, e, model, c);
-        }
-    }
     if !ctx.world.contains(root) {
         return; // despawned while loading
     }
-    for &r in &model.roots {
-        spawn_node(ctx, root, model, r);
+    let layer = ctx.world.get::<&crate::scene::RenderLayer>(root).map(|l| l.0).unwrap_or(0);
+    let n_nodes = model.nodes.len();
+    let mut node_entity: Vec<Option<Entity>> = vec![None; n_nodes];
+    let mut node_prims: Vec<Vec<Entity>> = vec![vec![]; n_nodes];
+    // spawn the hierarchy
+    let mut stack: Vec<(usize, Entity)> = model.roots.iter().rev().map(|&r| (r, root)).collect();
+    while let Some((idx, parent)) = stack.pop() {
+        let n = &model.nodes[idx];
+        let e = ctx.world.spawn((n.transform, Name(n.name.clone()), Parent(parent)));
+        node_entity[idx] = Some(e);
+        for (k, (mesh, mat, lod)) in n.prims.iter().enumerate() {
+            let target = if n.prims.len() == 1 { e } else { ctx.world.spawn((Transform::default(), Parent(e))) };
+            let deform = n.deform.get(k).cloned().flatten();
+            let mesh = match &deform {
+                // own copy: every instance deforms differently
+                Some(src) => {
+                    let md = MeshData { vertices: src.base.clone(), indices: ctx.renderer.mesh_indices(*mesh).unwrap_or_default() };
+                    ctx.renderer.add_mesh(&format!("{}#deform", ctx.renderer.mesh(*mesh).map(|m| m.name.clone()).unwrap_or_default()), &md)
+                }
+                None => *mesh,
+            };
+            let mut mr = MeshRenderer::new(mesh, *mat);
+            mr.layer = layer;
+            let _ = ctx.world.insert_one(target, mr);
+            if let (Some(l), None) = (lod, &deform) {
+                let _ = ctx.world.insert_one(target, l.clone());
+            }
+            if let Some(src) = deform {
+                let weights = if n.morph_weights.len() == src.targets.len() { n.morph_weights.clone() } else { vec![0.0; src.targets.len()] };
+                // skin joints are resolved after the whole tree exists
+                let _ = ctx.world.insert_one(target, Deformer::new(src, None, weights, mesh));
+                node_prims[idx].push(target);
+            }
+        }
+        for &c in n.children.iter().rev() {
+            stack.push((c, e));
+        }
+    }
+    // resolve skins
+    for (idx, n) in model.nodes.iter().enumerate() {
+        let Some(si) = n.skin else { continue };
+        let Some((joints, ibm)) = model.skins.get(si) else { continue };
+        let js: Vec<Entity> = joints.iter().filter_map(|&j| node_entity.get(j).copied().flatten()).collect();
+        for &pe in &node_prims[idx] {
+            if let Ok(mut d) = ctx.world.get::<&mut Deformer>(pe) {
+                if !d.src.joints.is_empty() {
+                    d.skin = Some((js.clone(), ibm.clone()));
+                }
+            }
+        }
+    }
+    if !model.clips.is_empty() {
+        let nodes: Vec<Entity> = node_entity.iter().map(|e| e.unwrap_or(root)).collect();
+        let rest: Vec<Transform> = model.nodes.iter().map(|n| n.transform).collect();
+        let _ = ctx.world.insert_one(root, Animator::new(model.clips.clone(), nodes, node_prims, rest));
     }
 }
 

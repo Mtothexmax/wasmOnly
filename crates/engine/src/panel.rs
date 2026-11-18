@@ -409,6 +409,7 @@ impl Panels {
             .slots
             .iter()
             .enumerate()
+            .filter(|(_, s)| world.contains(s.entity)) // panels of unloaded scenes
             .map(|(i, s)| {
                 let g = world
                     .get::<&GlobalTransform>(s.entity)

@@ -159,6 +159,118 @@ procedural-assets skill.
 Use `engine::jobs::par_map(&items, |x| ...)` / `par_for_each_mut`. Serial on the stable build, parallel
 on Web Workers with `--threads`, identical results. Never use rayon or std threads directly.
 
+## Screens and scenes
+
+A game can be a `ScreenStack<D>` of `Screen<D>` (D = data shared by all screens): see `crates/engine/src/screens.rs`
+and the demo (`Title`, `PlayScreen`, `Pause`). `update` returns `Trans::{None, Push, Pop, Switch, Reset}`.
+Everything a screen spawns (entities, bodies, static colliders, particles, glTF nodes that load later) belongs
+to its scene and is unloaded when it exits; overlays (`Push`) pause the simulation below (`pauses_below`).
+Clear your HUD slots in `exit`. GPU resources (textures, materials, meshes) are not freed — create them once
+(e.g. in `D`). Without screens: `ctx.begin_scene("level1")` ... `ctx.unload_scene("level1")`.
+`ctx.assets_pending()` = glTF loads in flight (loading screens). Register screens (`.register("play", ...)`)
+so agents can jump: `screens {switch: "play"}`.
+
+## Save games
+
+`ctx.save.set_namespace("mygame", VERSION)` once; `ctx.save.write("slot", &serializable)?`,
+`ctx.save.read::<T>("slot")` (None if empty or the format changed — log tells which), `read_entry` for
+version-based migration, `list()`, `delete`. Large binary data: `engine::save::put_blob/get_blob` (IndexedDB, async)
+or `ctx.save.put_blob_bg(key, bytes)`. Inspect: `call save`.
+
+## Character controller and third-person camera
+
+`let hero = ctx.spawn_character("hero", feet_pos, CharacterController { speed: 4.5, ..Default::default() })`
+(capsule, kinematic body). In `fixed_update`: `cc.drive(ctx.input.move_axis(), camera_yaw)`, `cc.run`, `cc.jump`
+(held is fine). Read `cc.grounded`, `cc.velocity`, `cc.sliding`, `cc.collisions`. Tuning: `max_slope_deg`,
+`step_height`, `snap_to_ground`, `air_control`, `coyote_time`, `jump_buffer`, `push_mass` (pushes dynamic bodies).
+Camera: `ThirdPersonCamera::following(hero)` on the camera entity (right-drag / pointer lock / touch / gamepad
+look, wheel + pinch zoom, sphere cast against walls). Use its `yaw` for camera-relative input.
+Attach a visual model as a child: `load_gltf(..)` + `Parent(hero)`, offset by `-cc.foot_offset()`.
+
+## Animation (glTF skinning, clips, morph targets)
+
+`load_gltf` of a model with skins/animations adds an `Animator` to the root (once loaded) and a `Deformer` to
+skinned/morphed meshes. `ctx.play_animation(root, "walk", PlayOpts::looped().fade(0.2).speed(1.2))` — calling it
+every frame with the same clip is free (only speed updates). `PlayOpts::once()` + `animator.finished()`.
+`ctx.set_morph_weight(e, index, w)` for manual morphs. CPU skinning: fine for tens of characters.
+Test asset: `assets/critter.glb` (clips `wave`, `bounce`, `idle`; morphs `squash`, `spikes`).
+
+## Particles
+
+`ctx.spawn_particles(name, pos, ParticleEmitter::preset(ParticlePreset::Fire))` — presets fire, smoke, sparks,
+fireflies, dust, magic, rain, splash. One-shot bursts: `.burst(n)` (entity despawns itself when done).
+Additive + HDR colours (> 1) glow via bloom; alpha particles are sorted back to front. Parent the emitter to
+make it follow an entity. Simulated in the fixed step (deterministic with `step`).
+
+## Atmosphere, bloom, glow
+
+`ctx.renderer.settings`: `sky`, `sky_zenith`, `sky_horizon`, `sun_size_deg`, `fog_density`, `fog_height_falloff`,
+`fog_start`, `fog_max`, `fog_color`, `exposure`, `bloom`, `bloom_intensity`, `bloom_threshold`,
+`depth_darkening` (crease darkening from the depth buffer), `vignette`, `saturation`. Glowing things
+(plants, lamps): `Material { emissive: Vec3::new(0.3, 2.4, 1.7), .. }` — values above ~1.2 bloom.
+
+## Render to texture (card portraits, mirrors, minimaps)
+
+```rust
+let (rt, tex) = ctx.create_render_texture(304, 380, RenderTextureOpts::portrait()); // once, transparent bg
+ctx.set_layer(subject, 1);                                  // subject only on layer 1 (also glTF nodes loaded later)
+let cam = ctx.world.spawn((Transform::from_xyz(..).looking_at(..), Camera { layers: 1 << 1, ..Default::default() }));
+ctx.set_render_texture_camera(rt, cam);                     // main camera: Camera { layers: !(1 << 1), .. }
+// 3D: Material { texture: tex, .. }   DOM: ctx.export_render_texture(rt); then renderer.render_texture_url(rt)
+```
+`portrait()` renders once (`ctx.refresh_render_texture(rt)` to redo, e.g. after the model loaded);
+`RenderTextureOpts::live()` renders every frame. Inspect: `call render_texture`.
+
+## Open world: terrain, streaming, floating origin
+
+```rust
+let mut t = Terrain::noise(TerrainDesc { size: 1024.0, res: 513, ..Default::default() }, NoiseParams { seed: 9, amplitude: 70.0, island: 0.25, ..Default::default() });
+t.flatten(Vec2::ZERO, 110.0, 8.0, 40.0);                 // plots, plazas
+t.flatten_path(&road_points, 9.0, 6.0);                  // roads follow the smoothed terrain
+t.auto_splat(&SplatRules::default());                    // 0 grass, 1 rock (steep), 2 sand (low), 3 snow/dirt (high)
+t.paint(3, p, 4.5, 1.0, 1.5);                            // paint a layer (roads)
+t.scatter.push(ScatterRule { mesh, material, density: 0.5, layer: Some(0), jitter: 0.5, collider_radius: 0.35, ..Default::default() });
+ctx.set_terrain(t, [TexPreset::Grass, TexPreset::Stone, TexPreset::Sand, TexPreset::Dirt]);
+let h = ctx.terrain_height(x, z);                        // absolute XZ
+```
+Chunks stream around the camera (`stream_radius`), each with 4 LODs, skirts and a heightfield collider; edits
+rebuild touched chunks. Scatter rules with the same `seed` place multi-part props (trunk + leaves) at the same spots;
+`jitter < 1` keeps a minimum spacing. GPU grass appears automatically on splat layer `renderer.grass_settings().layer`.
+`ctx.remove_terrain()` when leaving.
+
+Streaming other content: `ctx.add_stream_layer("props", 96.0, 420.0, |ctx, cell| { ... })` — the closure builds
+one cell (`cell.min` = absolute corner, `cell.seed(salt)` for deterministic content); everything it spawns is unloaded
+with the cell (each cell is a scene). Call `ctx.batch_static(root, 48.0)` at the end for static props.
+
+**Positions**: render/physics positions are f32 *local*; `ctx.origin` (f64) is where local (0,0,0) is. Convert with
+`ctx.local(DVec3)` / `ctx.to_absolute(Vec3)`. The origin shifts automatically (`ctx.streaming.origin_shift_distance`,
+default 1500 m). Keep absolute positions (spawn points, waypoints, saved positions) in `DVec3`.
+
+## Lights at scale, shadows
+
+Hundreds of `PointLight`s and `SpotLight`s (direction = entity -Z, `Transform::looking_at`) are fine (clustered).
+Sun shadows: `settings.shadow_distance` (default 160 m) split into `shadow_cascades` (1–4). Check with
+`render {debug_view: 3}` (cascades) and `4` (lights per cluster).
+
+## Procedural content (generators)
+
+The engine has a geometry kit, not content: write generators in the game and register them.
+```rust
+ctx.generators.register("fence", "{length}", |p, seed| {
+    let mut b = MeshBuilder::new().uv_world(1.0);
+    b.part("wood").block(Vec3::ZERO, Vec3::new(0.12, 1.1, 0.12));          // parts = materials
+    b.part("wall").wall(6.0, 3.0, 0.25, &[Opening::door(1.0, 1.0, 2.1)]); // openings with reveals
+    b.part("rail").sweep(&path, &geom::circle(0.04, 6), true);             // also extrude, lathe, polygon, cuboid
+    b.finish()
+});
+ctx.generators.materials.insert("wood".into(), wood_material);
+ctx.spawn_generated("fence", &json!({"length": 8}), seed, transform)?;       // cached per params+seed -> instanced
+let meshes = ctx.generated_meshes("pine", &json!({}), 1)?;                   // for scatter rules / your own spawns
+let many = ctx.generate_many("house", &jobs)?;                               // parallel (job system), not spawned
+```
+Iterate live without rebuilding the game: `call generate {name, params, seed, pos, regenerate: true}`.
+Moving parts: `Motion::spin(axis, rad/s)`, `sway`, `bob` on any entity (a child spinning backwards stays upright).
+
 ## Rules
 
 - Only `.glb` at runtime. Other formats: cook them (cook-assets skill).

@@ -35,6 +35,17 @@ pub struct Input {
     released: HashSet<String>,
     pub buttons: HashSet<MouseButton>,
     buttons_pressed: HashSet<MouseButton>,
+    /// Presses since the last fixed step: `key_pressed` inside `fixed_update` reads these, so a tap
+    /// that starts and ends between two fixed steps (short tap, paused simulation, high-refresh
+    /// display) is still seen exactly once by the simulation.
+    #[serde(skip)]
+    fixed_pressed: HashSet<String>,
+    #[serde(skip)]
+    fixed_released: HashSet<String>,
+    #[serde(skip)]
+    fixed_buttons_pressed: HashSet<MouseButton>,
+    #[serde(skip)]
+    in_fixed: bool,
     /// Pointer position in CSS pixels relative to the canvas.
     pub pointer: Vec2,
     /// Accumulated movement since the last frame (CSS pixels; uses movementX/Y, works under pointer lock).
@@ -55,18 +66,34 @@ impl Input {
     pub fn key(&self, code: &str) -> bool {
         self.keys.contains(code)
     }
-    /// True only in the frame the key went down.
+    /// The key went down — in `update`: during this frame; in `fixed_update`: since the previous
+    /// fixed step. Works in both places; a press is never lost or seen twice by the same callback.
     pub fn key_pressed(&self, code: &str) -> bool {
-        self.pressed.contains(code)
+        if self.in_fixed { self.fixed_pressed.contains(code) } else { self.pressed.contains(code) }
     }
     pub fn key_released(&self, code: &str) -> bool {
-        self.released.contains(code)
+        if self.in_fixed { self.fixed_released.contains(code) } else { self.released.contains(code) }
+    }
+    /// Held now, or pressed since the last fixed step (in `fixed_update`): use for actions like
+    /// jump/fire so taps shorter than a step still count.
+    pub fn key_down_or_pressed(&self, code: &str) -> bool {
+        self.key(code) || self.key_pressed(code)
     }
     pub fn button(&self, b: MouseButton) -> bool {
         self.buttons.contains(&b)
     }
     pub fn button_pressed(&self, b: MouseButton) -> bool {
-        self.buttons_pressed.contains(&b)
+        if self.in_fixed { self.fixed_buttons_pressed.contains(&b) } else { self.buttons_pressed.contains(&b) }
+    }
+    pub(crate) fn begin_fixed(&mut self) {
+        self.in_fixed = true;
+    }
+    /// After each fixed step: the step has seen these edges.
+    pub(crate) fn end_fixed(&mut self) {
+        self.in_fixed = false;
+        self.fixed_pressed.clear();
+        self.fixed_released.clear();
+        self.fixed_buttons_pressed.clear();
     }
     /// WASD/arrow keys + gamepad left stick + touch joystick as a vector (x = right, y = forward).
     pub fn move_axis(&self) -> Vec2 {
@@ -95,16 +122,19 @@ impl Input {
     pub fn key_down(&mut self, code: &str) {
         if self.keys.insert(code.to_string()) {
             self.pressed.insert(code.to_string());
+            self.fixed_pressed.insert(code.to_string());
         }
     }
     pub fn key_up(&mut self, code: &str) {
         if self.keys.remove(code) {
             self.released.insert(code.to_string());
+            self.fixed_released.insert(code.to_string());
         }
     }
     pub fn button_down(&mut self, b: MouseButton) {
         if self.buttons.insert(b) {
             self.buttons_pressed.insert(b);
+            self.fixed_buttons_pressed.insert(b);
         }
     }
     pub fn button_up(&mut self, b: MouseButton) {
@@ -125,6 +155,7 @@ impl Input {
     }
     pub(crate) fn release_all(&mut self) {
         let keys: Vec<String> = self.keys.drain().collect();
+        self.fixed_released.extend(keys.iter().cloned());
         self.released.extend(keys);
         self.buttons.clear();
         self.touch.release_all();

@@ -1,10 +1,11 @@
-//! The one renderer: forward PBR over WebGPU (via `web-sys`), 4x MSAA, one shadowed directional
-//! light (3x3 PCF), up to 16 point lights, frustum culling, instanced draws sorted by texture+mesh.
+//! The one renderer: forward PBR over WebGPU (via `web-sys`) into an HDR target, 4x MSAA, sun with
+//! cascaded shadow maps, clustered point + spot lights, GPU/CPU culling, instanced draws sorted by
+//! texture+mesh, terrain + GPU grass, views (canvas and render textures), post-processing.
 
 #![allow(deprecated)] // glam 0.33 deprecates Mat4::perspective_rh etc. in favour of glam::camera
 
 use crate::mesh::{MeshData, Vertex};
-use crate::scene::{Camera, GlobalTransform, MeshRenderer, PointLight};
+use crate::scene::{Camera, GlobalTransform, MeshRenderer};
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3, Vec4};
 use hecs::World;
@@ -16,7 +17,10 @@ use web_sys::*;
 const SAMPLES: u32 = 4;
 const DEPTH_FORMAT: GpuTextureFormat = GpuTextureFormat::Depth24plus;
 const SHADOW_FORMAT: GpuTextureFormat = GpuTextureFormat::Depth32float;
-const MAX_POINT_LIGHTS: usize = 16;
+/// Shadow cascades (layers of the shadow map array).
+const MAX_CASCADES: usize = 4;
+/// Uniform slot stride for per-cascade matrices (minUniformBufferOffsetAlignment).
+const CASCADE_SLOT: u32 = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 pub struct MeshId(pub u32);
@@ -59,6 +63,13 @@ pub struct Material {
     /// Water: wave height (world units) and wave frequency scale.
     pub wave_height: f32,
     pub wave_scale: f32,
+    /// Terrain splat shading: `texture` = 2x2 layer atlas, `normal_texture` = splat map (RGBA
+    /// weights), UVs from world XZ. Set up by `Ctx::set_terrain`.
+    pub terrain: bool,
+    /// Terrain: (local corner x, local corner z, 1 / size, unused) — updated by the engine.
+    pub terrain_params: [f32; 4],
+    /// Terrain: metres per texture tile for each layer.
+    pub terrain_tiling: [f32; 4],
 }
 
 /// Transparency of a material (glTF semantics).
@@ -97,6 +108,9 @@ impl Default for Material {
             water: false,
             wave_height: 0.0,
             wave_scale: 1.0,
+            terrain: false,
+            terrain_params: [0.0, 0.0, 1.0, 0.0],
+            terrain_tiling: [6.0; 4],
         }
     }
 }
@@ -185,7 +199,7 @@ pub fn srgb_hex(hex: u32) -> Vec4 {
     Vec4::new(lin(c(16)), lin(c(8)), lin(c(0)), 1.0)
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, serde::Deserialize)]
 pub struct RenderSettings {
     /// Direction the sunlight travels (normalised on use).
     pub sun_dir: Vec3,
@@ -196,8 +210,14 @@ pub struct RenderSettings {
     /// Linear clear color.
     pub clear_color: Vec3,
     pub shadows: bool,
-    /// Half-size (world units) of the area covered by the shadow map, centred in front of the camera.
-    pub shadow_extent: f32,
+    /// Sun shadows reach this far from the camera (m), split into `shadow_cascades` cascades.
+    pub shadow_distance: f32,
+    /// 1..4 cascaded shadow maps (2048² each).
+    pub shadow_cascades: u32,
+    /// Split distribution: 0 = linear, 1 = logarithmic.
+    pub shadow_split_lambda: f32,
+    /// Light clusters cover depths up to this distance (lights beyond use the last slice).
+    pub light_cluster_far: f32,
     /// Cull on the GPU (compute) and draw with drawIndexedIndirect (needs indirect-first-instance).
     pub gpu_culling: bool,
     /// Hi-Z occlusion culling inside the GPU culling pass (previous frame's depth).
@@ -212,8 +232,55 @@ pub struct RenderSettings {
     pub depth_jitter: f32,
     /// Draw opaque instances in reverse order (flicker scan: exact depth ties change their winner).
     pub reverse_draw_order: bool,
-    /// 0 = lit, 1 = normals, 2 = shadow term.
+    /// 0 = lit, 1 = normals, 2 = shadow term, 3 = shadow cascade, 4 = lights per cluster (heatmap).
     pub debug_view: u32,
+    // ---- atmosphere ----
+    /// Draw the gradient sky (otherwise `clear_color`).
+    pub sky: bool,
+    pub sky_zenith: Vec3,
+    pub sky_horizon: Vec3,
+    /// Angular radius of the sun disk (degrees, 0 = none).
+    pub sun_size_deg: f32,
+    /// Exponential fog density per metre (0 = off).
+    pub fog_density: f32,
+    /// Height fog: density falls off with exp(-falloff * height). 0 = uniform fog.
+    pub fog_height_falloff: f32,
+    /// No fog closer than this (m).
+    pub fog_start: f32,
+    /// Maximum fog opacity (keeps far objects faintly visible).
+    pub fog_max: f32,
+    /// Fixed fog colour; None = the sky colour towards the horizon (fog blends into the sky).
+    pub fog_color: Option<Vec3>,
+    // ---- post-processing ----
+    pub exposure: f32,
+    pub bloom: bool,
+    pub bloom_intensity: f32,
+    /// HDR brightness above which pixels bloom (soft knee below).
+    pub bloom_threshold: f32,
+    pub bloom_knee: f32,
+    /// Weight of the coarse bloom levels (wider glow).
+    pub bloom_radius: f32,
+    /// Depth darkening (unsharp-masked depth buffer): darkens creases and contact areas. 0 = off.
+    pub depth_darkening: f32,
+    /// Sample radius in pixels per 1000 px of screen height at 1 m distance.
+    pub depth_darkening_radius: f32,
+    /// Depth differences beyond this (m) are silhouettes, not creases.
+    pub depth_darkening_range: f32,
+    pub vignette: f32,
+    pub saturation: f32,
+    /// Draw particle systems.
+    pub particles: bool,
+    /// Draw GPU grass (needs a terrain; tune with the `grass` command / `renderer.grass_settings()`).
+    pub grass: bool,
+    // ---- resolution ----
+    /// Scene resolution relative to the canvas (0.4..1). The composite pass upscales; the HUD stays sharp.
+    pub render_scale: f32,
+    /// Adjust `render_scale` automatically to stay inside `frame_budget_ms` of GPU time.
+    pub auto_resolution: bool,
+    /// GPU milliseconds per frame the adaptive resolution aims to stay under (60 Hz = 16.7 ms incl. CPU).
+    pub frame_budget_ms: f32,
+    /// Lowest scale the adaptive resolution may pick.
+    pub min_render_scale: f32,
 }
 
 impl Default for RenderSettings {
@@ -226,7 +293,10 @@ impl Default for RenderSettings {
             ground_color: Vec3::new(0.12, 0.10, 0.09),
             clear_color: Vec3::new(0.30, 0.42, 0.60),
             shadows: true,
-            shadow_extent: 30.0,
+            shadow_distance: 160.0,
+            shadow_cascades: 4,
+            shadow_split_lambda: 0.8,
+            light_cluster_far: 400.0,
             gpu_culling: true,
             occlusion_culling: true,
             camera_jitter: Vec3::ZERO,
@@ -234,6 +304,32 @@ impl Default for RenderSettings {
             depth_jitter: 0.0,
             reverse_draw_order: false,
             debug_view: 0,
+            sky: true,
+            sky_zenith: Vec3::new(0.16, 0.30, 0.62),
+            sky_horizon: Vec3::new(0.60, 0.72, 0.86),
+            sun_size_deg: 1.2,
+            fog_density: 0.012,
+            fog_height_falloff: 0.08,
+            fog_start: 15.0,
+            fog_max: 0.9,
+            fog_color: None,
+            exposure: 1.0,
+            bloom: true,
+            bloom_intensity: 0.35,
+            bloom_threshold: 1.2,
+            bloom_knee: 0.6,
+            bloom_radius: 0.8,
+            depth_darkening: 1.0,
+            depth_darkening_radius: 30.0,
+            depth_darkening_range: 1.5,
+            vignette: 0.15,
+            saturation: 1.05,
+            particles: true,
+            grass: true,
+            render_scale: 1.0,
+            auto_resolution: true,
+            frame_budget_ms: 11.0,
+            min_render_scale: 0.5,
         }
     }
 }
@@ -260,6 +356,17 @@ pub struct FrameStats {
     pub gpu_visible: u32,
     pub width: u32,
     pub height: u32,
+    /// Canvas size; `width`/`height` are the (possibly scaled) scene resolution.
+    pub canvas: [u32; 2],
+    pub render_scale: f32,
+    /// Live particles drawn this frame.
+    pub particles: u32,
+    /// Grass blade instances drawn (upper bound; the vertex shader drops empty cells).
+    pub grass_blades: u32,
+    /// Clustered lighting (total lights, visible, max per cluster, index count, CPU ms).
+    pub lights: crate::lights::LightStats,
+    /// Far distance of each shadow cascade (m).
+    pub cascades: Vec<f32>,
 }
 
 #[derive(Clone, Debug)]
@@ -276,24 +383,28 @@ pub struct Builtins {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct GpuPointLight {
-    pos_range: [f32; 4],
-    color_intensity: [f32; 4],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
 struct Globals {
     view_proj: [[f32; 4]; 4],
-    light_view_proj: [[f32; 4]; 4],
+    cascades: [[[f32; 4]; 4]; MAX_CASCADES],
     camera_pos: [f32; 4],
     sun_dir: [f32; 4],
     sun_color: [f32; 4],
     sky_color: [f32; 4],
     ground_color: [f32; 4],
     counts: [u32; 4],
-    point_lights: [GpuPointLight; MAX_POINT_LIGHTS],
     time: [f32; 4],
+    inv_view_proj: [[f32; 4]; 4],
+    fog: [f32; 4],
+    fog_color: [f32; 4],
+    sky_zenith: [f32; 4],
+    sky_horizon: [f32; 4],
+    cam_right: [f32; 4],
+    cam_up: [f32; 4],
+    view: [[f32; 4]; 4],
+    cascade_splits: [f32; 4],
+    cascade_texel: [f32; 4],
+    cluster: [f32; 4],
+    screen: [f32; 4],
 }
 
 #[repr(C)]
@@ -359,13 +470,14 @@ pub struct GpuMesh {
     /// CPU copy (positions, indices) for analysis tools such as the z-fighting check; kept for
     /// meshes up to 60k indices.
     pub cpu: Option<std::rc::Rc<CpuMesh>>,
+    /// Full CPU copy (positions, normals, UVs) for static batching; same size limit as `cpu`.
+    pub data: Option<std::rc::Rc<MeshData>>,
 }
 
 pub struct Renderer {
     pub device: GpuDevice,
     pub queue: GpuQueue,
     context: GpuCanvasContext,
-    format: GpuTextureFormat,
     /// [opaque, opaque 2-sided, alpha-test, alpha-test 2-sided, blended, blended 2-sided].
     /// Opaque pipelines are compiled without `discard` (early-Z).
     pipelines: [GpuRenderPipeline; 6],
@@ -389,15 +501,34 @@ pub struct Renderer {
     pub gpu_culling_supported: bool,
     instance_cap: u32,
     bind0: GpuBindGroup,
-    bind0_shadow: GpuBindGroup,
+    /// One shadow bind group per cascade (its light matrix at a different uniform offset).
+    bind0_shadow: Vec<GpuBindGroup>,
+    /// Shadow map array (sampling view) + one attachment view per cascade layer.
     shadow_view: GpuTextureView,
+    shadow_layers: Vec<GpuTextureView>,
     shadow_size: u32,
+    cascade_buf: GpuBuffer,
+    /// Clustered lighting buffers (lights, cluster grid, light index list).
+    light_bufs: LightBufs,
     shadow_sampler: GpuSampler,
     color_sampler: GpuSampler,
     msaa_view: Option<GpuTextureView>,
     depth_view: Option<GpuTextureView>,
+    /// Post-processing, sky and particle pipelines.
+    pub(crate) post: crate::post::Post,
+    /// GPU grass on the terrain (settings: `renderer.grass.settings`).
+    pub(crate) grass: crate::vegetation::GrassRenderer,
+    /// HDR/bloom targets of the canvas.
+    targets: Option<crate::post::PostTargets>,
+    /// Render textures (rendered before the main view each frame they are due).
+    pub(crate) rtts: Vec<crate::render_texture::RenderTexture>,
+    /// Scene render size (canvas size x render_scale).
     size: (u32, u32),
+    canvas_size: (u32, u32),
+    adapt: (f32, f32, u32),
     meshes: Vec<GpuMesh>,
+    /// Slots of removed meshes, reused by `add_mesh` (streaming frees and re-creates chunks).
+    free_meshes: Vec<u32>,
     materials: Vec<Material>,
     /// Index 0 = 1x1 white default texture.
     tex_views: Vec<GpuTextureView>,
@@ -493,6 +624,7 @@ impl Renderer {
         let shadow_tex_entry = GpuBindGroupLayoutEntry::new(2, gpu_shader_stage::FRAGMENT);
         let t = GpuTextureBindingLayout::new();
         t.set_sample_type(GpuTextureSampleType::Depth);
+        t.set_view_dimension(GpuTextureViewDimension::N2dArray);
         shadow_tex_entry.set_texture(&t);
         let shadow_samp_entry = GpuBindGroupLayoutEntry::new(3, gpu_shader_stage::FRAGMENT);
         let s = GpuSamplerBindingLayout::new();
@@ -506,12 +638,16 @@ impl Renderer {
                 storage_entry(4, gpu_shader_stage::VERTEX),
                 shadow_tex_entry,
                 shadow_samp_entry,
+                storage_entry(6, gpu_shader_stage::FRAGMENT),
+                storage_entry(7, gpu_shader_stage::FRAGMENT),
+                storage_entry(8, gpu_shader_stage::FRAGMENT),
             ]))
             .map_err(js_err)?;
         let bgl0_shadow = device
             .create_bind_group_layout(&GpuBindGroupLayoutDescriptor::new(&[
                 uniform_entry(0, gpu_shader_stage::VERTEX),
                 storage_entry(1, gpu_shader_stage::VERTEX),
+                uniform_entry(2, gpu_shader_stage::VERTEX),
             ]))
             .map_err(js_err)?;
         let tex_entry = GpuBindGroupLayoutEntry::new(0, gpu_shader_stage::FRAGMENT);
@@ -552,6 +688,7 @@ impl Renderer {
         let st2 = GpuBindGroupLayoutEntry::new(2, gpu_shader_stage::FRAGMENT);
         let t2 = GpuTextureBindingLayout::new();
         t2.set_sample_type(GpuTextureSampleType::Depth);
+        t2.set_view_dimension(GpuTextureViewDimension::N2dArray);
         st2.set_texture(&t2);
         let ss2 = GpuBindGroupLayoutEntry::new(3, gpu_shader_stage::FRAGMENT);
         let s2 = GpuSamplerBindingLayout::new();
@@ -565,6 +702,9 @@ impl Renderer {
                 st2,
                 ss2,
                 depth_entry,
+                storage_entry(6, gpu_shader_stage::FRAGMENT),
+                storage_entry(7, gpu_shader_stage::FRAGMENT),
+                storage_entry(8, gpu_shader_stage::FRAGMENT),
             ]))
             .map_err(js_err)?;
 
@@ -604,7 +744,7 @@ impl Renderer {
             let vs = GpuVertexState::new(&pbr_module);
             vs.set_entry_point("vs_main");
             vs.set_buffers(&[JsNullable::wrap(vertex_layout())]);
-            let target = GpuColorTargetState::new(format);
+            let target = GpuColorTargetState::new(crate::post::HDR_FORMAT);
             if blend {
                 let c = GpuBlendComponent::new();
                 c.set_src_factor(GpuBlendFactor::SrcAlpha);
@@ -701,12 +841,26 @@ impl Renderer {
         let shadow_size = 2048;
         let st = GpuTextureDescriptor::new(
             SHADOW_FORMAT,
-            &nums(&[shadow_size, shadow_size]),
+            &nums(&[shadow_size, shadow_size, MAX_CASCADES as u32]),
             gpu_texture_usage::RENDER_ATTACHMENT | gpu_texture_usage::TEXTURE_BINDING,
         );
-        st.set_label("shadow-map");
+        st.set_label("shadow-cascades");
         let shadow_tex = device.create_texture(&st).map_err(js_err)?;
-        let shadow_view = shadow_tex.create_view().map_err(js_err)?;
+        let svd = GpuTextureViewDescriptor::new();
+        svd.set_dimension(GpuTextureViewDimension::N2dArray);
+        let shadow_view = shadow_tex.create_view_with_descriptor(&svd).map_err(js_err)?;
+        let mut shadow_layers = vec![];
+        for k in 0..MAX_CASCADES as u32 {
+            let d = GpuTextureViewDescriptor::new();
+            d.set_dimension(GpuTextureViewDimension::N2d);
+            d.set_base_array_layer(k);
+            d.set_array_layer_count(1);
+            shadow_layers.push(shadow_tex.create_view_with_descriptor(&d).map_err(js_err)?);
+        }
+        let cascade_buf = device
+            .create_buffer(&GpuBufferDescriptor::new(CASCADE_SLOT * MAX_CASCADES as u32, gpu_buffer_usage::UNIFORM | gpu_buffer_usage::COPY_DST))
+            .map_err(js_err)?;
+        let light_bufs = LightBufs::new(&device, 256, 16384)?;
         let sd = GpuSamplerDescriptor::new();
         sd.set_compare(GpuCompareFunction::Less);
         sd.set_mag_filter(GpuFilterMode::Linear);
@@ -760,6 +914,8 @@ impl Renderer {
             &visible_buf,
             &shadow_view,
             &shadow_sampler,
+            &light_bufs,
+            &cascade_buf,
         );
         let cull = if gpu_cull_supported {
             match crate::gpu_cull::GpuCull::new(&device) {
@@ -777,6 +933,8 @@ impl Renderer {
             None
         };
 
+        let post = crate::post::Post::new(&device, format, common, &bgl0, &bgl0_t, DEPTH_FORMAT, SAMPLES)?;
+        let grass = crate::vegetation::GrassRenderer::new(&device, &pbr_module, &bgl0, &bgl_mat, crate::post::HDR_FORMAT, DEPTH_FORMAT, SAMPLES)?;
         let timing = if timing_supported {
             crate::gpu_timing::GpuTiming::new(&device).map_err(|e| crate::log_warn!("GPU timing disabled: {e}")).ok()
         } else {
@@ -786,7 +944,6 @@ impl Renderer {
             device,
             queue,
             context,
-            format,
             pipelines,
             shadow_pipeline,
             shadow_mask_pipeline,
@@ -806,13 +963,23 @@ impl Renderer {
             bind0,
             bind0_shadow,
             shadow_view,
+            shadow_layers,
             shadow_size,
+            cascade_buf,
+            light_bufs,
             shadow_sampler,
             color_sampler,
             msaa_view: None,
             depth_view: None,
+            post,
+            grass,
+            targets: None,
+            rtts: vec![],
             size: (0, 0),
+            canvas_size: (0, 0),
+            adapt: (0.0, 0.0, 0),
             meshes: vec![],
+            free_meshes: vec![],
             materials: vec![],
             tex_views: vec![],
             flat_normal: None,
@@ -895,7 +1062,9 @@ impl Renderer {
         visible: &GpuBuffer,
         shadow_view: &GpuTextureView,
         shadow_sampler: &GpuSampler,
-    ) -> (GpuBindGroup, GpuBindGroup) {
+        lb: &LightBufs,
+        cascade_buf: &GpuBuffer,
+    ) -> (GpuBindGroup, Vec<GpuBindGroup>) {
         let full = device.create_bind_group(&GpuBindGroupDescriptor::new(
             &[
                 GpuBindGroupEntry::new_with_gpu_buffer(0, globals),
@@ -903,17 +1072,46 @@ impl Renderer {
                 GpuBindGroupEntry::new_with_gpu_texture_view(2, shadow_view),
                 GpuBindGroupEntry::new(3, shadow_sampler),
                 GpuBindGroupEntry::new_with_gpu_buffer(4, visible),
+                GpuBindGroupEntry::new_with_gpu_buffer(6, &lb.lights),
+                GpuBindGroupEntry::new_with_gpu_buffer(7, &lb.grid),
+                GpuBindGroupEntry::new_with_gpu_buffer(8, &lb.indices),
             ],
             bgl0,
         ));
-        let shadow = device.create_bind_group(&GpuBindGroupDescriptor::new(
-            &[
-                GpuBindGroupEntry::new_with_gpu_buffer(0, globals),
-                GpuBindGroupEntry::new_with_gpu_buffer(1, instances),
-            ],
-            bgl0_shadow,
-        ));
+        let shadow = (0..MAX_CASCADES as u32)
+            .map(|k| {
+                let b = GpuBufferBinding::new(cascade_buf);
+                b.set_offset(k * CASCADE_SLOT);
+                b.set_size(64);
+                device.create_bind_group(&GpuBindGroupDescriptor::new(
+                    &[
+                        GpuBindGroupEntry::new_with_gpu_buffer(0, globals),
+                        GpuBindGroupEntry::new_with_gpu_buffer(1, instances),
+                        GpuBindGroupEntry::new_with_gpu_buffer_binding(2, &b),
+                    ],
+                    bgl0_shadow,
+                ))
+            })
+            .collect();
         (full, shadow)
+    }
+
+    fn rebuild_bind0(&mut self) {
+        let (a, b) = Self::make_bind0(
+            &self.device,
+            &self.bgl0,
+            &self.bgl0_shadow,
+            &self.globals_buf,
+            &self.instance_buf,
+            &self.visible_buf,
+            &self.shadow_view,
+            &self.shadow_sampler,
+            &self.light_bufs,
+            &self.cascade_buf,
+        );
+        self.bind0 = a;
+        self.bind0_shadow = b;
+        self.bind0_t = None; // rebuilt lazily (needs the depth view)
     }
 
     /// 1x1 texture of one colour (clear pass), not registered as a public texture.
@@ -1192,7 +1390,7 @@ impl Renderer {
         let ib = mk(ibytes, gpu_buffer_usage::INDEX);
         vb.set_label(name);
         let (c, r) = data.bounds();
-        self.meshes.push(GpuMesh {
+        let gm = GpuMesh {
             name: name.to_string(),
             vb,
             ib,
@@ -1201,8 +1399,139 @@ impl Renderer {
             bounds_center: c,
             bounds_radius: r,
             cpu: (data.indices.len() <= 60_000).then(|| std::rc::Rc::new((data.vertices.iter().map(|v| v.pos).collect(), data.indices.clone()))),
-        });
+            data: (data.indices.len() <= 60_000).then(|| std::rc::Rc::new(data.clone())),
+        };
+        if let Some(slot) = self.free_meshes.pop() {
+            self.meshes[slot as usize] = gm;
+            return MeshId(slot);
+        }
+        self.meshes.push(gm);
         MeshId(self.meshes.len() as u32 - 1)
+    }
+
+    /// Frees a mesh's GPU buffers; the id is reused by a later `add_mesh`. Nothing may still
+    /// reference it (despawn its entities first).
+    pub fn remove_mesh(&mut self, id: MeshId) {
+        let Some(m) = self.meshes.get_mut(id.0 as usize) else { return };
+        if m.index_count == 0 && m.vertex_count == 0 {
+            return; // already free
+        }
+        m.vb.destroy();
+        m.ib.destroy();
+        m.index_count = 0;
+        m.vertex_count = 0;
+        m.cpu = None;
+        m.data = None;
+        m.name = "(free)".into();
+        self.free_meshes.push(id.0);
+    }
+
+    /// Drops frame-to-frame history (Hi-Z occlusion) after a discontinuity such as an origin shift.
+    pub fn invalidate_history(&mut self) {
+        if let Some(c) = self.cull.as_mut() {
+            c.hiz_valid = false;
+        }
+    }
+
+    /// GPU grass settings (radius, spacing, height, colours, wind, splat layer).
+    pub fn grass_settings(&mut self) -> &mut crate::vegetation::GrassSettings {
+        &mut self.grass.settings
+    }
+
+    /// Texture view of a public texture id (internal: grass splat input).
+    pub(crate) fn texture_view(&self, id: TextureId) -> Option<GpuTextureView> {
+        self.tex_views.get(id.0 as usize + 1).cloned()
+    }
+
+    /// Live (non-freed) mesh count.
+    pub fn mesh_count(&self) -> usize {
+        self.meshes.len() - self.free_meshes.len()
+    }
+
+    /// Replaces mip 0 of an RGBA texture created with `add_texture_rgba(_linear)` and regenerates mips.
+    pub fn write_texture_rgba(&mut self, id: TextureId, w: u32, h: u32, data: &[u8]) -> Result<(), String> {
+        let info = self.tex_objects.get_mut(id.0 as usize + 1).ok_or("no such texture")?;
+        if info.width != w || info.height != h || data.len() != (w * h * 4) as usize {
+            return Err(format!("write_texture_rgba: {w}x{h} ({} bytes) into {}x{}", data.len(), info.width, info.height));
+        }
+        let tex = info.tex.clone().ok_or("texture has no GPU object")?;
+        info.uploads += 1;
+        let (mips, linear) = (info.mips, info.linear);
+        let dst = GpuTexelCopyTextureInfo::new(&tex);
+        let layout = GpuTexelCopyBufferLayout::new();
+        layout.set_bytes_per_row(w * 4);
+        layout.set_rows_per_image(h);
+        self.queue.write_texture_with_u8_slice_and_u32_sequence(&dst, data, &layout, &nums(&[w, h])).map_err(js_err)?;
+        self.generate_mips(&tex, mips, linear)
+    }
+
+    /// Creates a render texture (sRGB colour + its own HDR/bloom targets). Returns its id and the
+    /// texture id to use in materials. Assign a camera with [`Self::set_render_texture_camera`].
+    pub fn create_render_texture(&mut self, w: u32, h: u32, opts: crate::render_texture::RenderTextureOpts, label: &str) -> Result<(crate::render_texture::RenderTextureId, TextureId), String> {
+        let (w, h) = (w.max(1), h.max(1));
+        let mips = 32 - w.max(h).leading_zeros();
+        let desc = GpuTextureDescriptor::new(
+            GpuTextureFormat::Rgba8unormSrgb,
+            &nums(&[w, h]),
+            gpu_texture_usage::TEXTURE_BINDING | gpu_texture_usage::RENDER_ATTACHMENT | gpu_texture_usage::COPY_SRC | gpu_texture_usage::COPY_DST,
+        );
+        desc.set_label(label);
+        desc.set_mip_level_count(mips);
+        let tex = self.device.create_texture(&desc).map_err(js_err)?;
+        let full = tex.create_view().map_err(js_err)?;
+        let vd = GpuTextureViewDescriptor::new();
+        vd.set_base_mip_level(0);
+        vd.set_mip_level_count(1);
+        let view0 = tex.create_view_with_descriptor(&vd).map_err(js_err)?;
+        let texture = self.push_texture_view(&full, TexInfo { tex: Some(tex.clone()), label: label.into(), width: w, height: h, mips, uploads: 0, linear: false });
+        let targets = self.post.targets(&self.device, w, h, DEPTH_FORMAT, SAMPLES, label)?;
+        self.rtts.push(crate::render_texture::RenderTexture {
+            size: (w, h),
+            texture,
+            gpu: tex,
+            view0,
+            mips,
+            targets,
+            camera: None,
+            opts,
+            pending: true,
+            renders: 0,
+            label: label.to_string(),
+            export: Default::default(),
+            exporting: Default::default(),
+        });
+        Ok((crate::render_texture::RenderTextureId(self.rtts.len() as u32 - 1), texture))
+    }
+
+    /// Blob URL of the last PNG export of a render texture (see `Ctx::export_render_texture`).
+    pub fn render_texture_url(&self, id: crate::render_texture::RenderTextureId) -> Option<String> {
+        self.rtts.get(id.0 as usize).and_then(|r| r.export.borrow().clone())
+    }
+
+    /// Replaces a mesh's vertices (same count; skinning, morph targets, procedural meshes) and
+    /// refreshes its bounds.
+    pub fn update_mesh_vertices(&mut self, id: MeshId, vertices: &[Vertex]) {
+        let Some(m) = self.meshes.get_mut(id.0 as usize) else { return };
+        if vertices.len() as u32 != m.vertex_count {
+            crate::log_warn!("update_mesh_vertices {}: {} vertices, mesh has {}", m.name, vertices.len(), m.vertex_count);
+            return;
+        }
+        let _ = self.queue.write_buffer_with_u32_and_u8_slice(&m.vb, 0, bytemuck::cast_slice(vertices));
+        let md = MeshData { vertices: vertices.to_vec(), indices: vec![] };
+        let (c, r) = md.bounds();
+        m.bounds_center = c;
+        m.bounds_radius = r;
+        if let Some(cpu) = &m.cpu {
+            m.cpu = Some(std::rc::Rc::new((vertices.iter().map(|v| v.pos).collect(), cpu.1.clone())));
+        }
+        if let Some(d) = &m.data {
+            m.data = Some(std::rc::Rc::new(MeshData { vertices: vertices.to_vec(), indices: d.indices.clone() }));
+        }
+    }
+
+    /// Index list of a mesh (from the CPU copy; None for meshes over 60k indices).
+    pub fn mesh_indices(&self, id: MeshId) -> Option<Vec<u32>> {
+        self.meshes.get(id.0 as usize)?.cpu.as_ref().map(|c| c.1.clone())
     }
 
     pub fn add_material(&mut self, m: Material) -> MaterialId {
@@ -1227,41 +1556,73 @@ impl Renderer {
         )
     }
 
+    /// Canvas size in device pixels (the scene may render smaller, see `render_scale`).
     pub fn size(&self) -> (u32, u32) {
+        self.canvas_size
+    }
+
+    /// Scene render size (canvas x `render_scale`).
+    pub fn render_size(&self) -> (u32, u32) {
         self.size
     }
 
+    /// Canvas size changed (device pixels).
     pub fn resize(&mut self, w: u32, h: u32) {
-        let (w, h) = (w.max(1), h.max(1));
+        self.canvas_size = (w.max(1), h.max(1));
+        self.apply_render_scale();
+    }
+
+    /// Recreates the scene targets when the canvas size or `render_scale` changed.
+    fn apply_render_scale(&mut self) {
+        let s = self.settings.render_scale.clamp(0.25, 1.0);
+        let (cw, ch) = self.canvas_size;
+        let (w, h) = (((cw as f32 * s).round() as u32).max(1), ((ch as f32 * s).round() as u32).max(1));
+        self.resize_targets(w, h);
+    }
+
+    /// Adaptive resolution: called once per frame with the frame interval. Every 30 frames the
+    /// average GPU time (timestamp queries; else the frame interval) is compared with the budget:
+    /// over it the scale drops by 10 %, well under it rises by 5 % (hysteresis, never above 1).
+    pub fn adapt_resolution(&mut self, frame_dt: f32) {
+        if !self.settings.auto_resolution {
+            return;
+        }
+        let gpu = self.stats.gpu_ms.filter(|g| g.samples > 0).map(|g| g.total);
+        self.adapt.0 += gpu.unwrap_or(0.0);
+        self.adapt.1 += frame_dt * 1000.0;
+        self.adapt.2 += 1;
+        if self.adapt.2 < 30 {
+            return;
+        }
+        let n = self.adapt.2 as f32;
+        let (avg_gpu, avg_frame) = (self.adapt.0 / n, self.adapt.1 / n);
+        self.adapt = (0.0, 0.0, 0);
+        let budget = self.settings.frame_budget_ms.max(2.0);
+        let (over, under) = match gpu {
+            Some(_) => (avg_gpu > budget, avg_gpu < budget * 0.8),
+            None => (avg_frame > 18.5, avg_frame < 17.2),
+        };
+        let s = self.settings.render_scale;
+        let next = if over { (s * 0.9).max(self.settings.min_render_scale) } else if under { (s * 1.05).min(1.0) } else { s };
+        if (next - s).abs() > 0.004 {
+            self.settings.render_scale = next;
+            crate::log_info!("adaptive resolution: scale {:.2} -> {:.2} (gpu {:.1} ms, frame {:.1} ms, budget {:.1} ms)", s, next, avg_gpu, avg_frame, budget);
+        }
+    }
+
+    fn resize_targets(&mut self, w: u32, h: u32) {
         if self.size == (w, h) && self.msaa_view.is_some() {
             return;
         }
         self.size = (w, h);
-        let color = GpuTextureDescriptor::new(
-            self.format,
-            &nums(&[w, h]),
-            gpu_texture_usage::RENDER_ATTACHMENT,
-        );
-        color.set_sample_count(SAMPLES);
-        color.set_label("msaa-color");
-        // TEXTURE_BINDING: the Hi-Z pass reads this frame's depth for next frame's occlusion culling.
-        let depth = GpuTextureDescriptor::new(
-            DEPTH_FORMAT,
-            &nums(&[w, h]),
-            gpu_texture_usage::RENDER_ATTACHMENT | gpu_texture_usage::TEXTURE_BINDING,
-        );
-        depth.set_sample_count(SAMPLES);
-        depth.set_label("msaa-depth");
-        self.msaa_view = self
-            .device
-            .create_texture(&color)
-            .ok()
-            .and_then(|t| t.create_view().ok());
-        self.depth_view = self
-            .device
-            .create_texture(&depth)
-            .ok()
-            .and_then(|t| t.create_view().ok());
+        match self.post.targets(&self.device, w, h, DEPTH_FORMAT, SAMPLES, "canvas") {
+            Ok(t) => {
+                self.msaa_view = Some(t.msaa.clone());
+                self.depth_view = Some(t.depth.clone());
+                self.targets = Some(t);
+            }
+            Err(e) => crate::log_error!("render targets {w}x{h}: {e}"),
+        }
         self.bind0_t = None;
         if let (Some(c), Some(d)) = (&mut self.cull, &self.depth_view) {
             if let Err(e) = c.resize(&self.device, w, h, d) {
@@ -1284,19 +1645,7 @@ impl Renderer {
         if let Some(c) = &mut self.cull {
             c.invalidate_bindings();
         }
-        let (a, b) = Self::make_bind0(
-            &self.device,
-            &self.bgl0,
-            &self.bgl0_shadow,
-            &self.globals_buf,
-            &self.instance_buf,
-            &self.visible_buf,
-            &self.shadow_view,
-            &self.shadow_sampler,
-        );
-        self.bind0 = a;
-        self.bind0_shadow = b;
-        self.bind0_t = None; // rebuilt lazily (needs the depth view)
+        self.rebuild_bind0();
         Ok(())
     }
 
@@ -1305,6 +1654,7 @@ impl Renderer {
         let aspect = self.size.0 as f32 / self.size.1.max(1) as f32;
         world
             .query::<(&Camera, &GlobalTransform)>()
+            .without::<&crate::render_texture::RenderTextureCamera>()
             .iter()
             .next()
             .map(|(c, g)| {
@@ -1312,6 +1662,26 @@ impl Renderer {
                 let proj = Mat4::perspective_rh(c.fov_y_deg.to_radians(), aspect, c.near * (1.0 + self.settings.depth_jitter), c.far);
                 (view, proj, g.translation())
             })
+    }
+
+    /// (view, proj, camera position, near, far, layer mask) of the main camera or a render texture's.
+    fn view_setup(&self, world: &World, rtt: Option<usize>) -> Option<(Mat4, Mat4, Vec3, f32, f32, u32)> {
+        let (cam, aspect) = match rtt {
+            None => {
+                let e = world.query::<(hecs::Entity, &Camera)>().without::<&crate::render_texture::RenderTextureCamera>().iter().next().map(|(e, _)| e)?;
+                (e, self.size.0 as f32 / self.size.1.max(1) as f32)
+            }
+            Some(i) => {
+                let rt = &self.rtts[i];
+                (rt.camera?, rt.size.0 as f32 / rt.size.1.max(1) as f32)
+            }
+        };
+        let c = *world.get::<&Camera>(cam).ok()?;
+        let g = world.get::<&GlobalTransform>(cam).ok()?.0;
+        let near = c.near * (1.0 + self.settings.depth_jitter);
+        let view = (Mat4::from_translation(self.settings.camera_jitter) * g).inverse();
+        let proj = Mat4::perspective_rh(c.fov_y_deg.to_radians(), aspect, near, c.far);
+        Some((view, proj, g.w_axis.truncate(), c.near, c.far, c.layers))
     }
 
     /// Seconds for shader animation; stops while `settings.freeze_time` is set.
@@ -1325,60 +1695,157 @@ impl Renderer {
         }
     }
 
+    /// Renders due render textures, then the main view to the canvas.
     pub fn render(&mut self, world: &World) -> Result<(), String> {
-        let (Some(msaa), Some(depth)) = (self.msaa_view.clone(), self.depth_view.clone()) else {
-            return Ok(());
+        self.apply_render_scale();
+        for i in 0..self.rtts.len() {
+            if !self.rtts[i].due() {
+                continue;
+            }
+            let saved = self.settings.clone();
+            self.rtts[i].apply(&mut self.settings);
+            let r = self.render_view(world, Some(i));
+            self.settings = saved;
+            match r {
+                Ok(()) => {
+                    let rt = &mut self.rtts[i];
+                    rt.renders += 1;
+                    rt.pending = false;
+                    if rt.mips > 1 {
+                        let gpu = rt.gpu.clone();
+                        let mips = rt.mips;
+                        if let Err(e) = self.generate_mips(&gpu, mips, false) {
+                            crate::log_warn!("render texture mips: {e}");
+                        }
+                    }
+                }
+                Err(e) => {
+                    crate::log_error!("render texture {}: {e}", self.rtts[i].label);
+                    self.rtts[i].pending = false;
+                }
+            }
+        }
+        self.render_view(world, None)
+    }
+
+    /// One view: the main camera into the canvas (`rtt` None) or a render texture's camera into it.
+    fn render_view(&mut self, world: &World, rtt: Option<usize>) -> Result<(), String> {
+        let main = rtt.is_none();
+        let (msaa, depth, hdr_view) = match rtt {
+            None => match (self.msaa_view.clone(), self.depth_view.clone(), self.targets.as_ref().map(|t| t.hdr_view.clone())) {
+                (Some(m), Some(d), Some(h)) => (m, d, h),
+                _ => return Ok(()),
+            },
+            Some(i) => {
+                let t = &self.rtts[i].targets;
+                (t.msaa.clone(), t.depth.clone(), t.hdr_view.clone())
+            }
         };
-        let Some((view, proj, cam_pos)) = self.camera_matrices(world) else {
-            return Err("no entity with Camera + Transform in the world".into());
+        let Some((view, proj, cam_pos, near, far, layers)) = self.view_setup(world, rtt) else {
+            return if main { Err("no entity with Camera + Transform in the world".into()) } else { Ok(()) };
         };
         let view_proj = proj * view;
-        self.last_view_proj = view_proj;
+        if main {
+            self.last_view_proj = view_proj;
+        }
         let cam_fwd = -view.inverse().z_axis.truncate();
 
-        // --- Shadow camera (texel-snapped to avoid shimmering) ------------------------------
+        // --- Shadow cascades: bounding sphere per view-depth slice (rotation-stable), texel-snapped
         let s = &self.settings;
         let dir = s.sun_dir.normalize_or(Vec3::NEG_Y);
         let up = if dir.y.abs() > 0.99 { Vec3::Z } else { Vec3::Y };
-        let e = s.shadow_extent;
-        let center = cam_pos + cam_fwd * e * 0.5;
+        let n_casc = s.shadow_cascades.clamp(1, MAX_CASCADES as u32) as usize;
+        let shadow_far = s.shadow_distance.max(near * 4.0).min(far);
+        let (tan_x, tan_y) = (1.0 / proj.x_axis.x, 1.0 / proj.y_axis.y);
+        let inv_view = view.inverse();
         let rot = Mat4::look_at_rh(Vec3::ZERO, dir, up);
-        let mut c_ls = rot.transform_point3(center);
-        let texel = 2.0 * e / self.shadow_size as f32;
-        c_ls.x = (c_ls.x / texel).floor() * texel;
-        c_ls.y = (c_ls.y / texel).floor() * texel;
-        let center = rot.inverse().transform_point3(c_ls);
-        let light_view = Mat4::look_at_rh(center - dir * e * 2.0, center, up);
-        let light_proj = Mat4::orthographic_rh(-e, e, -e, e, 0.0, e * 4.0);
-        let light_view_proj = light_proj * light_view;
-
-        // --- Lights ---------------------------------------------------------------------------
-        let mut point_lights = [GpuPointLight::zeroed(); MAX_POINT_LIGHTS];
-        let mut n_lights = 0usize;
-        for (pl, g) in world.query::<(&PointLight, &GlobalTransform)>().iter() {
-            if n_lights == MAX_POINT_LIGHTS {
-                break;
+        let mut cascades = [[[0.0f32; 4]; 4]; MAX_CASCADES];
+        let mut cascade_mats = [Mat4::IDENTITY; MAX_CASCADES];
+        let mut splits = [0.0f32; 4];
+        let mut texels = [0.0f32; 4];
+        // (light view matrix, half size, depth range) per cascade, for caster culling
+        let mut cascade_boxes: Vec<(Mat4, f32, f32)> = vec![];
+        for k in 0..n_casc {
+            let f = (k + 1) as f32 / n_casc as f32;
+            let lin = near + (shadow_far - near) * f;
+            let log = near * (shadow_far / near).powf(f);
+            let z1 = lin + (log - lin) * s.shadow_split_lambda;
+            let z0 = if k == 0 { near } else { splits[k - 1] };
+            splits[k] = z1;
+            let mut center = Vec3::ZERO;
+            let mut corners = [Vec3::ZERO; 8];
+            for (ci, c) in corners.iter_mut().enumerate() {
+                let z = if ci < 4 { z0 } else { z1 };
+                let sx = if ci & 1 == 0 { -1.0 } else { 1.0 };
+                let sy = if ci & 2 == 0 { -1.0 } else { 1.0 };
+                *c = inv_view.transform_point3(Vec3::new(sx * tan_x * z, sy * tan_y * z, -z));
+                center += *c / 8.0;
             }
-            let p = g.translation();
-            point_lights[n_lights] = GpuPointLight {
-                pos_range: [p.x, p.y, p.z, pl.range],
-                color_intensity: [pl.color.x, pl.color.y, pl.color.z, pl.intensity],
-            };
-            n_lights += 1;
+            let r = corners.iter().map(|c| c.distance(center)).fold(0.0f32, f32::max);
+            let r = (r * 16.0).ceil() / 16.0;
+            let texel = 2.0 * r / self.shadow_size as f32;
+            let mut c_ls = rot.transform_point3(center);
+            c_ls.x = (c_ls.x / texel).floor() * texel;
+            c_ls.y = (c_ls.y / texel).floor() * texel;
+            let center = rot.inverse().transform_point3(c_ls);
+            let back = r + 120.0; // casters up to 120 m beyond the slice towards the sun
+            let lv = Mat4::look_at_rh(center - dir * back, center, up);
+            let lp = Mat4::orthographic_rh(-r, r, -r, r, 0.0, back + r);
+            cascade_mats[k] = lp * lv;
+            cascades[k] = cascade_mats[k].to_cols_array_2d();
+            texels[k] = texel;
+            cascade_boxes.push((lv, r, back + r));
         }
-        let (near, far) = world.query::<&Camera>().iter().next().map(|c| (c.near, c.far)).unwrap_or((0.1, 500.0));
+        let mut cascade_data = vec![0u8; CASCADE_SLOT as usize * MAX_CASCADES];
+        for (k, m) in cascade_mats.iter().enumerate() {
+            cascade_data[k * CASCADE_SLOT as usize..k * CASCADE_SLOT as usize + 64].copy_from_slice(bytemuck::bytes_of(&m.to_cols_array()));
+        }
+        self.queue.write_buffer_with_u32_and_u8_slice(&self.cascade_buf, 0, &cascade_data).map_err(js_err)?;
+
+        // --- Clustered lights -----------------------------------------------------------------
+        let cluster_far = self.settings.light_cluster_far.min(far).max(near * 2.0);
+        let cl = crate::lights::build(world, view, proj, &frustum_planes(&view_proj), cam_pos, near, cluster_far);
+        if self.light_bufs.ensure(&self.device, cl.lights.len().max(1) as u32, cl.indices.len().max(1) as u32)? {
+            self.rebuild_bind0();
+        }
+        if !cl.lights.is_empty() {
+            self.queue.write_buffer_with_u32_and_u8_slice(&self.light_bufs.lights, 0, bytemuck::cast_slice(&cl.lights)).map_err(js_err)?;
+        }
+        self.queue.write_buffer_with_u32_and_u8_slice(&self.light_bufs.grid, 0, bytemuck::cast_slice(&cl.grid)).map_err(js_err)?;
+        if !cl.indices.is_empty() {
+            self.queue.write_buffer_with_u32_and_u8_slice(&self.light_bufs.indices, 0, bytemuck::cast_slice(&cl.indices)).map_err(js_err)?;
+        }
+        let n_lights = cl.lights.len();
+        let light_stats = cl.stats;
+        let (vw, vh) = match rtt {
+            None => self.size,
+            Some(i) => self.rtts[i].size,
+        };
+        let shader_t = self.shader_time();
+        let s = &self.settings;
         let globals = Globals {
             view_proj: view_proj.to_cols_array_2d(),
-            light_view_proj: light_view_proj.to_cols_array_2d(),
+            cascades,
             camera_pos: cam_pos.extend(1.0).into(),
             sun_dir: dir.extend(s.sun_intensity).into(),
             sun_color: s.sun_color.extend(1.0).into(),
             sky_color: s.sky_color.extend(1.0).into(),
             ground_color: s.ground_color.extend(1.0).into(),
-            counts: [n_lights as u32, s.shadows as u32, s.debug_view, 0],
-            point_lights,
+            counts: [n_lights as u32, s.shadows as u32, s.debug_view, n_casc as u32],
             // near must match the projection (depth_jitter) or water depth would shift with it
-            time: [self.shader_time(), near * (1.0 + self.settings.depth_jitter), far, 0.0],
+            time: [shader_t, near * (1.0 + s.depth_jitter), far, 0.0],
+            inv_view_proj: view_proj.inverse().to_cols_array_2d(),
+            fog: [s.fog_density.max(0.0), s.fog_height_falloff.max(0.0), s.fog_start.max(0.0), s.fog_max.clamp(0.0, 1.0)],
+            fog_color: s.fog_color.map(|c| c.extend(1.0)).unwrap_or(Vec4::ZERO).into(),
+            sky_zenith: s.sky_zenith.extend(0.0).into(),
+            sky_horizon: s.sky_horizon.extend(s.sun_size_deg.to_radians()).into(),
+            cam_right: view.inverse().x_axis.truncate().normalize_or(Vec3::X).extend(0.0).into(),
+            cam_up: view.inverse().y_axis.truncate().normalize_or(Vec3::Y).extend(0.0).into(),
+            view: view.to_cols_array_2d(),
+            cascade_splits: splits,
+            cascade_texel: texels,
+            cluster: [near, cluster_far, crate::lights::CLUSTER_Z as f32 / (cluster_far / near).ln(), 0.0],
+            screen: [vw as f32, vh as f32, 1.0 / vw.max(1) as f32, 1.0 / vh.max(1) as f32],
         };
         self.queue
             .write_buffer_with_u32_and_u8_slice(&self.globals_buf, 0, bytemuck::bytes_of(&globals))
@@ -1389,7 +1856,8 @@ impl Renderer {
         //             ++ [blended, frustum-culled on the CPU, sorted back to front]
         //             ++ [shadow casters sorted by (mask, texture, mesh)]
         // GPU path: opaque candidates are culled by cull.wgsl; CPU path: frustum test here.
-        let gpu = self.settings.gpu_culling && self.cull.is_some();
+        // GPU culling + Hi-Z belong to the main view (render textures use the CPU path)
+        let gpu = main && self.settings.gpu_culling && self.cull.is_some();
         let planes = frustum_planes(&view_proj);
         let cam_fwd_n = cam_fwd.normalize_or(Vec3::NEG_Z);
         // (double_sided, texture, mesh, instance, bounds, model index)
@@ -1397,8 +1865,8 @@ impl Renderer {
         let mut visible: Vec<(u8, u32, u32, InstanceRaw, [f32; 4], u32)> = vec![];
         // (view depth, double_sided, texture, mesh, instance, model index)
         let mut blended: Vec<(f32, bool, u32, u32, InstanceRaw, u32)> = vec![];
-        // (alpha-tested, texture, mesh, instance, model index)
-        let mut casters: Vec<(bool, u32, u32, InstanceRaw, u32)> = vec![];
+        // (alpha-tested, texture, mesh, instance, model index, bounding sphere)
+        let mut casters: Vec<(bool, u32, u32, InstanceRaw, u32, Vec3, f32)> = vec![];
         // Model matrices; normal matrices (inverse-transpose) are computed afterwards with the job system.
         let mut models: Vec<Mat4> = vec![];
         let fallback_mat = Material::default();
@@ -1408,6 +1876,9 @@ impl Renderer {
         let mut culled = 0u32;
         let mut lod_counts = [0u32; 4];
         for (g, mr, lod) in world.query::<(&GlobalTransform, &MeshRenderer, Option<&Lod>)>().iter() {
+            if layers & (1u32 << (mr.layer & 31)) == 0 {
+                continue;
+            }
             let model = g.0;
             let scale = model.x_axis.truncate().length().max(model.y_axis.truncate().length()).max(model.z_axis.truncate().length());
             let mut mesh_id = mr.mesh;
@@ -1423,9 +1894,9 @@ impl Renderer {
                     }
                 }
             }
-            let Some(mesh) = self.meshes.get(mesh_id.0 as usize) else { continue };
+            let Some(mesh) = self.meshes.get(mesh_id.0 as usize).filter(|m| m.index_count > 0) else { continue };
             let mat = self.materials.get(mr.material.0 as usize).unwrap_or(&fallback_mat);
-            let shading = if mat.water { 3.0 } else if mat.ui { 2.0 } else if mat.unlit { 1.0 } else { 0.0 };
+            let shading = if mat.terrain { -1.0 } else if mat.water { 3.0 } else if mat.ui { 2.0 } else if mat.unlit { 1.0 } else { 0.0 };
             let alpha = match mat.alpha_mode {
                 AlphaMode::Opaque => 0.0,
                 AlphaMode::Mask(c) => c.clamp(0.001, 1.0),
@@ -1435,9 +1906,11 @@ impl Renderer {
                 model: model.to_cols_array_2d(),
                 normal: [[0.0; 4]; 4], // filled below (jobs::par_map)
                 base_color: mat.base_color.into(),
-                emissive_metallic: mat.emissive.extend(mat.metallic).into(),
+                emissive_metallic: if mat.terrain { mat.terrain_params } else { mat.emissive.extend(mat.metallic).into() },
                 params: [mat.roughness, mat.checker, shading, alpha],
-                maps: if mat.water {
+                maps: if mat.terrain {
+                    mat.terrain_tiling
+                } else if mat.water {
                     [0.0, mat.wave_height, 0.0, mat.wave_scale]
                 } else {
                     [
@@ -1461,11 +1934,11 @@ impl Renderer {
             models.push(model);
             let is_blend = mat.alpha_mode == AlphaMode::Blend;
             let is_mask = matches!(mat.alpha_mode, AlphaMode::Mask(_));
-            if mr.cast_shadows && !is_blend {
-                casters.push((is_mask, if is_mask { tex } else { 0 }, mesh_id.0, raw, mi));
-            }
             let center = model.transform_point3(mesh.bounds_center);
             let radius = mesh.bounds_radius * scale;
+            if mr.cast_shadows && !is_blend && self.settings.shadows {
+                casters.push((is_mask, if is_mask { tex } else { 0 }, mesh_id.0, raw, mi, center, radius));
+            }
             let in_frustum = planes.iter().all(|p| p.truncate().dot(center) + p.w >= -radius);
             if is_blend {
                 if in_frustum {
@@ -1496,6 +1969,19 @@ impl Renderer {
         }
         blended.sort_by(|a, b| b.0.total_cmp(&a.0)); // far -> near
         casters.sort_by_key(|c| (c.0, c.1, c.2));
+        // per cascade: the casters whose bounding sphere touches the cascade's light-space box
+        let cascade_casters: Vec<Vec<usize>> = cascade_boxes
+            .iter()
+            .map(|(lv, r, depth)| {
+                (0..casters.len())
+                    .filter(|&i| {
+                        let (c, rad) = (casters[i].5, casters[i].6);
+                        let p = lv.transform_point3(c);
+                        p.x.abs() <= r + rad && p.y.abs() <= r + rad && -p.z >= -rad && -p.z <= depth + rad
+                    })
+                    .collect()
+            })
+            .collect();
 
         // Opaque batches: runs of equal (sides, texture, mesh) -> one (indirect) draw each.
         let mut batches: Vec<(u8, u32, u32, u32, u32)> = vec![]; // (pipeline, texture, mesh, first, count)
@@ -1515,12 +2001,17 @@ impl Renderer {
             }
         }
 
-        let total = (visible.len() + blended.len() + casters.len()) as u32;
+        let shadow_instances: usize = cascade_casters.iter().map(|c| c.len()).sum();
+        let total = (visible.len() + blended.len() + shadow_instances) as u32;
         self.ensure_instance_capacity(total.max(1))?;
         let mut data: Vec<InstanceRaw> = Vec::with_capacity(total as usize);
         data.extend(visible.iter().map(|v| v.3));
         data.extend(blended.iter().map(|b| b.4));
-        data.extend(casters.iter().map(|c| c.3));
+        let mut cascade_base = vec![];
+        for list in &cascade_casters {
+            cascade_base.push(data.len() as u32);
+            data.extend(list.iter().map(|&i| casters[i].3));
+        }
         if !data.is_empty() {
             self.queue.write_buffer_with_u32_and_u8_slice(&self.instance_buf, 0, bytemuck::cast_slice(&data)).map_err(js_err)?;
         }
@@ -1535,16 +2026,21 @@ impl Renderer {
         let mut stats = FrameStats {
             width: self.size.0,
             height: self.size.1,
+            canvas: [self.canvas_size.0, self.canvas_size.1],
+            render_scale: self.settings.render_scale,
             culled,
             visible: visible.len() as u32,
             transparent: blended.len() as u32,
             lod_levels: lod_counts,
             gpu_culling: gpu,
+            lights: light_stats,
+            cascades: splits[..n_casc].to_vec(),
             ..Default::default()
         };
         let groups: Vec<GpuBindGroup> = key_list.iter().map(|k| self.material_group(*k)).collect();
-        if self.bind0_t.is_none() {
-            self.bind0_t = Some(self.device.create_bind_group(&GpuBindGroupDescriptor::new(
+        let mut bind0_rt: Option<GpuBindGroup> = None;
+        if self.bind0_t.is_none() || !main {
+            let g = Some(self.device.create_bind_group(&GpuBindGroupDescriptor::new(
                 &[
                     GpuBindGroupEntry::new_with_gpu_buffer(0, &self.globals_buf),
                     GpuBindGroupEntry::new_with_gpu_buffer(1, &self.instance_buf),
@@ -1552,11 +2048,41 @@ impl Renderer {
                     GpuBindGroupEntry::new(3, &self.shadow_sampler),
                     GpuBindGroupEntry::new_with_gpu_buffer(4, &self.visible_buf),
                     GpuBindGroupEntry::new_with_gpu_texture_view(5, &depth),
+                    GpuBindGroupEntry::new_with_gpu_buffer(6, &self.light_bufs.lights),
+                    GpuBindGroupEntry::new_with_gpu_buffer(7, &self.light_bufs.grid),
+                    GpuBindGroupEntry::new_with_gpu_buffer(8, &self.light_bufs.indices),
                 ],
                 &self.bgl0_t,
             )));
+            if main {
+                self.bind0_t = g;
+            } else {
+                bind0_rt = g;
+            }
         }
-        if let Some(t) = self.timing.as_mut() {
+        // adaptive quality: lower resolution also shortens the grass radius (vertex cost)
+        let quality = ((self.settings.render_scale - self.settings.min_render_scale) / (1.0 - self.settings.min_render_scale).max(0.01)).clamp(0.0, 1.0);
+        let grass_blades = if self.settings.grass && layers & 1 != 0 { self.grass.prepare(&self.device, &self.queue, cam_pos, shader_t, quality) } else { 0 };
+        stats.grass_blades = grass_blades;
+        // particles: upload [additive ++ alpha-blended]
+        let (n_add, n_alpha) = if self.settings.particles {
+            let (add, alpha) = crate::particles::collect(world, cam_pos);
+            let n = (add.len() + alpha.len()) as u32;
+            if n > 0 {
+                self.post.ensure_particles(&self.device, n)?;
+                let mut all = add;
+                let na = all.len() as u32;
+                all.extend(alpha);
+                self.queue.write_buffer_with_u32_and_u8_slice(&self.post.particle_buf, 0, bytemuck::cast_slice(&all)).map_err(js_err)?;
+                (na, n - na)
+            } else {
+                (0, 0)
+            }
+        } else {
+            (0, 0)
+        };
+        stats.particles = n_add + n_alpha;
+        if let Some(t) = self.timing.as_mut().filter(|_| main) {
             t.begin_frame();
         }
         let encoder = self.device.create_command_encoder();
@@ -1591,72 +2117,81 @@ impl Renderer {
                     hiz_mips: c.hiz_mips,
                     _pad: [0; 3],
                 };
-                let ts = self.timing.as_mut().and_then(|t| t.compute_writes(crate::gpu_timing::CULL));
+                let ts = self.timing.as_mut().filter(|_| main).and_then(|t| t.compute_writes(crate::gpu_timing::CULL));
                 c.encode_cull(&self.device, &self.queue, &encoder, &self.visible_buf, &params, &items, &args, ts)?;
                 let k = *c.last_counters.borrow();
                 stats.gpu_frustum_culled = k[0];
                 stats.gpu_occluded = k[1];
                 stats.gpu_visible = k[2];
             }
-        } else if let Some(c) = self.cull.as_mut() {
-            c.hiz_valid = false;
+        } else if main {
+            if let Some(c) = self.cull.as_mut() {
+                c.hiz_valid = false;
+            }
         }
 
-        // --- Shadow pass (opaque depth-only, alpha-tested casters sample their texture) ----
+        // --- Shadow passes: one per cascade (opaque depth-only, alpha-tested casters sample their texture)
         {
-            let att = GpuRenderPassDepthStencilAttachment::new_with_gpu_texture_view(&self.shadow_view);
-            att.set_depth_clear_value(1.0);
-            att.set_depth_load_op(GpuLoadOp::Clear);
-            att.set_depth_store_op(GpuStoreOp::Store);
-            let desc = GpuRenderPassDescriptor::new(&[]);
-            desc.set_depth_stencil_attachment(&att);
-            desc.set_label("shadow");
-            if let Some(w) = self.timing.as_mut().and_then(|t| t.render_writes(crate::gpu_timing::SHADOW)) {
-                desc.set_timestamp_writes(&w);
-            }
-            let pass = encoder.begin_render_pass(&desc).map_err(js_err)?;
-            if self.settings.shadows && !casters.is_empty() {
-                pass.set_bind_group(0, Some(&self.bind0_shadow));
-                let base = blend_base + blended.len() as u32;
-                let mut bound: Option<(bool, u32)> = None;
-                let mut i = 0usize;
-                while i < casters.len() {
-                    let (mask, tex, mesh_id) = (casters[i].0, casters[i].1, casters[i].2);
-                    let mut j = i;
-                    while j < casters.len() && casters[j].0 == mask && casters[j].1 == tex && casters[j].2 == mesh_id {
-                        j += 1;
+            let n_pass = n_casc;
+            let ts = self.timing.as_mut().filter(|_| main).and_then(|t| t.split_writes(crate::gpu_timing::SHADOW));
+            for (k, list) in cascade_casters.iter().enumerate().take(n_pass) {
+                let att = GpuRenderPassDepthStencilAttachment::new_with_gpu_texture_view(&self.shadow_layers[k]);
+                att.set_depth_clear_value(1.0);
+                att.set_depth_load_op(GpuLoadOp::Clear);
+                att.set_depth_store_op(GpuStoreOp::Store);
+                let desc = GpuRenderPassDescriptor::new(&[]);
+                desc.set_depth_stencil_attachment(&att);
+                desc.set_label("shadow");
+                if let Some((b, e)) = &ts {
+                    if k == 0 && n_pass == 1 {
+                        if let Some(i) = js_sys::Reflect::get(e, &"endOfPassWriteIndex".into()).ok().and_then(|v| v.as_f64()) {
+                            b.set_end_of_pass_write_index(i as u32);
+                        }
+                        desc.set_timestamp_writes(b);
+                    } else if k == 0 {
+                        desc.set_timestamp_writes(b);
+                    } else if k == n_pass - 1 {
+                        desc.set_timestamp_writes(e);
                     }
-                    if bound.map(|b| b.0) != Some(mask) {
-                        pass.set_pipeline(if mask { &self.shadow_mask_pipeline } else { &self.shadow_pipeline });
-                    }
-                    if mask && bound != Some((true, tex)) {
-                        pass.set_bind_group(1, Some(&groups[tex as usize]));
-                    }
-                    bound = Some((mask, tex));
-                    let mesh = &self.meshes[mesh_id as usize];
-                    pass.set_vertex_buffer(0, Some(&mesh.vb));
-                    pass.set_index_buffer(&mesh.ib, GpuIndexFormat::Uint32);
-                    pass.draw_indexed_with_instance_count_and_first_index_and_base_vertex_and_first_instance(
-                        mesh.index_count,
-                        (j - i) as u32,
-                        0,
-                        0,
-                        base + i as u32,
-                    );
-                    stats.shadow_draw_calls += 1;
-                    i = j;
                 }
+                let pass = encoder.begin_render_pass(&desc).map_err(js_err)?;
+                if self.settings.shadows && !list.is_empty() {
+                    pass.set_bind_group(0, Some(&self.bind0_shadow[k]));
+                    let base = cascade_base[k];
+                    let mut bound: Option<(bool, u32)> = None;
+                    let mut i = 0usize;
+                    while i < list.len() {
+                        let c0 = &casters[list[i]];
+                        let (mask, tex, mesh_id) = (c0.0, c0.1, c0.2);
+                        let mut j = i;
+                        while j < list.len() && casters[list[j]].0 == mask && casters[list[j]].1 == tex && casters[list[j]].2 == mesh_id {
+                            j += 1;
+                        }
+                        if bound.map(|b| b.0) != Some(mask) {
+                            pass.set_pipeline(if mask { &self.shadow_mask_pipeline } else { &self.shadow_pipeline });
+                        }
+                        if mask && bound != Some((true, tex)) {
+                            pass.set_bind_group(1, Some(&groups[tex as usize]));
+                        }
+                        bound = Some((mask, tex));
+                        let mesh = &self.meshes[mesh_id as usize];
+                        pass.set_vertex_buffer(0, Some(&mesh.vb));
+                        pass.set_index_buffer(&mesh.ib, GpuIndexFormat::Uint32);
+                        pass.draw_indexed_with_instance_count_and_first_index_and_base_vertex_and_first_instance(mesh.index_count, (j - i) as u32, 0, 0, base + i as u32);
+                        stats.shadow_draw_calls += 1;
+                        i = j;
+                    }
+                }
+                pass.end();
             }
-            pass.end();
         }
 
         // --- Opaque pass (indirect on the GPU path); keeps colour + depth for the blend pass ---
         {
             let att = GpuRenderPassColorAttachment::new_with_gpu_texture_view(GpuLoadOp::Clear, GpuStoreOp::Store, &msaa);
-            let cc = self.settings.clear_color;
-            // clear color is linear; canvas is not sRGB -> approximate gamma
-            let gm = |x: f32| x.max(0.0).powf(1.0 / 2.2) as f64;
-            att.set_clear_value_gpu_color_dict(&GpuColorDict::new(1.0, gm(cc.z), gm(cc.y), gm(cc.x)));
+            let cc = self.settings.clear_color; // linear HDR target, alpha 1 = tonemapped
+            let clear_a = if rtt.is_some_and(|i| self.rtts[i].opts.transparent) { 0.0 } else { 1.0 };
+            att.set_clear_value_gpu_color_dict(&GpuColorDict::new(clear_a, cc.z as f64, cc.y as f64, cc.x as f64));
             let datt = GpuRenderPassDepthStencilAttachment::new_with_gpu_texture_view(&depth);
             datt.set_depth_clear_value(1.0);
             datt.set_depth_load_op(GpuLoadOp::Clear);
@@ -1664,7 +2199,7 @@ impl Renderer {
             let desc = GpuRenderPassDescriptor::new(&[JsNullable::wrap(att)]);
             desc.set_depth_stencil_attachment(&datt);
             desc.set_label("opaque");
-            if let Some(w) = self.timing.as_mut().and_then(|t| t.render_writes(crate::gpu_timing::OPAQUE)) {
+            if let Some(w) = self.timing.as_mut().filter(|_| main).and_then(|t| t.render_writes(crate::gpu_timing::OPAQUE)) {
                 desc.set_timestamp_writes(&w);
             }
             let pass = encoder.begin_render_pass(&desc).map_err(js_err)?;
@@ -1693,25 +2228,34 @@ impl Renderer {
                 // GPU path: upper bound (candidates); the exact count lives on the GPU.
                 stats.triangles += (mesh.index_count / 3) as u64 * count as u64;
             }
+            if grass_blades > 0 {
+                let mg = self.material_group((0, u32::MAX, u32::MAX));
+                self.grass.draw(&pass, &self.bind0, &mg, grass_blades);
+                stats.draw_calls += 1;
+            }
+            if self.settings.sky {
+                // last: only pixels no geometry covered pass the depth test (less-equal at z = 1)
+                pass.set_pipeline(&self.post.sky_pipeline);
+                pass.set_bind_group(0, Some(&self.bind0));
+                pass.draw(3);
+            }
             pass.end();
         }
 
         // --- Blend pass: back to front, depth read-only *and* bound as a texture (water) -----
         {
-            let surface = self.context.get_current_texture().map_err(js_err)?;
-            let surface_view = surface.create_view().map_err(js_err)?;
             let att = GpuRenderPassColorAttachment::new_with_gpu_texture_view(GpuLoadOp::Load, GpuStoreOp::Discard, &msaa);
-            att.set_resolve_target_gpu_texture_view(&surface_view);
+            att.set_resolve_target_gpu_texture_view(&hdr_view);
             let datt = GpuRenderPassDepthStencilAttachment::new_with_gpu_texture_view(&depth);
             datt.set_depth_read_only(true);
             let desc = GpuRenderPassDescriptor::new(&[JsNullable::wrap(att)]);
             desc.set_depth_stencil_attachment(&datt);
             desc.set_label("blend");
-            if let Some(w) = self.timing.as_mut().and_then(|t| t.render_writes(crate::gpu_timing::BLEND)) {
+            if let Some(w) = self.timing.as_mut().filter(|_| main).and_then(|t| t.render_writes(crate::gpu_timing::BLEND)) {
                 desc.set_timestamp_writes(&w);
             }
             let pass = encoder.begin_render_pass(&desc).map_err(js_err)?;
-            if let Some(b0) = &self.bind0_t {
+            if let Some(b0) = if main { &self.bind0_t } else { &bind0_rt } {
                 pass.set_bind_group(0, Some(b0));
             }
             let mut bound_tex = u32::MAX;
@@ -1734,23 +2278,56 @@ impl Renderer {
                 stats.transparent_draw_calls += 1;
                 stats.triangles += (mesh.index_count / 3) as u64 * count as u64;
             }
+            // particles: additive first (order-independent), then alpha-blended far -> near
+            if n_add + n_alpha > 0 {
+                pass.set_bind_group(1, Some(&self.post.particle_group));
+                if n_add > 0 {
+                    pass.set_pipeline(&self.post.particle_additive);
+                    pass.draw_with_instance_count_and_first_vertex_and_first_instance(6, n_add, 0, 0);
+                    stats.draw_calls += 1;
+                }
+                if n_alpha > 0 {
+                    pass.set_pipeline(&self.post.particle_alpha);
+                    pass.draw_with_instance_count_and_first_vertex_and_first_instance(6, n_alpha, 0, n_add);
+                    stats.draw_calls += 1;
+                }
+            }
             pass.end();
+        }
+
+        // --- Post: bloom + depth darkening + tonemap -> canvas ------------------------------
+        {
+            let ts = self.timing.as_mut().filter(|_| main).and_then(|t| t.split_writes(crate::gpu_timing::POST));
+            let nf = (near * (1.0 + self.settings.depth_jitter), far);
+            match rtt {
+                None => {
+                    let surface = self.context.get_current_texture().map_err(js_err)?;
+                    let surface_view = surface.create_view().map_err(js_err)?;
+                    if let Some(t) = &self.targets {
+                        self.post.encode(&self.queue, &encoder, t, &self.settings, nf, &surface_view, false, false, ts)?;
+                    }
+                }
+                Some(i) => {
+                    let rt = &self.rtts[i];
+                    self.post.encode(&self.queue, &encoder, &rt.targets, &self.settings, nf, &rt.view0, true, rt.opts.transparent, ts)?;
+                }
+            }
         }
 
         // --- Hi-Z for next frame + counter readback --------------------------------------
         let mut readback = false;
         if gpu {
             if let Some(c) = self.cull.as_mut() {
-                let ts = self.timing.as_mut().and_then(|t| t.compute_writes(crate::gpu_timing::HIZ));
+                let ts = self.timing.as_mut().filter(|_| main).and_then(|t| t.compute_writes(crate::gpu_timing::HIZ));
                 c.encode_hiz(&encoder, view_proj, ts);
                 readback = c.encode_readback(&encoder);
             }
         }
-        if let Some(t) = &self.timing {
+        if let Some(t) = self.timing.as_ref().filter(|_| main) {
             t.encode_resolve(&encoder);
         }
         self.queue.submit(&[encoder.finish()]);
-        if let Some(t) = &self.timing {
+        if let Some(t) = self.timing.as_ref().filter(|_| main) {
             t.start_readback();
             stats.gpu_ms = Some(*t.last.borrow());
         }
@@ -1759,7 +2336,9 @@ impl Renderer {
                 c.start_readback();
             }
         }
-        self.stats = stats;
+        if main {
+            self.stats = stats;
+        }
         Ok(())
     }
 }
@@ -1779,4 +2358,43 @@ fn frustum_planes(m: &Mat4) -> [Vec4; 6] {
         n(r2),
         n(r3 - r2),
     ]
+}
+
+/// Storage buffers of the clustered lighting (grown on demand; growth rebuilds bind group 0).
+pub(crate) struct LightBufs {
+    pub lights: GpuBuffer,
+    pub grid: GpuBuffer,
+    pub indices: GpuBuffer,
+    light_cap: u32,
+    index_cap: u32,
+}
+
+impl LightBufs {
+    fn buf(device: &GpuDevice, bytes: u32) -> Result<GpuBuffer, String> {
+        device.create_buffer(&GpuBufferDescriptor::new(bytes.max(16), gpu_buffer_usage::STORAGE | gpu_buffer_usage::COPY_DST)).map_err(js_err)
+    }
+    fn new(device: &GpuDevice, light_cap: u32, index_cap: u32) -> Result<Self, String> {
+        Ok(Self {
+            lights: Self::buf(device, light_cap * std::mem::size_of::<crate::lights::GpuLight>() as u32)?,
+            grid: Self::buf(device, crate::lights::CLUSTERS * 8)?,
+            indices: Self::buf(device, index_cap * 4)?,
+            light_cap,
+            index_cap,
+        })
+    }
+    /// Grows the buffers; true if they were replaced (bind groups must be rebuilt).
+    fn ensure(&mut self, device: &GpuDevice, lights: u32, indices: u32) -> Result<bool, String> {
+        let mut changed = false;
+        if lights > self.light_cap {
+            self.light_cap = lights.next_power_of_two();
+            self.lights = Self::buf(device, self.light_cap * std::mem::size_of::<crate::lights::GpuLight>() as u32)?;
+            changed = true;
+        }
+        if indices > self.index_cap {
+            self.index_cap = indices.next_power_of_two();
+            self.indices = Self::buf(device, self.index_cap * 4)?;
+            changed = true;
+        }
+        Ok(changed)
+    }
 }

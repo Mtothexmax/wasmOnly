@@ -19,6 +19,9 @@
 //                                                    screenshots with flipped draw order + perturbed depth -> flickering regions
 //   node tools/bridge.mjs perf [--ms 3000] [--profile] frame times, engine CPU phases, GPU pass times,
 //                                                    verdict (vsync/gpu/cpu-bound); --profile adds top CPU functions
+//   node tools/bridge.mjs run <script.txt|.json> [--out dir] [--keep-going]
+//   node tools/bridge.mjs run --commands "key Space; step 30; expect game_state.jumps == 1; screenshot a.png"
+//                                                    scripted test run (see tools/script.mjs), exit 1 on failure
 //   node tools/bridge.mjs mcp                        run as MCP server (stdio) — see .mcp.json
 //
 // Options: --port 9222 (CDP port), --url <page url to target/open>
@@ -29,6 +32,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { check, flicker, perf } from './qa.mjs';
+import { runScript } from './script.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const argv = process.argv.slice(2);
@@ -206,6 +210,8 @@ const TOOLS = [
     inputSchema: { type: 'object', properties: { frames: { type: 'number' }, threshold: { type: 'number' } } } },
   { name: 'perf', description: 'Performance capture: frame-time percentiles, engine CPU phases, GPU time per pass, verdict (smooth / gpu-bound / cpu-bound / stutter); profile=true adds the top CPU functions (Chrome sampling profiler).',
     inputSchema: { type: 'object', properties: { ms: { type: 'number' }, profile: { type: 'boolean' } } } },
+  { name: 'run_script', description: 'Scripted test run: a list of steps executed in order — reload, pause/resume, step N (deterministic), frames N, wait ms, key/down/up/hold <Code>, mouse dx dy, click x y, action <name>, screen <name>, call <cmd> {json}, wait_for <cmd.path> <op> <value> [ms], expect <cmd.path> <op> <value>, screenshot <file>, log <text>. `script` is text (lines or ";"-separated) or an array of {verb: arg}. Returns a pass/fail report per step plus engine warnings/errors that appeared.',
+    inputSchema: { type: 'object', properties: { script: { description: 'text or array of steps' }, keep_going: { type: 'boolean' }, out_dir: { type: 'string' } }, required: ['script'] } },
   { name: 'eval_js', description: 'Evaluate a JavaScript expression in the page (promises awaited, result returned by value).',
     inputSchema: { type: 'object', properties: { expression: { type: 'string' } }, required: ['expression'] } },
 ];
@@ -237,6 +243,7 @@ async function runTool(name, a = {}) {
     case 'screenshot': return { content: [{ type: 'image', data: await withSession((s) => s.screenshot()), mimeType: 'image/png' }] };
     case 'reload': return text(await withSession((s) => s.reload()));
     case 'eval_js': return text(await withSession((s) => s.eval(a.expression)));
+    case 'run_script': return text(await withSession((s) => runScript(s, a.script, { stopOnFail: !a.keep_going, outDir: a.out_dir ?? ROOT })));
     case 'perf': return text(await withSession((s) => perf(s, { ms: a.ms, profile: !!a.profile })));
     case 'check': return text(await withSession((s) => check(s, { flicker: !!a.flicker, strict: !!a.strict })));
     case 'flicker': return text(await withSession((s) => flicker(s, { frames: a.frames, threshold: a.threshold })));
@@ -275,7 +282,7 @@ function mcp() {
 
 // ------------------------------------------------------------------------------------------------
 const out = (v) => console.log(JSON.stringify(v, null, 2));
-const positional = argv.filter((a, i) => !a.startsWith('--') && !(i > 0 && argv[i - 1].startsWith('--') && !['--headless', '--release', '--sound', '--flicker', '--strict', '--profile'].includes(argv[i - 1])));
+const positional = argv.filter((a, i) => !a.startsWith('--') && !(i > 0 && argv[i - 1].startsWith('--') && !['--headless', '--release', '--sound', '--flicker', '--strict', '--profile', '--keep-going'].includes(argv[i - 1])));
 const [cmd, ...rest] = positional;
 
 try {
@@ -317,9 +324,18 @@ try {
       if (r.flicker_cells > 0) process.exitCode = 1;
       break;
     }
+    case 'run': {
+      // node tools/bridge.mjs run tests/jump.txt   |   run --commands "key Space; step 30; expect game_state.jumps == 1"
+      const src = opt('--commands') ?? fs.readFileSync(rest[0], 'utf8');
+      const outDir = opt('--out') ?? (rest[0] ? path.dirname(path.resolve(rest[0])) : process.cwd());
+      const r = await withSession((s) => runScript(s, src, { stopOnFail: !flag('--keep-going'), outDir }));
+      out(r);
+      if (!r.passed) process.exitCode = 1;
+      break;
+    }
     case 'mcp': mcp(); break;
     default:
-      console.error('usage: node tools/bridge.mjs launch|status|call|eval|screenshot|reload|wait|console|check|flicker|perf|mcp  (see header of this file)');
+      console.error('usage: node tools/bridge.mjs launch|status|call|eval|screenshot|reload|wait|console|check|flicker|perf|run|mcp  (see header of this file)');
       process.exitCode = 2;
   }
 } catch (e) {

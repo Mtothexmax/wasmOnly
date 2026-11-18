@@ -12,3 +12,4 @@ engine = { path = "../../crates/engine" }
 wasm-bindgen.workspace = true
 glam.workspace = true
 serde_json.workspace = true
+serde.workspace = true

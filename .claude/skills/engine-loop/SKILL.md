@@ -58,9 +58,11 @@ First time on a fresh clone: `node tools/make-sample-assets.mjs` (creates demo a
 | New log lines only | `call logs '{"since":<stats.log_seq>,"level":"warn"}'` |
 | Run JS in page | `eval 'document.title'` |
 | Screenshot | `screenshot out.png` (write to scratch, not the repo) |
+| Scripted test | `run games/demo/tests/smoke.txt` or `run --commands "key Space; step 30; expect ..."` |
+| Screens / scenes | `call screens`, `call scenes` |
 
 The same is available over MCP (server `wasmonly`): `engine_call {name,args}`, `status`, `reload`,
-`screenshot`, `eval_js`, `launch_chrome`.
+`screenshot`, `eval_js`, `launch_chrome`, `check`, `flicker`, `perf`, `run_script`.
 
 ## Toolchains and the threads build
 

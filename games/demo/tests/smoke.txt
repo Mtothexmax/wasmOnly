@@ -1,0 +1,69 @@
+# Demo smoke test: title -> play -> ball jump -> walker (character controller + animation)
+# -> pause overlay -> back to the title (scene unload). Deterministic where it matters (step).
+#
+#   node tools/bridge.mjs run games/demo/tests/smoke.txt        (screenshots land in games/demo/tests/shots/)
+
+reload
+expect game_state.screen == "title"
+wait_for game_state.state.portrait_state == 3 8000
+expect render_texture.render_textures.0.renders >= 1
+screenshot shots/title.png
+
+# title -> play (HUD button action, same path as a click)
+action play
+wait_for game_state.screen == "play" 3000
+wait_for assets.models_pending == [] 8000
+expect scenes.current == "play"
+
+# ball: settle, jump once
+pause
+step 60
+expect game_state.state.grounded == true
+key Space
+step 15
+expect game_state.state.jumps == 1
+expect game_state.state.player_pos.1 > 1.5
+step 60
+
+# walker: character controller driven by held keys, animation follows its state
+call control {"walker": true}
+expect game_state.state.control == "walker"
+down KeyW
+step 60
+up KeyW
+expect game_state.state.walker.grounded == true
+expect game_state.state.walker.pos.2 < 9.5
+expect game_state.state.walker_animation != null
+key Space
+step 10
+expect game_state.state.walker.jumps == 1
+expect game_state.state.walker.grounded == false
+step 60
+expect game_state.state.walker.grounded == true
+# regression (user report): jumping right next to a wall/crate did nothing — rapier's KCC removed
+# upward motion along steep surfaces. The walker stands against the tower's side and must still rise.
+call control {"walker": true, "pos": [2.86, 0.9, -2.0]}
+step 30
+expect game_state.state.walker.grounded == true
+key Space
+step 12
+expect game_state.state.walker.pos.1 > 1.6
+step 90
+expect game_state.state.walker.grounded == true
+resume
+frames 20
+screenshot shots/play.png
+
+# pause overlay freezes the simulation, P resumes
+key KeyP
+wait_for game_state.screen == "pause" 2000
+expect stats.time.paused == true
+expect game_state.stack == ["play", "pause"]
+key KeyP
+wait_for game_state.screen == "play" 2000
+expect stats.time.paused == false
+
+# back to the title: the play scene (island, bodies, particles) is unloaded
+call screens {"reset": "title"}
+expect scenes.current == "title"
+expect particles.particles < 200

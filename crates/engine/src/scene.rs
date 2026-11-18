@@ -83,6 +83,8 @@ pub struct MeshRenderer {
     pub mesh: MeshId,
     pub material: MaterialId,
     pub cast_shadows: bool,
+    /// Render layer 0..31; a camera draws it if bit `layer` is set in `Camera::layers`.
+    pub layer: u8,
 }
 
 impl MeshRenderer {
@@ -91,9 +93,15 @@ impl MeshRenderer {
             mesh,
             material,
             cast_shadows: true,
+            layer: 0,
         }
     }
 }
+
+/// Render layer for an entity and everything below it, including glTF nodes that arrive later
+/// (see `Ctx::set_layer`, `MeshRenderer::layer`, `Camera::layers`).
+#[derive(Clone, Copy, Debug)]
+pub struct RenderLayer(pub u8);
 
 /// Perspective camera. The entity's `GlobalTransform` is the camera pose (looks down -Z).
 #[derive(Clone, Copy, Debug)]
@@ -101,6 +109,8 @@ pub struct Camera {
     pub fov_y_deg: f32,
     pub near: f32,
     pub far: f32,
+    /// Bit mask of `MeshRenderer::layer`s this camera draws (default: all).
+    pub layers: u32,
 }
 
 impl Default for Camera {
@@ -109,6 +119,7 @@ impl Default for Camera {
             fov_y_deg: 60.0,
             near: 0.1,
             far: 500.0,
+            layers: u32::MAX,
         }
     }
 }
@@ -140,46 +151,74 @@ impl WorldLabel {
     }
 }
 
-/// Recomputes `GlobalTransform` for every entity that has a `Transform`.
-pub fn propagate_transforms(world: &mut World) {
-    let mut locals: HashMap<Entity, (Mat4, Option<Entity>)> = HashMap::new();
-    for (e, t, p) in world
-        .query::<(Entity, &Transform, Option<&Parent>)>()
-        .iter()
-    {
-        locals.insert(e, (t.matrix(), p.map(|p| p.0)));
-    }
-    let mut globals: HashMap<Entity, Mat4> = HashMap::with_capacity(locals.len());
-    fn resolve(
-        e: Entity,
-        locals: &HashMap<Entity, (Mat4, Option<Entity>)>,
-        globals: &mut HashMap<Entity, Mat4>,
-        depth: u32,
-    ) -> Mat4 {
-        if let Some(m) = globals.get(&e) {
-            return *m;
+/// Cheap hasher for entity keys (FxHash): SipHash over thousands of entities per frame showed
+/// up as the top cost of an open-world frame.
+#[derive(Default, Clone, Copy)]
+pub struct FxHasher(u64);
+impl std::hash::Hasher for FxHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for b in bytes {
+            self.write_u64(*b as u64);
         }
-        let Some((local, parent)) = locals.get(&e) else {
-            return Mat4::IDENTITY;
+    }
+    fn write_u32(&mut self, i: u32) {
+        self.write_u64(i as u64);
+    }
+    fn write_u64(&mut self, i: u64) {
+        self.0 = (self.0.rotate_left(5) ^ i).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+pub type FxMap<K, V> = HashMap<K, V, std::hash::BuildHasherDefault<FxHasher>>;
+
+/// Recomputes `GlobalTransform` for every entity that has a `Transform`: roots directly, children
+/// through their parent chain (memoised, cheap hashing).
+pub fn propagate_transforms(world: &mut World) {
+    let mut missing: Vec<(Entity, Mat4)> = vec![];
+    for (e, t, g) in world.query_mut::<hecs::Without<(Entity, &Transform, Option<&mut GlobalTransform>), &Parent>>() {
+        let m = t.matrix();
+        match g {
+            Some(g) => g.0 = m,
+            None => missing.push((e, m)),
+        }
+    }
+    for (e, m) in missing.drain(..) {
+        let _ = world.insert_one(e, GlobalTransform(m));
+    }
+    let kids: Vec<(Entity, Entity, Mat4)> = world.query::<(Entity, &Parent, &Transform)>().iter().map(|(e, p, t)| (e, p.0, t.matrix())).collect();
+    if kids.is_empty() {
+        return;
+    }
+    let mut index: FxMap<Entity, usize> = FxMap::default();
+    index.reserve(kids.len());
+    for (i, k) in kids.iter().enumerate() {
+        index.insert(k.0, i);
+    }
+    let mut result: Vec<Option<Mat4>> = vec![None; kids.len()];
+    fn resolve(i: usize, kids: &[(Entity, Entity, Mat4)], index: &FxMap<Entity, usize>, result: &mut [Option<Mat4>], world: &World, depth: u32) -> Mat4 {
+        if let Some(m) = result[i] {
+            return m;
+        }
+        let (_, parent, local) = kids[i];
+        let pm = match index.get(&parent) {
+            Some(&pi) if depth < 64 => resolve(pi, kids, index, result, world, depth + 1),
+            Some(_) => Mat4::IDENTITY,
+            None => world.get::<&GlobalTransform>(parent).map(|g| g.0).unwrap_or(Mat4::IDENTITY),
         };
-        let m = match parent {
-            Some(p) if depth < 64 && locals.contains_key(p) => {
-                resolve(*p, locals, globals, depth + 1) * *local
-            }
-            _ => *local,
-        };
-        globals.insert(e, m);
+        let m = pm * local;
+        result[i] = Some(m);
         m
     }
-    let keys: Vec<Entity> = locals.keys().copied().collect();
-    for e in keys {
-        resolve(e, &locals, &mut globals, 0);
+    for i in 0..kids.len() {
+        resolve(i, &kids, &index, &mut result, world, 0);
     }
-    let mut missing = vec![];
-    for (e, m) in &globals {
-        match world.get::<&mut GlobalTransform>(*e) {
-            Ok(mut g) => g.0 = *m,
-            Err(_) => missing.push((*e, *m)),
+    for (i, k) in kids.iter().enumerate() {
+        let m = result[i].unwrap_or(Mat4::IDENTITY);
+        match world.get::<&mut GlobalTransform>(k.0) {
+            Ok(mut g) => g.0 = m,
+            Err(_) => missing.push((k.0, m)),
         }
     }
     for (e, m) in missing {
@@ -189,13 +228,22 @@ pub fn propagate_transforms(world: &mut World) {
 
 /// Entities whose `Parent` chain leads to `root` (including root), depth-first.
 pub fn descendants(world: &World, root: Entity) -> Vec<Entity> {
-    let mut children: HashMap<Entity, Vec<Entity>> = HashMap::new();
+    descendants_of(world, &[root])
+}
+
+/// Descendants of several roots (including the roots) with one pass over the hierarchy.
+pub fn descendants_of(world: &World, roots: &[Entity]) -> Vec<Entity> {
+    let mut children: FxMap<Entity, Vec<Entity>> = FxMap::default();
     for (e, p) in world.query::<(Entity, &Parent)>().iter() {
         children.entry(p.0).or_default().push(e);
     }
     let mut out = vec![];
-    let mut stack = vec![root];
+    let mut seen: std::collections::HashSet<Entity, std::hash::BuildHasherDefault<FxHasher>> = Default::default();
+    let mut stack: Vec<Entity> = roots.to_vec();
     while let Some(e) = stack.pop() {
+        if !seen.insert(e) {
+            continue;
+        }
         out.push(e);
         if let Some(c) = children.get(&e) {
             stack.extend(c.iter().copied());

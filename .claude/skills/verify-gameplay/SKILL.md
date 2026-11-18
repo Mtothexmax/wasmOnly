@@ -61,10 +61,34 @@ node tools/bridge.mjs call audio                          # history: [{sound, st
 Panel hover/clicks are evaluated per *rendered frame*, not per `step`: let real frames pass (as above)
 when testing the pointer path. `audio.history[].step` tells you in which sim step a sound started.
 
-## Demo game ("Tumble") commands
+## Scripted test runs (preferred for anything you will check again)
 
-`reset`, `teleport {pos:[x,y,z]}`, `shoot_at {target:[x,y,z]}`; `game_state` has `score`, `total`,
-`player_pos`, `slowmo`. Terminal panel buttons: `reset`, `shadows`, `slowmo`, `sound`. Other games list theirs under `call help`.
+One command runs a whole scenario and returns a pass/fail report per step:
+
+```bash
+node tools/bridge.mjs run games/demo/tests/smoke.txt          # file (text or JSON array)
+node tools/bridge.mjs run --commands "pause; step 60; key Space; step 15; expect game_state.state.jumps == 1"
+```
+
+Verbs: `reload`, `pause`, `resume`, `step N`, `frames N`, `wait ms`, `key Code` (tap), `down/up Code`,
+`hold Code N`, `mouse dx dy`, `click x y`, `action name`, `screen name`, `call cmd {json}`,
+`wait_for <path> <op> <value> [ms]`, `expect <path> <op> <value>`, `screenshot file`, `log text`.
+Paths are `<command>.<field>.<index>` (`game_state.state.walker.pos.2`, `render_texture.render_textures.0.renders`),
+args in braces: `entity{"id":5}.pos.1`. Ops: `== != < <= > >= ~= contains`. The report lists
+`new_log` (engine warnings/errors during the run) — a passing run with a new warning is still a finding.
+`--keep-going` runs past failures; a live reload mid-run (rebuild) stops the run with a clear message.
+MCP: `run_script {script}`. Put durable scripts in `games/<g>/tests/` (ignored by the watcher).
+
+## Demo game ("Tumble")
+
+Screens: `title` -> `play` (+ `pause` overlay). `game_state` = `{screen, stack, state}`; in `play`, `state` has
+`score`, `total`, `grounded`, `jumps`, `player_pos`, `control` (`ball`|`walker`), `walker {pos, grounded,
+velocity, jumps}`, `walker_animation`, `camera {yaw, pitch, distance}`, `progress` (saved best/wins/plays).
+Commands (play): `reset`, `teleport {pos}`, `shoot_at {target}`, `control {walker: bool}`; `screens {switch: "play"}`.
+Keys: WASD, Space, C (ball/walker), R, P/Escape (pause). Screen `world` (open world): `game_state.state.hero`
+{local, absolute, grounded, ground_height}, commands `night {on}`, `teleport {pos: [x, z]}` (absolute); test
+`games/demo/tests/world.txt` (streaming, origin shift, z-fighting in a radius, lights). Terminal panel buttons: `reset`, `shadows`, `slowmo`,
+`sound`. Smoke test: `games/demo/tests/smoke.txt`. Other games list theirs under `call help`.
 
 ## Reproducing what the user did
 

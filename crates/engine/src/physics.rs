@@ -15,6 +15,8 @@ pub struct Body(pub RigidBodyHandle);
 
 pub struct Physics {
     pub world: PhysicsWorld,
+    /// Static colliders added since the last scene tagging (see `screens::Scenes`).
+    pub(crate) new_statics: Vec<ColliderHandle>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -43,7 +45,7 @@ impl Physics {
     pub fn new() -> Self {
         let mut world = PhysicsWorld::new();
         world.gravity = Vec3::new(0.0, -9.81, 0.0);
-        Self { world }
+        Self { world, new_statics: vec![] }
     }
 
     pub fn set_gravity(&mut self, g: Vec3) {
@@ -74,9 +76,9 @@ impl Physics {
 
     /// Adds a static collider not attached to any body (e.g. level geometry).
     pub fn add_static(&mut self, collider: ColliderBuilder, at: Vec3) -> ColliderHandle {
-        self.world
-            .colliders
-            .insert(collider.translation(at).build())
+        let h = self.world.colliders.insert(collider.translation(at).build());
+        self.new_statics.push(h);
+        h
     }
 
     pub fn remove(&mut self, world: &World, entity: Entity) {

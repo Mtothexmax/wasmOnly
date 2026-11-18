@@ -76,11 +76,47 @@ node tools/bridge.mjs call render '{"debug_view":1}'   # normals
 node tools/bridge.mjs call render '{"debug_view":2}'   # shadow term (white = lit)
 node tools/bridge.mjs call render '{"debug_view":0}'   # back to lit
 node tools/bridge.mjs call render '{"shadows":false}'
-node tools/bridge.mjs call render '{"sun_dir":[-0.4,-1,-0.3],"sun_intensity":3,"shadow_extent":30}'
+node tools/bridge.mjs call render '{"sun_dir":[-0.4,-1,-0.3],"sun_intensity":3,"shadow_distance":160}'
 node tools/bridge.mjs screenshot <scratch>/view.png
 ```
 
 Reset debug settings before finishing.
+
+## Atmosphere and post-processing
+
+Frame: opaque pass (+ sky, drawn last at the far plane) and blend pass (+ particles) render into a 4x MSAA
+`rgba16float` target; then bloom (quarter-res mip chain) and a composite pass (depth darkening, exposure, ACES,
+gamma) write the canvas. Shaders output **linear HDR**; alpha of the scene colour is the tonemap mask
+(1 = scene, 0 = UI panels / debug views shown as-is). Fog is applied per fragment (`apply_fog` in
+`common.wgsl`), its colour is the sky towards the horizon unless `fog_color` is set.
+
+```bash
+node tools/bridge.mjs call render                                      # all settings
+node tools/bridge.mjs call render '{"fog_density":0}'                  # isolate: fog off
+node tools/bridge.mjs call render '{"bloom":false,"depth_darkening":0}'  # isolate post effects
+node tools/bridge.mjs call stats   # render.gpu_ms.post = bloom + composite, render.particles
+```
+
+Something glows too much: bloom picks up HDR values above `bloom_threshold` (emissive > ~1.2, additive
+particles). Everything washed out / too dark: `exposure`. Far objects vanish: `fog_max` / `fog_density`.
+Dark halos around objects against far background: `depth_darkening_range` (silhouette cutoff, metres).
+Render textures (`call render_texture`) render the same pipeline with their camera's `layers` mask;
+`RenderTextureOpts` override sky/fog/bloom/shadows. A camera with `RenderTextureCamera` is never the main camera.
+
+## Shadows (cascades) and many lights
+
+`render {debug_view: 3}` colours each pixel by shadow cascade (red, green, blue, yellow, grey = beyond
+`shadow_distance`); `stats.render.cascades` lists their far distances. Blocky/shimmering far shadows: fewer metres per
+cascade (`shadow_distance` down, `shadow_split_lambda` up). Missing shadow from a tall object just outside the view:
+casters are kept up to 120 m towards the sun. `render {debug_view: 4}` = lights per cluster (heatmap, 32+ = yellow);
+`stats.render.lights` = total / visible / max per cluster / CPU ms. Stress test: `lights {grid: {n: 20}}`,
+`lights {clear_test: true}`.
+
+## Terrain and grass
+
+`terrain` shows chunks loaded/built and the height range; `terrain {height_at: [x, z]}` compares with what you see.
+Cracks between chunks: `TerrainDesc.skirt`. Grass missing: `grass` (`has_terrain`, `blades_last_frame`), the splat
+layer (`terrain {height_at}` → `splat`), `render {grass: true}`. Terrain looks tiled: `TerrainDesc.tiling`.
 
 ## Culling, LOD, mips
 
@@ -99,7 +135,8 @@ node tools/bridge.mjs call render '{"occlusion_culling":false}' # GPU frustum on
 ## Renderer facts
 
 - Forward PBR (GGX), 4× MSAA, ACES tonemap, manual sRGB output.
-- 1 sun with 2048² shadow map (3×3 PCF, texel-snapped, fits `shadow_extent` around the camera target).
+- 1 sun with 1–4 cascaded 2048² shadow maps (3×3 PCF, texel-snapped bounding spheres up to `shadow_distance`, cascade blend band).
+- Clustered point + spot lights (16x9x24 froxels, up to 2048 lights, assigned on the CPU each frame).
 - Up to 16 point lights (`PointLight` component); more are ignored.
 - Instances sorted by texture then mesh; one storage buffer that grows as needed.
 - Textures get full mip chains (GPU blit) and 8x anisotropic filtering. KTX2 is not supported.

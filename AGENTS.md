@@ -17,6 +17,9 @@ node tools/bridge.mjs call help     # list every engine + game command
 node tools/bridge.mjs screenshot out.png
 node tools/bridge.mjs check          # build check: reload, assets, z-fighting, engine errors (exit 1 = fail)
 node tools/dev.mjs build --check     # build + check in one step (watch --check: after every rebuild)
+node tools/bridge.mjs run games/demo/tests/smoke.txt   # scripted test run (input, step, expect, screenshot)
+node tools/new-game.mjs ../my-game                     # new standalone game repo (see HANDOFF.md)
+node tools/dev.mjs watch --game-dir ../my-game         # build/serve a game from another folder
 ```
 
 Or use the MCP server (`.mcp.json` registers `wasmonly`): tools `launch_chrome`, `status`,
@@ -47,6 +50,34 @@ normal `cargo` output above it.
      mapping (pixels stay put), returns flickering regions + entity + `depth_ties` partner; catches what the
      geometric test skips (water, displaced meshes). `check --flicker` includes it.
   Fix by offsetting one surface (height, inset) instead of relying on depth bias.
+- **Scripted test runs:** `bridge run <file>` or `run --commands "key Space; step 30; expect game_state.state.jumps == 1"`
+  executes a list (reload, pause, step N, frames N, wait ms, key/down/up/hold, mouse, click, action, screen,
+  call, wait_for, expect, screenshot) and returns a pass/fail report per step plus new engine warnings; exit 1
+  on failure. MCP: `run_script`. Syntax in the header of `tools/script.mjs`; example `games/demo/tests/smoke.txt`.
+  Test scripts live in `games/<g>/tests/` (the watcher ignores that folder, so screenshots don't trigger reloads).
+- **Screens / scenes:** `call screens` = stack, history, scenes; `screens {switch|push|reset: name}`, `{pop:true}`.
+  `call scenes` = entity count per scene, `{unload: name}`. `game_state` of a `ScreenStack` game is
+  `{screen, stack, state}` (the top screen's `debug_state` is in `state`).
+- **Save games:** `call save` lists slots (localStorage) + IndexedDB blob count; `{slot}` reads one (with
+  version + time), `{op:"set", slot, data}`, `{op:"delete", slot}`, `{op:"blobs"}`.
+- **Animation:** `call animation` lists animators; `{id}` = clips, playing clip + time, crossfade, deformers
+  (skinned, joints, morph weights); `{id, play, fade?, speed?, looped?}`, `{id, morph, weight}`.
+- **Particles:** `call particles` = emitters + live counts; `{preset, pos, burst?}` spawns one.
+- **Render textures:** `call render_texture` = size, camera, renders, export url; `{id, render:true}`, `{id, export:true}`.
+- **Open world:** `call world` = floating origin (`origin`, `shifts`), streaming layers (loaded cells, loads/unloads,
+  build ms), entity + mesh counts; `{shift:[x,y,z]}`, `{origin_shift_distance}`, `{layer, radius, enabled}`.
+  `call terrain` = size, chunks loaded/built/unloaded, height range; `{height_at:[x,z]}` (absolute), `{flatten|raise|paint}`.
+  `call grass` (GPU grass settings, blade count), `call lights` (clustered lights; `{grid:{n}}` stress test),
+  `call generate` (registered generators; `{name, params, seed, pos}` spawns one live), `call batch` (static batches,
+  moving instances). Debug views: `render {debug_view:3}` = shadow cascades, `4` = lights per cluster.
+  In big worlds use `zfight {radius: 150}` — a full check over ~1M triangles takes seconds.
+- **Characters:** `call characters` = every character controller (pos, grounded, velocity, jumps, held jump,
+  wish, blocked time, touching entities); `{id, pos}` places one. "stuck"/"jump blocked" warnings in the log
+  name the blocking entity.
+- **Resolution:** `render {render_scale}` (0.25..1), `auto_resolution` (default on) adapts it to
+  `frame_budget_ms` of GPU time; `stats.render` has `width/height` (scene) and `canvas`.
+- **Render settings:** `call render` lists every setting; set any by name (sky, fog_*, bloom*, exposure,
+  depth_darkening, vignette, saturation, particles, shadows, ...). Unknown names are an error.
 - **Visual checks:** `render '{"debug_view":1}'` = normals, `2` = shadow term, `0` = lit.
 - **3D UI:** `call panels` gives every world-panel widget with its on-screen centre (`screen`, CSS px);
   click it for real with `input {x,y}` + `input {button:0}`, or directly with `panel_click {id, widget}`.
@@ -75,7 +106,20 @@ normal `cargo` output above it.
 | Path | What |
 |---|---|
 | `crates/engine/src/app.rs` | `Game` trait, `Ctx`, frame loop (fixed step + rAF), input listeners |
-| `crates/engine/src/renderer.rs` | WebGPU forward PBR, shadows, MSAA, instancing, mips, LOD pick, CPU/GPU culling switch |
+| `crates/engine/src/renderer.rs` | WebGPU forward PBR into an HDR target, shadows, MSAA, instancing, mips, LOD pick, CPU/GPU culling switch, views (canvas + render textures), layers |
+| `crates/engine/src/post.rs` | HDR targets, bloom (dual-filter mips), depth darkening, ACES composite; sky + particle pipelines |
+| `crates/engine/src/render_texture.rs` | render to texture (portraits, mirrors), PNG export to a blob URL |
+| `crates/engine/src/particles.rs` | CPU-simulated particle systems (fixed step, presets), instanced billboards |
+| `crates/engine/src/animation.rs` | glTF clips (step/linear/cubic), `Animator` crossfades, CPU skinning + morph targets (`Deformer`) |
+| `crates/engine/src/character.rs` | `CharacterController` (rapier KCC: slopes, steps, snap, coyote/jump buffer) + `ThirdPersonCamera` |
+| `crates/engine/src/screens.rs` | `ScreenStack`/`Screen`/`Trans` (title/menu/play/pause), scenes = entity groups loaded/unloaded together |
+| `crates/engine/src/save.rs` | save slots (localStorage, versioned JSON) + blobs (IndexedDB) |
+| `crates/engine/src/geom.rs` | geometry kit for procedural content (`MeshBuilder`: parts, walls with openings, extrude, sweep, lathe) + generator registry |
+| `crates/engine/src/batch.rs` | static batching (`batch_static`) + `Motion` (spin/sway/bob instance animation) |
+| `crates/engine/src/lights.rs` | clustered lighting (16x9x24 froxels, point + `SpotLight`, up to 2048) |
+| `crates/engine/src/terrain.rs` | heightmap terrain: chunk LOD + skirts, splat material, heightfield colliders, streaming, edits, scatter rules |
+| `crates/engine/src/vegetation.rs` | GPU grass (vertex-shader placed blades) |
+| `crates/engine/src/streaming.rs` | streaming layers (cells = scenes) + floating origin (`ctx.origin`, `shift_origin`) |
 | `crates/engine/src/gpu_cull.rs` | compute culling (frustum + Hi-Z occlusion), indirect args, counter readback |
 | `crates/engine/src/panel.rs` | world panels: Canvas2D widgets -> texture on a quad, ray/UV hit test |
 | `crates/engine/src/audio.rs` | Web Audio, 3D panner voices, per-voice effect chain (filters, echo, reverb, distortion, pan, detune) |
@@ -85,7 +129,7 @@ normal `cargo` output above it.
 | `crates/engine/src/jobs.rs` | job system: serial on stable, rayon Web Workers with the `threads` feature |
 | `crates/engine/src/touch.rs` | multi-touch gestures: joystick, look, pinch, tap, hold, swipe |
 | `crates/engine/src/mesh.rs` | primitives, `simplify_cluster` (auto LOD) |
-| `crates/engine/src/shaders/*.wgsl` | `common.wgsl` is prepended to pbr/shadow; `cull`, `hiz`, `mipgen` are standalone |
+| `crates/engine/src/shaders/*.wgsl` | `common.wgsl` (layouts, sky, fog) is prepended to pbr/shadow/sky/particles; `cull`, `hiz`, `mipgen`, `post` are standalone |
 | `crates/engine/src/debug.rs` | the AI API (`COMMANDS` table = `help` output) |
 | `crates/engine/src/debugmode.rs` | ` debug mode: input + camera log -> dev server `/__debuglog` -> `logs/` |
 | `crates/engine/src/physics.rs` | rapier3d wrapper, `Body` component, raycasts |
@@ -94,6 +138,10 @@ normal `cargo` output above it.
 | `games/demo/` | example game; `assets/` is copied to `dist/assets/` |
 | `tools/asset-cook/` | native russimp/Assimp cooker: OBJ/FBX/DAE/... -> `.glb` |
 | `tools/bridge.mjs` | CDP bridge CLI + MCP server |
+| `tools/script.mjs` | scripted test runs (`bridge run`, MCP `run_script`) |
+| `tools/qa.mjs` | build check, flicker scan, perf capture |
+| `tools/new-game.mjs` | scaffold for a standalone game repository |
+| `HANDOFF.md` | guide for agents building a game on the engine elsewhere |
 
 ## Rules
 
@@ -106,4 +154,6 @@ normal `cargo` output above it.
 - Adding an engine command: add it to `COMMANDS` and the `match` in `debug.rs`.
   Game-specific commands go in `Game::debug_command` + `debug_commands`.
 - `wasm-bindgen` in `Cargo.toml` is pinned to the installed CLI version (`wasm-bindgen --version`).
-- In `fixed_update` read held input (`input.key`), edge input (`key_pressed`) in `update`.
+- Input: `input.key` = held; `key_pressed` = edge — in `update` per frame, in `fixed_update` latched since the last
+  fixed step (short taps and taps while paused are never lost). Jump/fire-style actions: `key_down_or_pressed`.
+  Every new action gets a scripted test with a short tap (`key Space` + `step N` while paused).

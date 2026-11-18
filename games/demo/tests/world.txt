@@ -1,0 +1,52 @@
+# Open world: terrain streaming, prop cells, floating origin, character on the heightfield.
+#   node tools/bridge.mjs run games/demo/tests/world.txt
+
+reload
+call screens {"switch": "world"}
+wait_for game_state.screen == "world" 5000
+wait_for terrain.chunks_loaded >= 150 20000
+wait_for assets.models_pending == [] 8000
+frames 30
+expect zfight{"radius":150}.pairs == 0
+expect stats.render.grass_blades > 10000
+expect world.layers.0.loaded > 10
+
+# the hero stands on the terrain (heightfield collider)
+pause
+step 120
+expect game_state.state.hero.grounded == true
+screenshot shots/world-town.png
+
+# small shift threshold so the teleport below must move the origin
+call world {"origin_shift_distance": 200}
+call teleport {"pos": [380, -380]}
+resume
+frames 10
+pause
+step 120
+expect world.shifts >= 1
+expect game_state.state.hero.grounded == true
+expect game_state.state.hero.absolute.0 > 375
+expect game_state.state.hero.absolute.0 < 385
+# local coordinates stay small after the shift
+expect game_state.state.hero.local.0 < 200
+expect game_state.state.hero.local.0 > -200
+resume
+
+# streaming: far chunks/cells unloaded, near ones loaded
+wait_for terrain.chunks_unloaded > 0 15000
+wait_for world.layers.0.unloads > 0 15000
+frames 30
+expect zfight{"radius":150}.pairs == 0
+screenshot shots/world-edge.png
+
+# night: hundreds of lamps are clustered lights
+call teleport {"pos": [-10, 70]}
+frames 60
+call night {"on": true}
+wait_for lights.point >= 100 5000
+expect stats.render.lights.visible >= 20
+frames 10
+screenshot shots/world-night.png
+call night {"on": false}
+call world {"origin_shift_distance": 1500}

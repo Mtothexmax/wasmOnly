@@ -6,6 +6,9 @@
 //     from Cargo.toml [workspace.metadata.wasmonly] threads-toolchain + build-std; output in target/threads.
 //   node tools/dev.mjs serve [--port 8080]               -> static server for dist/ (+ /__events live reload)
 //   node tools/dev.mjs watch [--game demo] [--port 8080] -> build, serve, rebuild + reload on change
+//   --game-dir <path>: a standalone game crate anywhere (its own repo, made by tools/new-game.mjs):
+//     built there (its rust-toolchain.toml + .cargo/config.toml), output in <path>/dist, assets from
+//     <path>/assets, page from <path>/web/index.html (else the engine's), debug logs in <path>/logs.
 //   --check (build/watch): after each successful build run `bridge check` in the debug Chrome
 //     (reload, assets, z-fighting, engine errors; --flicker adds the flicker scan) and print
 //     {"check":{...}}. build exits 1 if the check fails. Skipped when no Chrome is listening.
@@ -26,12 +29,19 @@ import http from 'node:http';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const DIST = path.join(ROOT, 'dist');
 const args = process.argv.slice(2);
 const cmd = args[0] ?? 'watch';
 const opt = (name, def) => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : def; };
 const flag = (name) => args.includes(name);
-const game = opt('--game', 'demo');
+// External game crate (own repository) or a member of this workspace (games/<name>).
+const GAME_DIR = opt('--game-dir') ? path.resolve(opt('--game-dir')) : null;
+const crateName = (dir) => (fs.readFileSync(path.join(dir, 'Cargo.toml'), 'utf8').match(/\[package\][^\[]*?name\s*=\s*"([^"]+)"/s) ?? [])[1];
+const game = GAME_DIR ? crateName(GAME_DIR) : opt('--game', 'demo');
+if (GAME_DIR && !game) { console.error(`${GAME_DIR}/Cargo.toml: no [package] name`); process.exit(2); }
+/** Project root: the game repo for --game-dir, else this repo. */
+const PROJECT = GAME_DIR ?? ROOT;
+const DIST = path.join(PROJECT, 'dist');
+const GAME_SRC = GAME_DIR ?? path.join(ROOT, 'games', game);
 const release = flag('--release');
 const threads = flag('--threads');
 
@@ -65,7 +75,7 @@ function copyDir(src, dst) {
 }
 
 function checkBindgenVersion() {
-  const lock = fs.readFileSync(path.join(ROOT, 'Cargo.lock'), 'utf8');
+  const lock = fs.readFileSync(path.join(PROJECT, 'Cargo.lock'), 'utf8');
   const m = lock.match(/name = "wasm-bindgen"\r?\nversion = "([^"]+)"/);
   const cli = execFileSync('wasm-bindgen', ['--version'], { encoding: 'utf8' }).trim().split(' ')[1];
   if (m && m[1] !== cli) {
@@ -76,34 +86,36 @@ function checkBindgenVersion() {
 export function build() {
   const t0 = Date.now();
   const profile = release ? 'release' : 'debug';
-  const cargoArgs = ['build', '-p', game, '--target', 'wasm32-unknown-unknown'];
+  const cargoArgs = GAME_DIR
+    ? ['build', '--manifest-path', path.join(GAME_DIR, 'Cargo.toml'), '--target', 'wasm32-unknown-unknown']
+    : ['build', '-p', game, '--target', 'wasm32-unknown-unknown'];
   if (release) cargoArgs.push('--release');
   const env = { ...process.env };
-  let targetDir = path.join(ROOT, 'target');
+  let targetDir = path.join(PROJECT, 'target');
   let toolchain = null;
   if (threads) {
     toolchain = threadsToolchain();
     cargoArgs.unshift(`+${toolchain}`);
     cargoArgs.push('-Z', 'build-std=panic_abort,std', '--features', 'engine/threads');
-    targetDir = path.join(ROOT, 'target', 'threads');
+    targetDir = path.join(PROJECT, 'target', 'threads');
     env.CARGO_TARGET_DIR = targetDir;
     env.CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS = THREAD_RUSTFLAGS;
   }
   console.log(`> cargo ${cargoArgs.join(' ')}`);
-  const r = spawnSync('cargo', cargoArgs, { cwd: ROOT, stdio: 'inherit', env });
+  const r = spawnSync('cargo', cargoArgs, { cwd: PROJECT, stdio: 'inherit', env });
   if (r.status !== 0) {
     console.log(JSON.stringify({ build: 'error', stage: 'cargo', game, profile }));
     return false;
   }
   checkBindgenVersion();
-  const wasm = path.join(targetDir, 'wasm32-unknown-unknown', profile, `${game}.wasm`);
+  const wasm = path.join(targetDir, 'wasm32-unknown-unknown', profile, `${game.replace(/-/g, '_')}.wasm`);
   const pkg = path.join(DIST, 'pkg');
   fs.rmSync(pkg, { recursive: true, force: true });
   const bg = ['--target', 'web', '--out-dir', pkg, '--out-name', 'game', '--no-typescript'];
   if (!release) bg.push('--keep-debug'); // DWARF for Chrome DevTools (C/C++ DevTools Support extension)
   bg.push(wasm);
   console.log(`> wasm-bindgen ${bg.join(' ')}`);
-  const b = spawnSync('wasm-bindgen', bg, { cwd: ROOT, stdio: 'inherit' });
+  const b = spawnSync('wasm-bindgen', bg, { cwd: PROJECT, stdio: 'inherit' });
   if (b.status !== 0) {
     console.log(JSON.stringify({ build: 'error', stage: 'wasm-bindgen', game, profile }));
     return false;
@@ -117,8 +129,9 @@ export function build() {
       console.log('(wasm-opt not found — skipping; install binaryen for smaller release builds)');
     }
   }
-  fs.copyFileSync(path.join(ROOT, 'web', 'index.html'), path.join(DIST, 'index.html'));
-  copyDir(path.join(ROOT, 'games', game, 'assets'), path.join(DIST, 'assets'));
+  const page = [path.join(GAME_SRC, 'web', 'index.html'), path.join(ROOT, 'web', 'index.html')].find((p) => fs.existsSync(p));
+  fs.copyFileSync(page, path.join(DIST, 'index.html'));
+  copyDir(path.join(GAME_SRC, 'assets'), path.join(DIST, 'assets'));
   const info = { build: 'ok', game, profile, threads, toolchain: toolchain ?? 'rust-toolchain.toml', ms: Date.now() - t0, wasm_bytes: fs.statSync(out).size };
   console.log(JSON.stringify(info));
   return true;
@@ -183,14 +196,14 @@ export function serve() {
     if (url.pathname === '/__debuglog' && req.method === 'POST') {
       const name = (url.searchParams.get('file') ?? 'debug.log').replace(/[^A-Za-z0-9._-]/g, '_');
       if (!name.endsWith('.log')) { res.writeHead(400).end('file must end in .log'); return; }
-      const dir = path.join(ROOT, 'logs');
+      const dir = path.join(PROJECT, 'logs');
       const chunks = [];
       req.on('data', (c) => chunks.push(c));
       req.on('end', () => {
         fs.mkdirSync(dir, { recursive: true });
         const file = path.join(dir, name);
         fs.appendFileSync(file, Buffer.concat(chunks));
-        res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ file: path.relative(ROOT, file).split(path.sep).join('/') }));
+        res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ file: path.relative(PROJECT, file).split(path.sep).join('/') }));
       });
       return;
     }
@@ -249,15 +262,17 @@ function watch() {
       if (again) { again = false; trigger(); }
     }, 200);
   };
-  for (const dir of ['crates', 'games', 'web']) {
-    fs.watch(path.join(ROOT, dir), { recursive: true }, (_ev, file) => {
-      if (file && !/target|[\\/]\.|~$/.test(file)) trigger();
+  const dirs = GAME_DIR ? [GAME_DIR, path.join(ROOT, 'crates'), path.join(ROOT, 'web')] : ['crates', 'games', 'web'].map((d) => path.join(ROOT, d));
+  for (const dir of dirs) {
+    fs.watch(dir, { recursive: true }, (_ev, file) => {
+      // build output, logs, test scripts + their screenshots (tests/) must not trigger a rebuild + live reload mid-run
+      if (file && !/target|(^|[\\/])(dist|logs|node_modules)([\\/]|$)|[\\/]\.|^\.|~$|(^|[\\/])tests[\\/]/.test(file)) trigger();
     });
   }
-  console.log('watching crates/ games/ web/ ...');
+  console.log(`watching ${dirs.map((d) => path.relative(process.cwd(), d) || '.').join(', ')} ...`);
 }
 
 if (cmd === 'build') process.exit(build() && (!flag('--check') || runCheck()) ? 0 : 1);
 else if (cmd === 'serve') serve();
 else if (cmd === 'watch') watch();
-else { console.error('usage: node tools/dev.mjs build|serve|watch [--game demo] [--release] [--port 8080]'); process.exit(2); }
+else { console.error('usage: node tools/dev.mjs build|serve|watch [--game demo | --game-dir <path>] [--release] [--threads] [--check] [--port 8080]'); process.exit(2); }

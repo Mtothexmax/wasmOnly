@@ -24,7 +24,8 @@ pub trait Game: 'static {
     /// Called once after the GPU is ready.
     fn init(&mut self, ctx: &mut Ctx);
     /// Fixed-rate simulation step (`ctx.time.fixed_dt`), runs *before* physics. Deterministic.
-    /// Read held input here (`input.key`); edge events (`key_pressed`) belong in `update`.
+    /// Held input: `input.key`; edges: `input.key_pressed` (here: pressed since the last step, so
+    /// short taps are never lost); for jump/fire-style actions `input.key_down_or_pressed`.
     fn fixed_update(&mut self, _ctx: &mut Ctx) {}
     /// Once per rendered frame, after the fixed steps (camera, UI, edge-triggered input).
     fn update(&mut self, _ctx: &mut Ctx, _dt: f32) {}
@@ -121,6 +122,18 @@ pub struct Ctx {
     pub zcheck: crate::zfight::AutoCheck,
     /// Debug mode (` key): input + camera log file, badge (see [`crate::debugmode`]).
     pub debug_mode: crate::debugmode::DebugMode,
+    /// Save slots (localStorage) and blobs (IndexedDB), see [`crate::save`].
+    pub save: crate::save::Save,
+    /// Scene membership of entities, see [`crate::screens`] (`begin_scene`, `unload_scene`).
+    pub scenes: crate::screens::Scenes,
+    /// Procedural generators (see [`crate::geom`]).
+    pub generators: crate::geom::Generators,
+    /// Streaming layers + floating origin settings (see [`crate::streaming`]).
+    pub streaming: crate::streaming::Streaming,
+    /// Heightmap terrain (see [`crate::terrain`]).
+    pub terrain: Option<crate::terrain::Terrain>,
+    /// Absolute world position of the local origin (floating origin, see `Ctx::shift_origin`).
+    pub origin: glam::DVec3,
     pub time: Time,
     pub rng: Rng,
     pub canvas: HtmlCanvasElement,
@@ -232,6 +245,16 @@ impl Ctx {
         }
     }
 
+    /// Puts `e` and all its descendants on render layer `layer` (also glTF nodes loaded later).
+    pub fn set_layer(&mut self, e: Entity, layer: u8) {
+        let _ = self.world.insert_one(e, scene::RenderLayer(layer));
+        for d in scene::descendants(&self.world, e) {
+            if let Ok(mut mr) = self.world.get::<&mut MeshRenderer>(d) {
+                mr.layer = layer;
+            }
+        }
+    }
+
     pub fn find_by_name(&self, name: &str) -> Option<Entity> {
         self.world
             .query::<(Entity, &Name)>()
@@ -328,6 +351,42 @@ impl Ctx {
         }
     }
 
+    /// Creates a render texture (see [`crate::render_texture`]). Returns (id, texture for materials).
+    pub fn create_render_texture(&mut self, w: u32, h: u32, opts: crate::render_texture::RenderTextureOpts) -> (crate::render_texture::RenderTextureId, Option<crate::renderer::TextureId>) {
+        let label = format!("rtt{}", self.renderer.rtts.len());
+        match self.renderer.create_render_texture(w, h, opts, &label) {
+            Ok((id, tex)) => (id, Some(tex)),
+            Err(e) => {
+                log_error!("create_render_texture {w}x{h}: {e}");
+                (crate::render_texture::RenderTextureId(u32::MAX), None)
+            }
+        }
+    }
+
+    /// Makes `camera` (an entity with `Camera` + `Transform`) render into `rt`.
+    pub fn set_render_texture_camera(&mut self, rt: crate::render_texture::RenderTextureId, camera: Entity) {
+        if let Some(r) = self.renderer.rtts.get_mut(rt.0 as usize) {
+            r.camera = Some(camera);
+            r.pending = true;
+            let _ = self.world.insert_one(camera, crate::render_texture::RenderTextureCamera(rt));
+        }
+    }
+
+    /// Renders a `once` render texture again this frame (portrait changed).
+    pub fn refresh_render_texture(&mut self, rt: crate::render_texture::RenderTextureId) {
+        if let Some(r) = self.renderer.rtts.get_mut(rt.0 as usize) {
+            r.pending = true;
+        }
+    }
+
+    /// Starts a PNG export; the blob URL appears in `renderer.render_texture_url(rt)` shortly after.
+    pub fn export_render_texture(&mut self, rt: crate::render_texture::RenderTextureId) {
+        let Some(r) = self.renderer.rtts.get(rt.0 as usize) else { return };
+        if let Err(e) = crate::render_texture::start_export(&self.renderer.device, &self.renderer.queue, r) {
+            log_error!("export_render_texture: {e}");
+        }
+    }
+
     pub fn request_pointer_lock(&self) {
         self.canvas.request_pointer_lock();
     }
@@ -342,9 +401,15 @@ impl Ctx {
 /// Runs one fixed simulation step (game logic, then physics).
 pub(crate) fn fixed_step<G: Game>(ctx: &mut Ctx, game: &mut G) {
     let t0 = log::now_ms();
+    ctx.input.begin_fixed();
     game.fixed_update(ctx);
+    ctx.input.end_fixed();
     let t1 = log::now_ms();
     let dt = ctx.time.fixed_dt;
+    crate::character::step_characters(ctx, dt);
+    crate::particles::step_all(ctx, dt);
+    crate::animation::advance_all(&mut ctx.world, dt);
+    crate::batch::step_motion(&mut ctx.world, dt);
     let Ctx { physics, world, .. } = ctx;
     physics.step(world, dt);
     let t2 = log::now_ms();
@@ -408,6 +473,12 @@ async fn start<G: Game>(game: G) -> Result<(), String> {
         audio: Audio::default(),
         debug_mode: Default::default(),
         zcheck: Default::default(),
+        save: Default::default(),
+        scenes: Default::default(),
+        generators: Default::default(),
+        streaming: Default::default(),
+        terrain: None,
+        origin: glam::DVec3::ZERO,
         time: Time {
             fixed_dt: 1.0 / 60.0,
             step: 0,
@@ -549,17 +620,28 @@ fn frame<G: Game>(c: &mut Ctx, game: &mut G, dt: f32) {
     }
     game.update(c, dt);
     let t_update = log::now_ms();
+    {
+        let Ctx { scenes, world, physics, .. } = c;
+        scenes.tag_new(world, physics);
+    }
+    c.update_streaming();
+    c.update_terrain();
+    crate::character::update_cameras(c, dt);
+    crate::animation::apply_poses(&mut c.world);
     scene::propagate_transforms(&mut c.world);
+    crate::animation::deform_all(c);
     c.panels.flush(&mut c.renderer);
     {
         let pending = c.models.pending.len();
         let Ctx { zcheck, world, renderer, .. } = c;
-        zcheck.tick(world, renderer, pending, log::now_ms());
+        let cam = world.query::<(&scene::Camera, &scene::GlobalTransform)>().without::<&crate::render_texture::RenderTextureCamera>().iter().next().map(|(_, g)| g.translation());
+        zcheck.tick(world, renderer, pending, log::now_ms(), cam);
     }
     {
         let cam = c
             .world
             .query::<(&scene::Camera, &scene::GlobalTransform)>()
+            .without::<&crate::render_texture::RenderTextureCamera>()
             .iter()
             .next()
             .map(|(_, g)| g.0);
@@ -576,6 +658,9 @@ fn frame<G: Game>(c: &mut Ctx, game: &mut G, dt: f32) {
                 "triangles": c.renderer.stats.triangles,
                 "entities": c.world.len(),
                 "bodies": c.physics.body_count(),
+                // what the game was doing: a "does nothing" report can be read from the log alone
+                "characters": crate::character::describe_characters(&c.world),
+                "game_state": game.debug_state(c),
             })
         };
         let v = if c.debug_mode.on() { snap() } else { serde_json::Value::Null }; // only built while logging
@@ -588,6 +673,7 @@ fn frame<G: Game>(c: &mut Ctx, game: &mut G, dt: f32) {
     let cam = c
         .world
         .query::<(&scene::Camera, &scene::GlobalTransform)>()
+        .without::<&crate::render_texture::RenderTextureCamera>()
         .iter()
         .next()
         .map(|(_, g)| g.0);
@@ -604,6 +690,7 @@ fn frame<G: Game>(c: &mut Ctx, game: &mut G, dt: f32) {
         }
     }
     let t_render = log::now_ms();
+    c.renderer.adapt_resolution(c.time.frame_dt);
     let vp = c.renderer.last_view_proj;
     let (cw, ch) = (
         c.canvas.client_width() as f32,
