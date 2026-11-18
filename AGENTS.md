@@ -86,8 +86,13 @@ normal `cargo` output above it.
   `down:false` or `release_all` releases them. Two agents at once: give each its own Chrome
   (`bridge launch --port 9223 --url http://localhost:8091/`, then `--port/--url` or `CDP_PORT`/`GAME_URL` on
   every command); `run`/`perf`/`check`/`flicker` bring their tab to the front (hidden tabs get no frames).
+- **Smooth motion:** dynamic bodies and character controllers are drawn interpolated between their last two
+  fixed-step poses (`crate::interp`, `call interpolation {on}`, opt out per entity with `NoInterpolation`). Check
+  smoothness with `call trace '{"id":N,"frames":300}'` then `call trace` -> `speed_jitter_pct` (a few % = smooth),
+  frames with 0 / 2+ steps. A high fps number can hide hitches: look at `perf` `frame_ms.max` / `missed_frames_pct`.
 - **Resolution:** `render {render_scale}` (0.25..1), `auto_resolution` (default on) adapts it to
-  `frame_budget_ms` of GPU time; `stats.render` has `width/height` (scene) and `canvas`.
+  `frame_budget_ms` of whole-frame GPU time (`gpu_ms.frame`); every change reallocates the targets (a 20-35 ms
+  hitch at 4K), so it jumps once to a scale that fits and changes at most every 4 s; `stats.render` has `width/height` (scene) and `canvas`.
 - **Render settings:** `call render` lists every setting; set any by name (sky, fog_*, bloom*, exposure,
   depth_darkening, vignette, saturation, particles, shadows, ...). Unknown names are an error.
 - **Visual checks:** `render '{"debug_view":1}'` = normals, `2` = shadow term, `0` = lit.

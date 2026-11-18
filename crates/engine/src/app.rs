@@ -81,7 +81,7 @@ pub struct Time {
     /// CPU milliseconds per engine phase (smoothed): where a frame's CPU time goes.
     pub phases: Phases,
     #[serde(skip)]
-    accumulator: f32,
+    pub(crate) accumulator: f32,
     #[serde(skip)]
     acc_game_fixed: f32,
     #[serde(skip)]
@@ -120,6 +120,12 @@ pub struct Ctx {
     pub audio: Audio,
     /// Automatic z-fighting check (debug builds), see [`crate::zfight::AutoCheck`].
     pub zcheck: crate::zfight::AutoCheck,
+    /// Draw dynamic bodies and characters between their last two fixed-step poses (smooth motion
+    /// at any display rate, see `crate::interp`). Default on.
+    pub interpolation: bool,
+    pub(crate) interp_shown: bool,
+    /// Motion trace (`trace` command): entity, frames left, samples [frame ms, steps, x, y, z].
+    pub(crate) trace: Option<(Entity, u32, Vec<[f32; 5]>)>,
     /// Debug mode (` key): input + camera log file, badge (see [`crate::debugmode`]).
     pub debug_mode: crate::debugmode::DebugMode,
     /// Save slots (localStorage) and blobs (IndexedDB), see [`crate::save`].
@@ -490,6 +496,7 @@ impl Ctx {
 /// Runs one fixed simulation step (game logic, then physics).
 pub(crate) fn fixed_step<G: Game>(ctx: &mut Ctx, game: &mut G) {
     let t0 = log::now_ms();
+    crate::interp::before_step(ctx);
     ctx.input.begin_fixed();
     game.fixed_update(ctx);
     ctx.input.end_fixed();
@@ -562,6 +569,9 @@ async fn start<G: Game>(game: G) -> Result<(), String> {
         audio: Audio::default(),
         debug_mode: Default::default(),
         zcheck: Default::default(),
+        interpolation: true,
+        interp_shown: false,
+        trace: None,
         save: Default::default(),
         scenes: Default::default(),
         gltf_defaults: Default::default(),
@@ -666,6 +676,9 @@ fn frame<G: Game>(c: &mut Ctx, game: &mut G, dt: f32) {
         if n == 8 {
             c.time.accumulator = 0.0; // spiral-of-death guard
         }
+        crate::interp::after_steps(c, n > 0);
+    } else {
+        crate::interp::after_steps(c, false);
     }
     let t_fixed = log::now_ms();
     // Touch: joystick axis + hold detection; taps on world panels click them (and are consumed).
@@ -727,6 +740,13 @@ fn frame<G: Game>(c: &mut Ctx, game: &mut G, dt: f32) {
     crate::water::follow_camera(c);
     crate::animation::apply_poses(&mut c.world);
     scene::propagate_transforms(&mut c.world);
+    if let Some((e, left, samples)) = c.trace.as_mut().filter(|t| t.1 > 0) {
+        if let Ok(g) = c.world.get::<&scene::GlobalTransform>(*e) {
+            let p = g.translation();
+            samples.push([dt * 1000.0, (c.time.step - step0) as f32, p.x, p.y, p.z]);
+        }
+        *left -= 1;
+    }
     crate::animation::deform_all(c);
     c.panels.flush(&mut c.renderer);
     {

@@ -651,6 +651,8 @@ pub struct Renderer {
     size: (u32, u32),
     canvas_size: (u32, u32),
     adapt: (f32, f32, u32),
+    adapt_last_change: f64,
+    adapt_up_votes: u32,
     meshes: Vec<GpuMesh>,
     /// Slots of removed meshes, reused by `add_mesh` (streaming frees and re-creates chunks).
     free_meshes: Vec<u32>,
@@ -1141,6 +1143,8 @@ impl Renderer {
             size: (0, 0),
             canvas_size: (0, 0),
             adapt: (0.0, 0.0, 0),
+            adapt_last_change: -1e9,
+            adapt_up_votes: 0,
             meshes: vec![],
             free_meshes: vec![],
             materials: vec![],
@@ -1834,14 +1838,21 @@ impl Renderer {
         self.resize_targets(w, h);
     }
 
-    /// Adaptive resolution: called once per frame with the frame interval. Every 30 frames the
-    /// average GPU time (timestamp queries; else the frame interval) is compared with the budget:
-    /// over it the scale drops by 10 %, well under it rises by 5 % (hysteresis, never above 1).
+    /// Adaptive resolution, called once per frame. Every change of `render_scale` reallocates the
+    /// render targets (a 20-35 ms hitch at 4K), so it changes rarely and lands on a value that fits:
+    /// * measures the whole-frame GPU time (`gpu_ms.frame`, includes clears/resolves; else the
+    ///   frame interval) averaged over 30 frames;
+    /// * GPU time scales with pixels, so the scale that fits is `s * sqrt(target / gpu)` with
+    ///   target = 90 % of `frame_budget_ms`; it jumps there in one step (0.05 grid);
+    /// * goes down when over budget, goes up only if the *predicted* time at the higher step stays
+    ///   under 85 % of the budget for 3 windows in a row (no up/down oscillation);
+    /// * at least 4 s between changes, except when more than 30 % over budget.
     pub fn adapt_resolution(&mut self, frame_dt: f32) {
         if !self.settings.auto_resolution {
+            self.adapt = (0.0, 0.0, 0);
             return;
         }
-        let gpu = self.stats.gpu_ms.filter(|g| g.samples > 0).map(|g| g.total);
+        let gpu = self.stats.gpu_ms.filter(|g| g.samples > 0).map(|g| if g.frame > 0.0 { g.frame } else { g.total });
         self.adapt.0 += gpu.unwrap_or(0.0);
         self.adapt.1 += frame_dt * 1000.0;
         self.adapt.2 += 1;
@@ -1852,15 +1863,53 @@ impl Renderer {
         let (avg_gpu, avg_frame) = (self.adapt.0 / n, self.adapt.1 / n);
         self.adapt = (0.0, 0.0, 0);
         let budget = self.settings.frame_budget_ms.max(2.0);
-        let (over, under) = match gpu {
-            Some(_) => (avg_gpu > budget, avg_gpu < budget * 0.8),
-            None => (avg_frame > 18.5, avg_frame < 17.2),
+        let s = self.settings.render_scale.clamp(0.25, 1.0);
+        let lo = self.settings.min_render_scale.clamp(0.25, 1.0);
+        let now = crate::log::now_ms();
+        let since = now - self.adapt_last_change;
+        let snap = |x: f32| ((x / 0.05).floor() * 0.05).clamp(lo, 1.0);
+        let next = match gpu {
+            Some(_) => {
+                let cost = avg_gpu.max(0.1);
+                if cost > budget {
+                    self.adapt_up_votes = 0;
+                    let emergency = cost > budget * 1.3;
+                    if since < 4000.0 && !emergency {
+                        return;
+                    }
+                    snap(s * (budget * 0.9 / cost).sqrt()).min(s - 0.05).max(lo)
+                } else {
+                    let up = snap(s + 0.05);
+                    let predicted = cost * (up / s).powi(2);
+                    if up > s && predicted < budget * 0.85 {
+                        self.adapt_up_votes += 1;
+                    } else {
+                        self.adapt_up_votes = 0;
+                    }
+                    if self.adapt_up_votes < 3 || since < 4000.0 {
+                        return;
+                    }
+                    self.adapt_up_votes = 0;
+                    // largest step that still fits
+                    let mut best = up;
+                    while best + 0.05 <= 1.0 + 1e-3 && cost * ((best + 0.05) / s).powi(2) < budget * 0.85 {
+                        best += 0.05;
+                    }
+                    best.min(1.0)
+                }
+            }
+            // no timestamp queries: frame interval (vsync-bound, coarse)
+            None => {
+                if since < 4000.0 {
+                    return;
+                }
+                if avg_frame > 18.5 { snap(s * 0.85) } else if avg_frame < 17.2 && s < 1.0 { snap(s + 0.05) } else { s }
+            }
         };
-        let s = self.settings.render_scale;
-        let next = if over { (s * 0.9).max(self.settings.min_render_scale) } else if under { (s * 1.05).min(1.0) } else { s };
         if (next - s).abs() > 0.004 {
             self.settings.render_scale = next;
-            crate::log_info!("adaptive resolution: scale {:.2} -> {:.2} (gpu {:.1} ms, frame {:.1} ms, budget {:.1} ms)", s, next, avg_gpu, avg_frame, budget);
+            self.adapt_last_change = now;
+            crate::log_info!("adaptive resolution: scale {:.2} -> {:.2} (gpu frame {:.1} ms, interval {:.1} ms, budget {:.1} ms)", s, next, avg_gpu, avg_frame, budget);
         }
     }
 

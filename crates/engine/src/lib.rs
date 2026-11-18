@@ -20,6 +20,7 @@ pub mod gltf_loader;
 pub mod gpu_timing;
 pub(crate) mod gpu_cull;
 pub mod input;
+pub mod interp;
 pub mod jobs;
 pub mod lights;
 pub mod log;

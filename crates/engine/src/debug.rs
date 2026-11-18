@@ -23,6 +23,8 @@ use wasm_bindgen::JsCast;
 
 pub const COMMANDS: &[(&str, &str)] = &[
     ("help", "List commands."),
+    ("trace", "Record the drawn position of an entity every rendered frame (smoothness check). args: {id, frames?: 120} starts; {} returns {done, samples: [[frame_ms, fixed_steps, x, y, z]], speed_jitter_pct} (mean frame-to-frame change of the drawn speed relative to the mean speed, in %; a few % = smooth, a hitch or a 0/2-step frame shows as a jump)."),
+    ("interpolation", "Render interpolation of dynamic bodies + characters between fixed steps (smooth motion at any display rate). args: {on?: bool}."),
     ("sky", "Sky + day/night: mode, time of day, sun/moon elevation, daylight, night, light, ambient. args: {time?: hours (turns the cycle on), cycle?: bool, day_length?: minutes per day (0 = still), mode?: gradient|atmosphere, clouds?, stars?, moon?, skybox?: url|null, skybox_blend?, skybox_night_blend?}."),
     ("inspect", "What is drawn at a canvas point (CSS px): entity, name, scene, local + absolute position, mesh, material, parent chain. args: {x, y, copy?: false}. In debug mode Ctrl+click does this and copies it to the clipboard."),
     ("characters", "Character controllers: pos, grounded, velocity, jumps, held jump, wish, blocked time, touching entities. args: {id?, pos?: [x,y,z] (place)}"),
@@ -642,6 +644,36 @@ pub(crate) fn handle<G: Game>(
         "save" => ctx.save.command(a),
         "particles" => ctx.particles_command(a),
         "sky" => ctx.sky_command(a),
+        "trace" => {
+            if a.get("id").is_some() {
+                let e = entity_arg(ctx, a)?;
+                let n = a.get("frames").and_then(|v| v.as_u64()).unwrap_or(120) as u32;
+                ctx.trace = Some((e, n, Vec::with_capacity(n as usize)));
+                return Ok(serde_json::json!({"started": true, "frames": n}));
+            }
+            let Some((_, left, s)) = &ctx.trace else { return Err("no trace; start with {id, frames}".into()) };
+            // speed per frame = distance / frame interval; jitter = mean |speed - mean| / mean
+            let speeds: Vec<f32> = s.windows(2).map(|w| {
+                let d = ((w[1][2] - w[0][2]).powi(2) + (w[1][3] - w[0][3]).powi(2) + (w[1][4] - w[0][4]).powi(2)).sqrt();
+                d / (w[1][0] / 1000.0).max(1e-4)
+            }).collect();
+            let mean = speeds.iter().sum::<f32>() / speeds.len().max(1) as f32;
+            // frame-to-frame speed change (acceleration over seconds does not count as jitter)
+            let jitter = if mean > 1e-3 && speeds.len() > 1 { speeds.windows(2).map(|w| (w[1] - w[0]).abs()).sum::<f32>() / (speeds.len() - 1) as f32 / mean * 100.0 } else { 0.0 };
+            let steps: Vec<u32> = s.iter().map(|x| x[1] as u32).collect();
+            Ok(serde_json::json!({
+                "done": *left == 0, "frames": s.len(), "mean_speed": mean, "speed_jitter_pct": jitter,
+                "frames_with_0_steps": steps.iter().filter(|&&n| n == 0).count(),
+                "frames_with_2plus_steps": steps.iter().filter(|&&n| n >= 2).count(),
+                "samples": if a.get("samples").and_then(|v| v.as_bool()).unwrap_or(false) { serde_json::json!(s) } else { serde_json::json!(null) },
+            }))
+        }
+        "interpolation" => {
+            if let Some(v) = a.get("on").and_then(|v| v.as_bool()) {
+                ctx.interpolation = v;
+            }
+            Ok(serde_json::json!({"on": ctx.interpolation}))
+        }
         "inspect" => {
             let x = a.get("x").and_then(|v| v.as_f64()).ok_or("missing 'x'")? as f32;
             let y = a.get("y").and_then(|v| v.as_f64()).ok_or("missing 'y'")? as f32;
