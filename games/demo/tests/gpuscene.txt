@@ -1,0 +1,40 @@
+# GPU-driven scene: persistent objects, LOD + frustum + Hi-Z + shadow cascades culled in cull.wgsl.
+#   node tools/bridge.mjs run games/demo/tests/gpuscene.txt
+
+reload
+screen play
+pause
+call render {"gpu_culling":true,"particles":false,"shadow_cache":true}
+frames 10
+expect gpu_scene.active == true
+expect gpu_scene.main_groups >= 5
+expect gpu_scene.shadow_groups >= 5
+expect gpu_scene.gpu.visible >= 100
+expect gpu_scene.gpu.frustum_culled >= 1
+expect stats.render.gpu_visible >= 100
+
+# a still scene uploads (almost) nothing: no records, objects or args change
+frames 10
+expect stats.render.instance_upload_bytes < 20000
+
+# shadow cascades are filled by the GPU when they are re-rendered
+call render {"shadow_cache":false}
+frames 5
+expect gpu_scene.gpu.shadow_instances >= 50
+expect stats.render.shadow_draw_calls >= 5
+call render {"shadow_cache":true}
+
+# spawned objects get slots and are drawn the same frame
+call spawn {"shape":"cube","pos":[0,3,-4],"size":0.5,"color":"#ff00ff","body":"none"}
+call spawn {"shape":"sphere","pos":[1,3,-4],"size":0.5,"color":"#ff00ff","body":"none"}
+frames 5
+expect gpu_scene.main_objects >= 426
+
+# the CPU path (render textures, flicker tool) still works
+call render {"gpu_culling":false}
+frames 3
+expect gpu_scene.active == false
+expect stats.render.visible >= 100
+call render {"gpu_culling":true,"particles":true}
+frames 3
+screenshot shots/gpuscene.png

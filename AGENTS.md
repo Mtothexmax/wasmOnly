@@ -126,8 +126,21 @@ normal `cargo` output above it.
   `swipes`. Real DOM touch can be simulated with `new PointerEvent('pointerdown', {pointerType:'touch', ...})`.
 - **Debug Chrome is muted** (`--mute-audio`): audio state/API checks work, nothing is audible. Use
   `launch --sound` only when the user wants to listen.
+- **GPU-driven scene (main view):** every drawn or shadow-casting entity keeps a persistent object record (bounding
+  sphere, LOD table, draw group per LOD level) next to its instance record (`crates/engine/src/gpu_scene.rs`). Per frame
+  the CPU only compares each entity with its slot (transform, mesh, material content, opacity, `Lod`) and rebuilds the
+  changed ones; one compute pass (`shaders/cull.wgsl`) picks the LOD level, culls frustum + Hi-Z and fills the id lists
+  of the main view *and* of every shadow cascade rendered this frame, then each draw group (pipeline, texture, mesh) is
+  one `drawIndexedIndirect`. Group slices only change when membership changes (spawn, despawn, material/mesh swap).
+  Groups whose conservative bounds (AABB + LOD distance band) cannot be visible are not drawn; draw order per pipeline
+  comes from the GPU's nearest-instance readback. The shadow cache marks a layer stale when a changed caster touches
+  its light box. `call gpu_scene` = slots, groups, id layout, GPU counters (frustum, occluded, visible, shadow
+  instances, LOD levels); test `games/demo/tests/gpuscene.txt`. `material_mut` with unchanged values costs nothing
+  (content compared with a snapshot). Render textures and `render {gpu_culling:false}` use the CPU path (same
+  records via the shared `classify`); `bridge flicker` uses it too.
 - **Culling/LOD:** `stats.render` has `gpu_culling`, `gpu_frustum_culled`, `gpu_occluded`, `gpu_visible`
-  (async readback, 1-3 frames old) and `lod_levels`. `render {gpu_culling:false}` switches to the CPU path.
+  (async readback, 1-3 frames old) and `lod_levels`. On the GPU path `visible` = main-view candidates, `triangles` =
+  LOD-0 upper bound. `render {gpu_culling:false}` switches to the CPU path.
 - **Frame rate / stutter:** `node tools/bridge.mjs perf [--ms 3000] [--profile]` measures real rAF intervals and
   returns `frame_ms` p50/p95/p99, `missed_frames_pct`, `cpu_phases` (game_fixed, physics, update, engine, render),
   `gpu_ms` per pass (cull, shadow, opaque, blend, hiz, post; WebGPU timestamp queries) and a `verdict`
@@ -155,10 +168,10 @@ normal `cargo` output above it.
   target (saves a load + store of the 4x MSAA target).
 - **Instance upload:** every drawn or shadow-casting entity owns a stable slot in the instance buffer (`InstancePool`
   in `renderer.rs`; a faded entity has a second slot for its shadow copy). A record is uploaded only when it changed;
-  draws go through 4-byte id lists (`visible_ids`: opaque written by `cull.wgsl` on the GPU path, blended and
-  shadow casters by the CPU), so a changing visible set no longer shifts the records. Unused slots are freed after a
-  few frames. `stats.render.instance_upload_bytes` (records + ids), `instance_slots`. Brickhollow walking: ~500 KB
-  -> ~10 KB per frame, uncapped p95 17 -> 11 ms. The audio listener is only updated for positional voices and a
+  draws go through 4-byte id lists (`visible_ids`: written by `cull.wgsl` on the GPU path, by the CPU for blended
+  draws and on the CPU path), so a changing visible set no longer shifts the records. Unused slots are freed after a
+  few frames. `stats.render.instance_upload_bytes` (records + objects + args + ids), `instance_slots`. Brickhollow
+  walking: ~500 KB -> ~5 KB per frame. The audio listener is only updated for positional voices and a
   moved camera. Pacing with `onSubmittedWorkDone` was tried and is much worse on the main thread (the promise
   resolves late).
 - **Benchmarking against other engines:** count frames engine-neutrally (hook on `getCurrentTexture`), run Chrome
@@ -187,7 +200,8 @@ normal `cargo` output above it.
 | `crates/engine/src/terrain.rs` | heightmap terrain: chunk LOD + skirts, splat material, heightfield colliders, streaming, edits, scatter rules |
 | `crates/engine/src/vegetation.rs` | GPU grass (vertex-shader placed blades) |
 | `crates/engine/src/streaming.rs` | streaming layers (cells = scenes) + floating origin (`ctx.origin`, `shift_origin`) |
-| `crates/engine/src/gpu_cull.rs` | compute culling (frustum + Hi-Z occlusion), indirect args, counter readback |
+| `crates/engine/src/gpu_scene.rs` | GPU-driven scene: persistent objects + draw groups, change detection, `cull.wgsl` dispatch, readback |
+| `crates/engine/src/gpu_cull.rs` | Hi-Z occlusion pyramid |
 | `crates/engine/src/panel.rs` | world panels: Canvas2D widgets -> texture on a quad, ray/UV hit test |
 | `crates/engine/src/audio.rs` | Web Audio, 3D panner voices, per-voice effect chain (filters, echo, reverb, distortion, pan, detune) |
 | `crates/engine/src/audio/music.rs` | streamed music (`<audio>` + range requests), crossfade, prefetch, music bus |

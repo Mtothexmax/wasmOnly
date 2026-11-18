@@ -34,6 +34,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("lights", "Clustered lights: counts + last frame stats. args: {add?: {pos, color?, intensity?, range?, spot?: true, dir?, inner_deg?, outer_deg?}, grid?: {n, spacing?, center?} (stress test), clear_test?: true}"),
     ("generate", "Procedural generators (geom kit). No args: list. args: {name, params?: {...}, seed?: 1, pos?: [x,y,z], yaw_deg?, regenerate?: true (drop cache)}"),
     ("batch", "Static batches + moving (Motion) instances. args: {id?: root entity to batch now, cell?: 64}"),
+    ("gpu_scene", "GPU-driven scene of the main view: object slots, draw groups, id-buffer layout, last GPU counters (frustum, occluded, visible, shadow instances, LOD levels)"),
     ("render_texture", "Render textures (portraits, mirrors). args: {id?, render?: true (re-render once), export?: true (PNG blob URL -> url)}"),
     ("animation", "Animators (glTF clips, skinning, morph targets). args: {id?, play?: clip, fade?: 0.2, speed?: 1, looped?: true, stop?: true, morph?: index, weight?: w}"),
     ("particles", "Particle emitters + live counts. args: {preset?: 'fire'|'smoke'|'sparks'|'fireflies'|'dust'|'magic'|'rain'|'splash', pos?: [x,y,z], burst?: n}"),
@@ -719,6 +720,7 @@ pub(crate) fn handle<G: Game>(
         "lights" => ctx.lights_command(a),
         "generate" => ctx.generate_command(a),
         "batch" => ctx.batch_command(a),
+        "gpu_scene" => Ok(ctx.renderer.gpu_scene_info()),
         "animation" => ctx.animation_command(a),
         "render_texture" => {
             if let Some(id) = a["id"].as_u64() {

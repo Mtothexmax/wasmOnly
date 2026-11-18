@@ -22,6 +22,9 @@ pub const AUTO_LOD_FACTOR: f32 = 40.0;
 /// Shadow cascades (layers of the shadow map array).
 const MAX_CASCADES: usize = 4;
 
+#[path = "gpu_scene.rs"]
+mod gpu_scene;
+
 /// Instance records at stable slots, one per (entity, shadow-copy) key. A record is uploaded only
 /// when it changed, so the per-frame upload is the moving entities plus the 4-byte id lists (the
 /// layout no longer shifts when the visible set changes).
@@ -106,6 +109,93 @@ impl InstancePool {
     }
 }
 
+/// How one entity is drawn, from its transform, `MeshRenderer` and material. Shared by the CPU
+/// path and the GPU-driven scene so both build bit-identical records.
+#[derive(Clone, Copy)]
+struct Classified {
+    pub raw: InstanceRaw,
+    /// Faded entity that casts: the unfaded record it casts its shadow with.
+    pub shadow_raw: Option<InstanceRaw>,
+    /// Drawn in the blend pass (blended material or faded).
+    pub blend: bool,
+    pub mask: bool,
+    pub casts: bool,
+    /// Opacity 0: not drawn (may still cast).
+    pub hidden: bool,
+    /// Neither drawn nor casting: needs no GPU record.
+    pub skip: bool,
+    pub double_sided: bool,
+    pub ui: bool,
+    pub water: bool,
+    /// Material textures (base, normal, height) as a bind-group key.
+    pub tex_key: (u32, u32, u32),
+}
+
+fn classify(model: &Mat4, mr: &MeshRenderer, mat: &Material, shadows_on: bool) -> Classified {
+    let mat_blend = mat.alpha_mode == AlphaMode::Blend;
+    // per-entity fade: drawn blended, shadow stays as the material would cast it
+    let faded = mr.opacity < 0.999 && !mat.water && !mat.terrain && !mat.ui;
+    let hidden = faded && mr.opacity <= 0.001;
+    let casts = mr.cast_shadows && (!mat_blend || mat.blend_casts_shadow) && shadows_on;
+    let shading = if mat.terrain { -1.0 } else if mat.water { 3.0 } else if mat.ui { 2.0 } else if mat.unlit { 1.0 } else { 0.0 };
+    let cast_alpha = match mat.alpha_mode {
+        AlphaMode::Opaque => 0.0,
+        AlphaMode::Mask(c) => c.clamp(0.001, 1.0),
+        AlphaMode::Blend => -1.0,
+    };
+    let alpha = if faded { -1.0 } else { cast_alpha };
+    // Normal matrix = inverse transpose of the upper 3x3 (the shaders only use that part).
+    let normal = Mat4::from_mat3(glam::Mat3::from_mat4(*model).inverse().transpose());
+    let raw = InstanceRaw {
+        model: model.to_cols_array_2d(),
+        normal: normal.to_cols_array_2d(),
+        base_color: (mat.base_color * Vec4::new(1.0, 1.0, 1.0, if faded { mr.opacity.max(0.0) } else { 1.0 })).into(),
+        emissive_metallic: if mat.terrain {
+            mat.terrain_params
+        } else if mat.water {
+            mat.emissive.extend(mat.water_foam).into()
+        } else {
+            mat.emissive.extend(mat.metallic).into()
+        },
+        params: [mat.roughness, if mat.water { mat.water_clarity } else { mat.checker }, shading, alpha],
+        maps: if mat.terrain {
+            mat.terrain_tiling
+        } else if mat.water {
+            [mat.water_vertex_spacing, mat.wave_height, mat.water_chop, mat.wave_scale]
+        } else {
+            [
+                if mat.normal_texture.is_some() { mat.normal_scale } else { 0.0 },
+                if mat.height_texture.is_some() { mat.displacement } else { 0.0 },
+                if mat.height_texture.is_some() { mat.parallax } else { 0.0 },
+                0.0,
+            ]
+        },
+    };
+    let shadow_raw = (faded && casts).then(|| {
+        let mut r = raw;
+        r.base_color = mat.base_color.into();
+        r.params[3] = cast_alpha;
+        r
+    });
+    Classified {
+        raw,
+        shadow_raw,
+        blend: mat_blend || faded,
+        mask: matches!(mat.alpha_mode, AlphaMode::Mask(_)),
+        casts,
+        hidden,
+        skip: hidden && !mr.cast_shadows,
+        double_sided: mat.double_sided,
+        ui: mat.ui,
+        water: mat.water,
+        tex_key: (
+            mat.texture.map(|t| t.0 + 1).unwrap_or(0),
+            mat.normal_texture.map(|t| t.0 + 1).unwrap_or(u32::MAX),
+            mat.height_texture.map(|t| t.0 + 1).unwrap_or(u32::MAX),
+        ),
+    }
+}
+
 /// Content of one shadow-map layer: matrix, light-space sphere it covers, caster hash.
 #[derive(Clone, Copy, Default)]
 struct ShadowLayer {
@@ -117,6 +207,12 @@ struct ShadowLayer {
     radius: f32,
     content: u64,
     frame: u64,
+    /// Light view, half size and depth range the layer was rendered with (casters touching it).
+    lv: Mat4,
+    half: f32,
+    depth: f32,
+    /// GPU-driven path: a caster touching the layer changed since it was rendered.
+    dirty: bool,
 }
 /// Uniform slot stride for per-cascade matrices (minUniformBufferOffsetAlignment).
 const CASCADE_SLOT: u32 = 256;
@@ -128,7 +224,7 @@ pub struct MaterialId(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 pub struct TextureId(pub u32);
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Material {
     pub name: String,
     /// Linear RGBA.
@@ -755,6 +851,17 @@ pub struct Renderer {
     sky_lut_key: [f32; 10],
     /// Instance records at stable slots (what `instance_buf` holds).
     pool: InstancePool,
+    /// GPU-driven scene of the main view (persistent objects + draw groups), see `gpu_scene.rs`.
+    scene: gpu_scene::GpuScene,
+    scene_gpu: Option<gpu_scene::SceneGpu>,
+    /// Content version per material: bumped when a material handed out by `material_mut` really
+    /// differs from its snapshot (the scene rebuilds entities whose material changed; code that
+    /// writes the same values every frame costs nothing).
+    material_ver: Vec<u32>,
+    material_snap: Vec<Material>,
+    material_touched: Vec<u32>,
+    /// Bumped when `visible_buf` is recreated (bind groups that write it go stale).
+    ids_gen: u32,
     /// What `visible_buf` holds (diff upload; u32::MAX where the GPU cull wrote).
     ids_uploaded: Vec<u32>,
     /// Per-frame scratch for the id list.
@@ -1233,7 +1340,7 @@ impl Renderer {
             &sky_gpu,
         );
         let cull = if gpu_cull_supported {
-            match crate::gpu_cull::GpuCull::new(&device) {
+            match crate::gpu_cull::GpuCull::new(&device).and_then(|c| Ok((c, gpu_scene::SceneGpu::new(&device)?))) {
                 Ok(c) => Some(c),
                 Err(e) => {
                     crate::log_warn!("GPU culling disabled: {e}");
@@ -1246,6 +1353,10 @@ impl Renderer {
                 crate::gpu_cull::FEATURE
             );
             None
+        };
+        let (cull, scene_gpu) = match cull {
+            Some((c, s)) => (Some(c), Some(s)),
+            None => (None, None),
         };
 
         let post = crate::post::Post::new(&device, format, common, &bgl0, &bgl0_t, DEPTH_FORMAT, SAMPLES)?;
@@ -1271,6 +1382,12 @@ impl Renderer {
             sky_gpu,
             sky_lut_key: [0.0; 10],
             pool: InstancePool::default(),
+            scene: Default::default(),
+            scene_gpu,
+            material_ver: vec![],
+            material_snap: vec![],
+            material_touched: vec![],
+            ids_gen: 0,
             ids_uploaded: vec![],
             scratch_ids: vec![],
             skybox: None,
@@ -2009,14 +2126,34 @@ impl Renderer {
     }
 
     pub fn add_material(&mut self, m: Material) -> MaterialId {
+        self.material_snap.push(m.clone());
         self.materials.push(m);
+        self.material_ver.push(0);
         MaterialId(self.materials.len() as u32 - 1)
     }
 
     pub fn material(&self, id: MaterialId) -> Option<&Material> {
         self.materials.get(id.0 as usize)
     }
+    /// `gpu_scene` command: the GPU-driven scene's state and its last GPU counters.
+    pub fn gpu_scene_info(&self) -> serde_json::Value {
+        let mut v = self.scene.describe();
+        if let Some(sg) = &self.scene_gpu {
+            let l = sg.last.borrow();
+            let k = l.counters;
+            v["gpu"] = serde_json::json!({
+                "frustum_culled": k[0], "occluded": k[1], "visible": k[2], "shadow_instances": k[3],
+                "lod_levels": [k[4], k[5], k[6], k[7]], "lod_culled": k[8],
+            });
+        }
+        v["active"] = serde_json::json!(self.settings.gpu_culling && self.scene_gpu.is_some());
+        v
+    }
+
     pub fn material_mut(&mut self, id: MaterialId) -> Option<&mut Material> {
+        if (id.0 as usize) < self.materials.len() {
+            self.material_touched.push(id.0);
+        }
         self.materials.get_mut(id.0 as usize)
     }
     pub fn mesh(&self, id: MeshId) -> Option<&GpuMesh> {
@@ -2172,9 +2309,7 @@ impl Renderer {
             self.visible_buf = Self::make_visible_buffer(&self.device, cap)?;
             self.ids_cap = cap;
             self.ids_uploaded.clear();
-            if let Some(c) = &mut self.cull {
-                c.invalidate_bindings();
-            }
+            self.ids_gen += 1;
         }
         self.rebuild_bind0();
         Ok(())
@@ -2465,12 +2600,13 @@ impl Renderer {
         };
 
         // --- Instances -------------------------------------------------------------------------
-        // Buffer layout: [opaque/mask candidates sorted by (sides, texture, mesh)]
-        //             ++ [blended, frustum-culled on the CPU, sorted back to front]
-        //             ++ [shadow casters sorted by (mask, texture, mesh)]
-        // GPU path: opaque candidates are culled by cull.wgsl; CPU path: frustum test here.
-        // GPU culling + Hi-Z belong to the main view (render textures use the CPU path)
-        let gpu = main && self.settings.gpu_culling && self.cull.is_some();
+        // Records live at stable slots (`InstancePool`); draws read them through id lists. GPU path:
+        // `gpu_scene` keeps persistent objects and cull.wgsl fills the id lists (main view + shadow
+        // cascades), only blended ids come from here. CPU path: every entity is gathered below, id
+        // lists = [opaque by (sides, texture, mesh)] ++ [blended, back to front] ++ [casters per pass].
+        // GPU-driven (main view, compute culling available): persistent scene + `cull.wgsl`;
+        // otherwise every entity is gathered and frustum-culled here (render textures, flicker tool).
+        let gpu = main && self.settings.gpu_culling && self.cull.is_some() && self.scene_gpu.is_some();
         let planes = frustum_planes(&view_proj);
         let cam_fwd_n = cam_fwd.normalize_or(Vec3::NEG_Z);
         // Per accepted instance (index `mi`): the slot of its GPU record and its bounding sphere. The
@@ -2503,7 +2639,26 @@ impl Renderer {
         let (mut scene_min, mut scene_max) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
         let shadows_on = self.settings.shadows;
         let lod_bias = self.settings.lod_bias.max(0.01);
-        for (ent, g, mr, lod) in world.query::<(hecs::Entity, &GlobalTransform, &MeshRenderer, Option<&Lod>)>().iter() {
+        if gpu {
+            for id in std::mem::take(&mut self.material_touched) {
+                let i = id as usize;
+                if self.materials[i] != self.material_snap[i] {
+                    self.material_snap[i] = self.materials[i].clone();
+                    self.material_ver[i] = self.material_ver[i].wrapping_add(1);
+                }
+            }
+            self.scene.sync(world, &mut self.pool, &self.materials, &self.material_ver, &self.meshes, shadows_on);
+            let (mut b, w) = self.scene.blended(&planes, cam_pos, cam_fwd_n, lod_bias, layers, &self.meshes);
+            b.sort_by_key(|e| e.4);
+            for e in b {
+                blended.push((e.0, e.1, e.2, e.3, raws.len() as u32));
+                raws.push(e.4);
+            }
+            has_water = w;
+            key_list = self.scene.key_list.clone();
+            (scene_min, scene_max) = self.scene.scene_bounds();
+        }
+        for (ent, g, mr, lod) in world.query::<(hecs::Entity, &GlobalTransform, &MeshRenderer, Option<&Lod>)>().iter().filter(|_| !gpu) {
             if layers & (1u32 << (mr.layer & 31)) == 0 {
                 continue;
             }
@@ -2524,65 +2679,24 @@ impl Renderer {
             }
             let Some(mesh) = self.meshes.get(mesh_id.0 as usize).filter(|m| m.index_count > 0) else { continue };
             let mat = self.materials.get(mr.material.0 as usize).unwrap_or(&fallback_mat);
-            let mat_blend = mat.alpha_mode == AlphaMode::Blend;
-            // per-entity fade: drawn blended, shadow stays as the material would cast it
-            let faded = mr.opacity < 0.999 && !mat.water && !mat.terrain && !mat.ui;
-            if faded && mr.opacity <= 0.001 && !mr.cast_shadows {
+            let c = classify(&model, mr, mat, shadows_on);
+            if c.skip {
                 continue;
             }
-            let is_blend = mat_blend || faded;
-            let is_mask = matches!(mat.alpha_mode, AlphaMode::Mask(_));
+            let (is_blend, is_mask, casts) = (c.blend, c.mask, c.casts);
             let center = model.transform_point3(mesh.bounds_center);
             let radius = mesh.bounds_radius * scale;
-            let casts = mr.cast_shadows && (!mat_blend || mat.blend_casts_shadow) && shadows_on;
             let in_frustum = planes.iter().all(|p| p.truncate().dot(center) + p.w >= -radius);
             // opacity 0: not drawn, still casts
-            let drawn = if is_blend { in_frustum } else { gpu || in_frustum } && !(faded && mr.opacity <= 0.001);
+            let drawn = in_frustum && !c.hidden;
             if !drawn {
                 culled += 1;
                 if !casts {
                     continue; // neither drawn nor a shadow caster: no GPU record needed
                 }
             }
-            let shading = if mat.terrain { -1.0 } else if mat.water { 3.0 } else if mat.ui { 2.0 } else if mat.unlit { 1.0 } else { 0.0 };
-            let cast_alpha = match mat.alpha_mode {
-                AlphaMode::Opaque => 0.0,
-                AlphaMode::Mask(c) => c.clamp(0.001, 1.0),
-                AlphaMode::Blend => -1.0,
-            };
-            let alpha = if faded { -1.0 } else { cast_alpha };
-            // Normal matrix = inverse transpose of the upper 3x3 (the shaders only use that part).
-            let normal = Mat4::from_mat3(glam::Mat3::from_mat4(model).inverse().transpose());
-            let raw = InstanceRaw {
-                model: model.to_cols_array_2d(),
-                normal: normal.to_cols_array_2d(),
-                base_color: (mat.base_color * Vec4::new(1.0, 1.0, 1.0, if faded { mr.opacity.max(0.0) } else { 1.0 })).into(),
-                emissive_metallic: if mat.terrain {
-                    mat.terrain_params
-                } else if mat.water {
-                    mat.emissive.extend(mat.water_foam).into()
-                } else {
-                    mat.emissive.extend(mat.metallic).into()
-                },
-                params: [mat.roughness, if mat.water { mat.water_clarity } else { mat.checker }, shading, alpha],
-                maps: if mat.terrain {
-                    mat.terrain_tiling
-                } else if mat.water {
-                    [mat.water_vertex_spacing, mat.wave_height, mat.water_chop, mat.wave_scale]
-                } else {
-                    [
-                        if mat.normal_texture.is_some() { mat.normal_scale } else { 0.0 },
-                        if mat.height_texture.is_some() { mat.displacement } else { 0.0 },
-                        if mat.height_texture.is_some() { mat.parallax } else { 0.0 },
-                        0.0,
-                    ]
-                },
-            };
-            let key = (
-                mat.texture.map(|t| t.0 + 1).unwrap_or(0),
-                mat.normal_texture.map(|t| t.0 + 1).unwrap_or(u32::MAX),
-                mat.height_texture.map(|t| t.0 + 1).unwrap_or(u32::MAX),
-            );
+            let raw = c.raw;
+            let key = c.tex_key;
             let tex = *key_ids.entry(key).or_insert_with(|| {
                 key_list.push(key);
                 key_list.len() as u32 - 1
@@ -2593,11 +2707,8 @@ impl Renderer {
             bounds.push([center.x, center.y, center.z, radius]);
             if casts {
                 // a faded entity casts with its unfaded record (full alpha, original alpha test)
-                let ci = if faded {
-                    let mut r = raw;
-                    r.base_color = mat.base_color.into();
-                    r.params[3] = cast_alpha;
-                    raws.push(self.pool.put((ekey, true), &r));
+                let ci = if let Some(r) = &c.shadow_raw {
+                    raws.push(self.pool.put((ekey, true), r));
                     bounds.push([center.x, center.y, center.z, radius]);
                     raws.len() as u32 - 1
                 } else {
@@ -2623,7 +2734,7 @@ impl Renderer {
         if self.settings.reverse_draw_order {
             visible.reverse();
         }
-        blended.sort_by(|a, b| b.0.total_cmp(&a.0)); // far -> near
+        blended.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.4.cmp(&b.4))); // far -> near
         casters.sort_unstable();
         // per cascade: the casters whose bounding sphere touches the cascade's light-space box
         let cascade_casters: Vec<Vec<u32>> = cascade_boxes
@@ -2647,11 +2758,26 @@ impl Renderer {
             // render textures draw into the shared shadow layers
             self.invalidate_shadow_cache();
         }
+        if gpu {
+            // a layer is stale when a caster that changed (moved, spawned, despawned, deformed,
+            // other material) touches the light box it was rendered with
+            let reset = std::mem::take(&mut self.scene.shadow_reset);
+            for c in self.shadow_cache.iter_mut().filter(|c| c.valid && !c.dirty) {
+                c.dirty = reset
+                    || self.scene.shadow_changes.iter().any(|b| {
+                        let p = c.lv.transform_point3(Vec3::new(b[0], b[1], b[2]));
+                        let (r, rad) = (c.half, b[3]);
+                        p.x.abs() <= r + rad && p.y.abs() <= r + rad && -p.z >= -rad && -p.z <= c.depth + rad
+                    });
+            }
+        }
         let mut render_pass = vec![true; shadow_passes.len()];
         for (p, &(slot, layer)) in shadow_passes.iter().enumerate() {
             let k = slot % MAX_CASCADES;
             let mut content: u64 = 0xcbf2_9ce4_8422_2325;
-            if shadows_on {
+            if gpu {
+                content = 0;
+            } else if shadows_on {
                 for &i in &cascade_casters[p] {
                     let (key, ci) = casters[i as usize];
                     let r = &self.pool.recs[raws[ci as usize] as usize];
@@ -2676,7 +2802,7 @@ impl Renderer {
                 let same = c.mat == mat;
                 let covers = k > 0 && (center - c.center).length() + need <= c.radius;
                 let age = self.shadow_frame.saturating_sub(c.frame);
-                if c.content == content {
+                if if gpu { !c.dirty } else { c.content == content } {
                     same || covers
                 } else {
                     k > 0 && (same || covers) && age < self.settings.shadow_refresh[k - 1].max(1) as u64
@@ -2689,7 +2815,8 @@ impl Renderer {
                 if p < n_casc { texels[k] = tx; } else { prev_texels[k] = tx; }
             } else {
                 let tx = if p < n_casc { texels[k] } else { prev_texels[k] };
-                *c = ShadowLayer { valid: true, mat, texel: tx, dir, center, radius, content, frame: self.shadow_frame };
+                let (lv, half, depth) = cascade_boxes[p];
+                *c = ShadowLayer { valid: true, mat, texel: tx, dir, center, radius, content, frame: self.shadow_frame, lv, half, depth, dirty: false };
             }
         }
         let _ = &prev_texels;
@@ -2742,7 +2869,7 @@ impl Renderer {
             draw_order.reverse();
         }
         // Hi-Z occlusion culling pays off only with enough geometry behind the occluders.
-        let candidate_tris: u64 = batches.iter().map(|b| (self.meshes[b.2 as usize].index_count / 3) as u64 * b.4 as u64).sum();
+        let candidate_tris: u64 = if gpu { self.scene.main_tris } else { batches.iter().map(|b| (self.meshes[b.2 as usize].index_count / 3) as u64 * b.4 as u64).sum() };
         let mut use_hiz = gpu && self.settings.occlusion_culling && candidate_tris >= self.settings.occlusion_min_triangles as u64;
         if main {
             self.hiz_auto.0 += 1;
@@ -2754,7 +2881,8 @@ impl Renderer {
             }
         }
         // Blended runs: only *adjacent* equal keys merge, so the back-to-front order is kept.
-        let blend_base = visible.len() as u32;
+        // driven path: the blended ids follow the main + shadow slices the GPU fills
+        let blend_base = if gpu { self.scene.id_layout().1 } else { visible.len() as u32 };
         let mut blend_runs: Vec<(bool, u32, u32, u32, u32)> = vec![];
         for (i, b) in blended.iter().enumerate() {
             match blend_runs.last_mut() {
@@ -2776,25 +2904,11 @@ impl Renderer {
             .write_buffer_with_u32_and_u8_slice(&self.globals_buf, 0, bytemuck::bytes_of(&globals))
             .map_err(js_err)?;
 
-        let shadow_instances: usize = cascade_casters.iter().enumerate().filter(|(p, _)| render_pass.get(*p).copied().unwrap_or(true)).map(|(_, c)| c.len()).sum();
-        let total = (visible.len() + blended.len() + shadow_instances) as u32;
-        self.ensure_instance_capacity((self.pool.recs.len() as u32).max(1), total.max(1))?;
-        // Id lists: [opaque (GPU path: written by cull.wgsl)] ++ [blended] ++ [casters per rendered pass]
-        let mut ids: Vec<u32> = std::mem::take(&mut self.scratch_ids);
-        ids.clear();
-        ids.reserve(total as usize);
-        ids.extend(visible.iter().map(|v| raws[v.1 as usize]));
-        ids.extend(blended.iter().map(|b| raws[b.4 as usize]));
-        let mut cascade_base = vec![];
-        for (p, list) in cascade_casters.iter().enumerate() {
-            cascade_base.push(ids.len() as u32);
-            if render_pass.get(p).copied().unwrap_or(true) {
-                ids.extend(list.iter().map(|&i| raws[casters[i as usize].1 as usize]));
-            }
-        }
-        // Upload the records that changed, and the chunks of the id list that differ from what the
-        // id buffer holds (a still scene uploads almost nothing).
         let mut upload_bytes = 0u64;
+        let shadow_instances: usize = cascade_casters.iter().enumerate().filter(|(p, _)| render_pass.get(*p).copied().unwrap_or(true)).map(|(_, c)| c.len()).sum();
+        let total = if gpu { blend_base + blended.len() as u32 } else { (visible.len() + blended.len() + shadow_instances) as u32 };
+        self.ensure_instance_capacity((self.pool.recs.len() as u32).max(1), total.max(1))?;
+        // Instance records that changed (both paths share the slots)
         {
             let size = std::mem::size_of::<InstanceRaw>();
             for (a, b) in self.pool.take_ranges() {
@@ -2803,12 +2917,51 @@ impl Renderer {
                     .write_buffer_with_u32_and_u8_slice(&self.instance_buf, (a * size) as u32, bytemuck::cast_slice(&self.pool.recs[a..b]))
                     .map_err(js_err)?;
             }
-            // the GPU path writes the opaque range itself
-            let from = if gpu { blend_base as usize } else { 0 };
+        }
+        let mut cascade_base = vec![];
+        if gpu {
+            // objects that changed, indirect args when group membership changed, blended ids
+            let sg = self.scene_gpu.as_mut().unwrap();
+            let (ng, nsg) = self.scene.group_count();
+            let n_args = ng + gpu_scene::PASSES as u32 * nsg;
+            if sg.ensure(&self.device, self.scene.slots().max(1), n_args.max(1), ng.max(1))? {
+                self.scene.upload_all = true;
+                self.scene.args_dirty = true;
+            }
+            for (a, b) in self.scene.take_dirty() {
+                let objs = self.scene.objects(a, b);
+                upload_bytes += (objs.len() * std::mem::size_of::<gpu_scene::GpuObject>()) as u64;
+                sg.write_objects(&self.queue, a, &objs)?;
+            }
+            if std::mem::take(&mut self.scene.args_dirty) {
+                upload_bytes += (self.scene.args.len() * 20) as u64;
+                sg.write_args(&self.queue, &self.scene.args)?;
+            }
+            if !blended.is_empty() {
+                let ids: Vec<u32> = blended.iter().map(|b| raws[b.4 as usize]).collect();
+                upload_bytes += (ids.len() * 4) as u64;
+                self.queue.write_buffer_with_u32_and_u8_slice(&self.visible_buf, blend_base * 4, bytemuck::cast_slice(&ids)).map_err(js_err)?;
+            }
+            // the GPU rewrote the id buffer: the CPU path's diff mirror is stale
+            self.ids_uploaded.clear();
+        } else {
+            // Id lists: [opaque] ++ [blended] ++ [casters per rendered pass]
+            let mut ids: Vec<u32> = std::mem::take(&mut self.scratch_ids);
+            ids.clear();
+            ids.reserve(total as usize);
+            ids.extend(visible.iter().map(|v| raws[v.1 as usize]));
+            ids.extend(blended.iter().map(|b| raws[b.4 as usize]));
+            for (p, list) in cascade_casters.iter().enumerate() {
+                cascade_base.push(ids.len() as u32);
+                if render_pass.get(p).copied().unwrap_or(true) {
+                    ids.extend(list.iter().map(|&i| raws[casters[i as usize].1 as usize]));
+                }
+            }
+            // only the chunks that differ from what the id buffer holds
             const CH: usize = 256; // ids per chunk (1 KB)
             let prev = &self.ids_uploaded;
             let mut ranges: Vec<(usize, usize)> = vec![];
-            let mut i = from;
+            let mut i = 0;
             while i < ids.len() {
                 let e = (i + CH - i % CH).min(ids.len());
                 if e > prev.len() || ids[i..e] != prev[i..e] {
@@ -2826,14 +2979,16 @@ impl Renderer {
                 upload_bytes += ((b - a) * 4) as u64;
                 self.queue.write_buffer_with_u32_and_u8_slice(&self.visible_buf, (a * 4) as u32, bytemuck::cast_slice(&ids[a..b])).map_err(js_err)?;
             }
+            // keep the allocations for the next frame: `ids` is now what the id buffer holds
+            self.scratch_ids = std::mem::replace(&mut self.ids_uploaded, ids);
         }
-        if gpu {
-            // unknown after the cull pass
-            ids[..blend_base as usize].fill(u32::MAX);
-        }
-        // keep the allocations for the next frame: `ids` is now what the id buffer holds
-        self.scratch_ids = std::mem::replace(&mut self.ids_uploaded, ids);
         let n_records = self.pool.recs.len() as u32;
+        // GPU counters of the driven path (1-3 frames old)
+        let rb = if gpu { self.scene_gpu.as_ref().map(|s| { let l = s.last.borrow(); (l.counters, l.near.clone()) }) } else { None };
+        if let Some((k, _)) = &rb {
+            culled = k[0] + k[8];
+            lod_counts = [k[4], k[5], k[6], k[7]];
+        }
 
         let mut stats = FrameStats {
             width: self.size.0,
@@ -2841,7 +2996,7 @@ impl Renderer {
             canvas: [self.canvas_size.0, self.canvas_size.1],
             render_scale: self.settings.render_scale,
             culled,
-            visible: visible.len() as u32,
+            visible: if gpu { self.scene.main_count } else { visible.len() as u32 },
             transparent: blended.len() as u32,
             lod_levels: lod_counts,
             gpu_culling: gpu,
@@ -2928,46 +3083,53 @@ impl Renderer {
             pass.end();
         }
 
-        // --- GPU culling (compute) ----------------------------------------------------------
+        // --- GPU culling (compute): LOD, frustum, Hi-Z, shadow cascades -> id lists + indirect args
         if gpu {
-            let occlusion = use_hiz;
             stats.hiz_active = use_hiz;
-            if let Some(c) = self.cull.as_mut() {
-                c.ensure_capacity(&self.device, visible.len() as u32, batches.len() as u32)?;
-                let mut items = Vec::with_capacity(visible.len());
-                for (b, batch) in batches.iter().enumerate() {
-                    for v in &visible[batch.3 as usize..(batch.3 + batch.4) as usize] {
-                        items.push(crate::gpu_cull::CullItem { center_radius: bounds[v.1 as usize], batch: b as u32, inst: raws[v.1 as usize], _pad: [0; 2] });
+            let (ng, nsg) = self.scene.group_count();
+            let mut pass_mask = 0u32;
+            let mut pass_lv = [[[0.0f32; 4]; 4]; gpu_scene::PASSES];
+            let mut pass_box = [[0.0f32; 4]; gpu_scene::PASSES];
+            if self.settings.shadows {
+                for (p, &on) in render_pass.iter().enumerate().take(gpu_scene::PASSES) {
+                    if on {
+                        let (lv, r, depth) = cascade_boxes[p];
+                        pass_mask |= 1 << p;
+                        pass_lv[p] = lv.to_cols_array_2d();
+                        pass_box[p] = [r, depth, 0.0, 0.0];
                     }
                 }
-                let args: Vec<crate::gpu_cull::DrawArgs> = batches
-                    .iter()
-                    .map(|b| crate::gpu_cull::DrawArgs {
-                        index_count: self.meshes[b.2 as usize].index_count,
-                        instance_count: 0,
-                        first_index: 0,
-                        base_vertex: 0,
-                        first_instance: b.3,
-                    })
-                    .collect();
-                let params = crate::gpu_cull::CullParams {
+            }
+            if let (Some(c), Some(sg)) = (self.cull.as_ref(), self.scene_gpu.as_mut()) {
+                let params = gpu_scene::SceneParams {
                     planes: planes.map(|p| p.into()),
                     prev_view_proj: c.prev_view_proj.to_cols_array_2d(),
+                    cam: [cam_pos.x, cam_pos.y, cam_pos.z, 1.0 / lod_bias],
                     hiz_size: [c.hiz_size.0 as f32, c.hiz_size.1 as f32],
-                    count: items.len() as u32,
-                    flags: 1 | if occlusion && c.hiz_valid { 2 } else { 0 },
+                    count: self.scene.slots(),
+                    flags: 1 | if use_hiz && c.hiz_valid { 2 } else { 0 },
                     hiz_mips: c.hiz_mips,
-                    _pad: [0; 3],
+                    layers,
+                    n_groups: ng,
+                    n_sgroups: nsg,
+                    pass_mask,
+                    n_args: ng + gpu_scene::PASSES as u32 * nsg,
+                    _pad: [0; 2],
+                    pass_lv,
+                    pass_box,
                 };
                 let ts = self.timing.as_mut().filter(|_| main).and_then(|t| t.compute_writes(crate::gpu_timing::CULL));
-                c.encode_cull(&self.device, &self.queue, &encoder, &self.visible_buf, &params, &items, &args, ts)?;
-                let k = *c.last_counters.borrow();
+                if let Some(hiz) = c.hiz_view() {
+                    sg.encode(&self.device, &self.queue, &encoder, &self.visible_buf, self.ids_gen, hiz, c.generation, &params, ts)?;
+                }
+            }
+            if let Some((k, _)) = &rb {
                 stats.gpu_frustum_culled = k[0];
                 stats.gpu_occluded = k[1];
                 stats.gpu_visible = k[2];
                 // Hi-Z auto off (the counters lag a few frames: skip the first 10 after enabling)
                 let min_ratio = self.settings.occlusion_min_ratio;
-                if main && occlusion && min_ratio > 0.0 {
+                if use_hiz && min_ratio > 0.0 {
                     let a = &mut self.hiz_auto;
                     a.1 += 1;
                     if a.1 > 10 {
@@ -2995,6 +3157,7 @@ impl Renderer {
         // --- Shadow passes: one per cascade (opaque depth-only, alpha-tested casters sample their texture)
         {
             let todo: Vec<usize> = (0..shadow_passes.len()).filter(|&p| render_pass[p]).collect();
+            let shadow_groups = if gpu && !todo.is_empty() { self.scene.shadow_groups(cam_pos, lod_bias) } else { vec![] };
             stats.shadow_passes_rendered = todo.len() as u32;
             stats.shadow_passes_cached = (shadow_passes.len() - todo.len()) as u32;
             let n_pass = todo.len();
@@ -3022,7 +3185,34 @@ impl Renderer {
                     }
                 }
                 let pass = encoder.begin_render_pass(&desc).map_err(js_err)?;
-                if self.settings.shadows && !list.is_empty() {
+                if gpu && self.settings.shadows {
+                    // one indirect draw per shadow group, filled by cull.wgsl for this pass
+                    pass.set_bind_group(0, Some(&self.bind0_shadow[slot]));
+                    let args = &self.scene_gpu.as_ref().unwrap().args_buf;
+                    let (ng, nsg) = self.scene.group_count();
+                    let mut bound: Option<(bool, u32)> = None;
+                    let (lv, half, depth) = cascade_boxes[p];
+                    for &(mask, tex, mesh_id, g) in &shadow_groups {
+                        if !self.scene.shadow_group_in_box(g, &lv, half, depth) {
+                            continue;
+                        }
+                        let mesh = &self.meshes[mesh_id as usize];
+                        if mesh.index_count == 0 {
+                            continue;
+                        }
+                        if bound.map(|b| b.0) != Some(mask) {
+                            pass.set_pipeline(if mask { &self.shadow_mask_pipeline } else { &self.shadow_pipeline });
+                        }
+                        if mask && bound != Some((true, tex)) {
+                            pass.set_bind_group(1, Some(&groups[tex as usize]));
+                        }
+                        bound = Some((mask, tex));
+                        pass.set_vertex_buffer(0, Some(&mesh.vb));
+                        pass.set_index_buffer(&mesh.ib, GpuIndexFormat::Uint32);
+                        pass.draw_indexed_indirect_with_u32(args, (ng + p as u32 * nsg + g) * 20);
+                        stats.shadow_draw_calls += 1;
+                    }
+                } else if self.settings.shadows && !list.is_empty() {
                     pass.set_bind_group(0, Some(&self.bind0_shadow[slot]));
                     let base = cascade_base[p];
                     let mut bound: Option<(bool, u32)> = None;
@@ -3094,7 +3284,31 @@ impl Renderer {
             pass.set_bind_group(0, Some(&self.bind0));
             let mut bound_tex = u32::MAX;
             let mut bound_pipe = usize::MAX;
-            let args_buf = self.cull.as_ref().filter(|_| gpu).map(|c| c.args_buf.clone());
+            if gpu {
+                let args = self.scene_gpu.as_ref().unwrap().args_buf.clone();
+                let near = rb.as_ref().map(|r| r.1.as_slice()).unwrap_or(&[]);
+                for (pipe, tex, mesh_id, g) in self.scene.draw_order(near, self.settings.reverse_draw_order, &planes, cam_pos, lod_bias) {
+                    let mesh = &self.meshes[mesh_id as usize];
+                    if mesh.index_count == 0 {
+                        continue;
+                    }
+                    let pi = pipe as usize;
+                    if pi != bound_pipe {
+                        pass.set_pipeline(&self.pipelines[pi]);
+                        bound_pipe = pi;
+                    }
+                    if tex != bound_tex {
+                        pass.set_bind_group(1, Some(&groups[tex as usize]));
+                        bound_tex = tex;
+                    }
+                    pass.set_vertex_buffer(0, Some(&mesh.vb));
+                    pass.set_index_buffer(&mesh.ib, GpuIndexFormat::Uint32);
+                    pass.draw_indexed_indirect_with_u32(&args, g * 20);
+                    stats.draw_calls += 1;
+                }
+                // upper bound (LOD 0 of every candidate); the exact count lives on the GPU
+                stats.triangles += self.scene.main_tris;
+            }
             for &b in &draw_order {
                 let (two_sided, tex, mesh_id, first, count) = batches[b as usize];
                 let pi = two_sided as usize; // pipeline index 0..3
@@ -3109,10 +3323,7 @@ impl Renderer {
                 let mesh = &self.meshes[mesh_id as usize];
                 pass.set_vertex_buffer(0, Some(&mesh.vb));
                 pass.set_index_buffer(&mesh.ib, GpuIndexFormat::Uint32);
-                match &args_buf {
-                    Some(args) => pass.draw_indexed_indirect_with_u32(args, b * 20),
-                    None => pass.draw_indexed_with_instance_count_and_first_index_and_base_vertex_and_first_instance(mesh.index_count, count, 0, 0, first),
-                }
+                pass.draw_indexed_with_instance_count_and_first_index_and_base_vertex_and_first_instance(mesh.index_count, count, 0, 0, first);
                 stats.draw_calls += 1;
                 // GPU path: upper bound (candidates); the exact count lives on the GPU.
                 stats.triangles += (mesh.index_count / 3) as u64 * count as u64;
@@ -3217,7 +3428,9 @@ impl Renderer {
                 } else {
                     c.hiz_valid = false;
                 }
-                readback = c.encode_readback(&encoder);
+            }
+            if let Some(sg) = self.scene_gpu.as_mut() {
+                readback = sg.encode_readback(&self.device, &encoder, self.scene.group_count().0);
             }
         }
         if let Some(t) = self.timing.as_ref().filter(|_| main) {
@@ -3229,8 +3442,8 @@ impl Renderer {
             stats.gpu_ms = Some(*t.last.borrow());
         }
         if readback {
-            if let Some(c) = &self.cull {
-                c.start_readback();
+            if let Some(sg) = &self.scene_gpu {
+                sg.start_readback();
             }
         }
         if main {

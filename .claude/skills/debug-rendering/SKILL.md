@@ -124,7 +124,13 @@ layer (`terrain {height_at}` → `splat`), `render {grass: true}`. Terrain looks
 node tools/bridge.mjs call stats      # render: gpu_culling, gpu_frustum_culled, gpu_occluded, gpu_visible, lod_levels
 node tools/bridge.mjs call render '{"gpu_culling":false}'       # CPU frustum path (direct draws) for comparison
 node tools/bridge.mjs call render '{"occlusion_culling":false}' # GPU frustum only
+node tools/bridge.mjs call gpu_scene  # GPU-driven scene: slots, draw groups, id layout, GPU counters incl. shadow instances
 ```
+
+- Missing/ghost object only with GPU culling on: compare with `gpu_culling:false` at a paused, frozen frame
+  (`pause` + `render {freeze_time:true, auto_resolution:false}`); both paths build records with `classify`,
+  so any pixel difference beyond HUD text is a GPU-scene bug (change detection in `GpuScene::sync`, group
+  bounds in `draw_order`/`shadow_groups`, LOD rule in `cull.wgsl` vs `Lod::pick`).
 
 - Object missing only with GPU culling on -> bounding sphere too small (mesh bounds/scale) or Hi-Z
   popping (occlusion uses the *previous* frame: objects revealed by a fast camera move appear 1 frame late).
@@ -150,8 +156,8 @@ node tools/bridge.mjs call render '{"occlusion_culling":false}' # GPU frustum on
   height maps must be *linear* textures (`add_texture_rgba_linear` / `generate_maps`); a normal map uploaded
   as sRGB looks wrong (too bright, tilted). `render {"debug_view":1}` shows the mapped normals.
 - Water flicker/moiré far away = waves smaller than a pixel; `waves()` fades them by pixel footprint.
-- Main pass draws `instances[visible_ids[instance_index]]` (binding 4): identity on the CPU path,
-  compacted by `cull.wgsl` on the GPU path. `hiz.wgsl` builds the max-depth pyramid after the main pass.
+- Main and shadow passes draw `instances[visible_ids[instance_index]]` (binding 4): record slots, written by
+  the CPU on the CPU path and by `cull.wgsl` (per draw group, main view + each rendered cascade) on the GPU path. `hiz.wgsl` builds the max-depth pyramid after the main pass.
 - Transparency: `stats.render.transparent` / `transparent_draw_calls` count blended instances (CPU frustum
   culled, sorted far->near, drawn after opaque, no depth write). Mask materials discard below the cutoff in
   both the main and the shadow pass (`shadow-mask` pipeline). Black foliage = normals pointing down.
