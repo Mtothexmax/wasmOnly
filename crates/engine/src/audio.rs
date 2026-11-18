@@ -229,6 +229,8 @@ pub struct Audio {
     /// Suspend the AudioContext while the tab is unfocused (default on); resume on focus.
     pause_on_blur: bool,
     pub listener: Vec3,
+    /// Camera the Web Audio listener was last set from.
+    listener_cam: Option<Mat4>,
     /// Last 32 plays (newest last).
     pub history: VecDeque<PlayEvent>,
     pub plays_total: u64,
@@ -275,6 +277,7 @@ impl Default for Audio {
                 .unwrap_or(true),
             pause_on_blur: true,
             listener: Vec3::ZERO,
+            listener_cam: None,
             history: VecDeque::new(),
             plays_total: 0,
             step: 0,
@@ -701,7 +704,13 @@ impl Audio {
             let now = c.current_time();
             self.music.update(now);
         }
-        if let (Some(ctx), Some(cam)) = (&self.ctx, camera) {
+        // The listener only matters for positional voices, and the setters are not free (~15 % of
+        // the main thread in a busy scene): skip them without such voices or when the camera is
+        // still.
+        let spatial = self.voices.iter().any(|v| v.panner.is_some());
+        let changed = camera.is_some() && camera != self.listener_cam;
+        if let (Some(ctx), Some(cam), true, true) = (&self.ctx, camera, spatial, changed) {
+            self.listener_cam = camera;
             let l = ctx.listener();
             let p = cam.w_axis.truncate();
             let fwd = -cam.z_axis.truncate().normalize_or(Vec3::NEG_Z);
@@ -715,7 +724,9 @@ impl Audio {
                 up.y as f64,
                 up.z as f64,
             );
-            self.listener = p;
+        }
+        if let Some(cam) = camera {
+            self.listener = cam.w_axis.truncate();
         }
         for v in &mut self.voices {
             if let (Some(e), Some(pn)) = (v.follow, &v.panner) {

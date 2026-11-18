@@ -483,6 +483,8 @@ pub struct FrameStats {
     pub shadow_passes_cached: u32,
     /// Hi-Z occlusion culling ran this frame (off: too little geometry, or auto off).
     pub hiz_active: bool,
+    /// Instance records uploaded this frame (only the chunks that changed), bytes.
+    pub instance_upload_bytes: u64,
     pub visible: u32,
     pub culled: u32,
     pub triangles: u64,
@@ -668,6 +670,8 @@ pub struct Renderer {
     /// Per-frame instance lists, kept between frames for their allocations.
     scratch_raws: Vec<InstanceRaw>,
     scratch_data: Vec<InstanceRaw>,
+    /// What `instance_buf` holds (diff upload).
+    uploaded: Vec<InstanceRaw>,
     skybox: Option<TextureId>,
     /// Derived sky / day-night state (sun, moon, daylight, night), see `crate::sky`.
     pub sky: crate::sky::SkyState,
@@ -1179,6 +1183,7 @@ impl Renderer {
             sky_lut_key: [0.0; 10],
             scratch_raws: vec![],
             scratch_data: vec![],
+            uploaded: vec![],
             skybox: None,
             sky: Default::default(),
             globals_buf,
@@ -2064,6 +2069,7 @@ impl Renderer {
         }
         self.instance_buf = Self::make_instance_buffer(&self.device, cap)?;
         self.instance_cap = cap;
+        self.uploaded.clear();
         self.visible_buf = Self::make_visible_buffer(&self.device, cap)?;
         if let Some(c) = &mut self.cull {
             c.invalidate_bindings();
@@ -2675,12 +2681,37 @@ impl Renderer {
                 data.extend(list.iter().map(|&i| raws[casters[i as usize].1 as usize]));
             }
         }
-        if !data.is_empty() {
-            self.queue.write_buffer_with_u32_and_u8_slice(&self.instance_buf, 0, bytemuck::cast_slice(&data)).map_err(js_err)?;
+        // Upload only the chunks that differ from what the buffer already holds (a still scene
+        // uploads almost nothing; writeBuffer was the largest main-thread cost in busy scenes).
+        let mut upload_bytes = 0u64;
+        {
+            const CH: usize = 32; // instances per chunk (6 KB)
+            let prev = &self.uploaded;
+            let mut ranges: Vec<(usize, usize)> = vec![];
+            let mut i = 0;
+            while i < data.len() {
+                let e = (i + CH).min(data.len());
+                let dirty = e > prev.len() || bytemuck::cast_slice::<_, u8>(&data[i..e]) != bytemuck::cast_slice::<_, u8>(&prev[i..e]);
+                if dirty {
+                    match ranges.last_mut() {
+                        Some(r) if r.1 == i => r.1 = e,
+                        _ => ranges.push((i, e)),
+                    }
+                }
+                i = e;
+            }
+            if ranges.len() > 16 {
+                ranges = vec![(ranges[0].0, ranges[ranges.len() - 1].1)];
+            }
+            let size = std::mem::size_of::<InstanceRaw>();
+            for (a, b) in ranges {
+                upload_bytes += ((b - a) * size) as u64;
+                self.queue.write_buffer_with_u32_and_u8_slice(&self.instance_buf, (a * size) as u32, bytemuck::cast_slice(&data[a..b])).map_err(js_err)?;
+            }
         }
-        // keep the allocations for the next frame
+        // keep the allocations for the next frame: `data` is now what the buffer holds
         self.scratch_raws = raws;
-        self.scratch_data = data;
+        self.scratch_data = std::mem::replace(&mut self.uploaded, data);
         // visible_ids: identity for the CPU-drawn ranges (all opaque on the CPU path, blended always).
         let id_from = if gpu { blend_base } else { 0 };
         let id_to = blend_base + blended.len() as u32;
@@ -2703,6 +2734,7 @@ impl Renderer {
             cascades: splits[..n_casc].to_vec(),
             shadow_hash: cascade_mats[..n_casc].iter().flat_map(|m| m.to_cols_array()).enumerate().map(|(i, v)| v as f64 * (i as f64 * 0.618 + 1.0)).sum(),
             shadow_steps: self.shadow_step_count,
+            instance_upload_bytes: upload_bytes,
             shadow_fade: prev_weight,
             ..Default::default()
         };
