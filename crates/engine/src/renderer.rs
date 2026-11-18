@@ -62,6 +62,9 @@ pub struct Material {
     pub parallax: f32,
     /// Water surface (see [`Material::water`]): `base_color` = deep colour, `emissive` = shallow colour.
     pub water: bool,
+    /// `AlphaMode::Blend` materials normally cast no shadow; true = cast it as if opaque (glass
+    /// that should still shade the ground, faded walls).
+    pub blend_casts_shadow: bool,
     /// Water: wave height (world units) and wave frequency scale.
     pub wave_height: f32,
     pub wave_scale: f32,
@@ -117,6 +120,7 @@ impl Default for Material {
             displacement: 0.0,
             parallax: 0.0,
             water: false,
+            blend_casts_shadow: false,
             wave_height: 0.0,
             wave_scale: 1.0,
             water_chop: 0.6,
@@ -437,6 +441,12 @@ impl Default for RenderSettings {
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct FrameStats {
+    /// Shadow stability: checksum of the current cascade matrices (constant while camera and
+    /// shadow direction are still: no texel-grid shift), shadow-direction steps so far, and the
+    /// weight of the previous direction while cross-fading (0 = not fading).
+    pub shadow_hash: f64,
+    pub shadow_steps: u32,
+    pub shadow_fade: f32,
     pub draw_calls: u32,
     pub shadow_draw_calls: u32,
     pub visible: u32,
@@ -648,6 +658,7 @@ pub struct Renderer {
     shadow_dir: Option<Vec3>,
     shadow_cur_set: u32,
     shadow_fade: Option<(Vec3, f64)>,
+    shadow_step_count: u32,
     cascade_buf: GpuBuffer,
     /// Clustered lighting buffers (lights, cluster grid, light index list).
     light_bufs: LightBufs,
@@ -1145,6 +1156,7 @@ impl Renderer {
             shadow_dir: None,
             shadow_cur_set: 0,
             shadow_fade: None,
+            shadow_step_count: 0,
             cascade_buf,
             light_bufs,
             shadow_sampler,
@@ -2123,6 +2135,7 @@ impl Renderer {
                         self.shadow_dir = Some(light);
                         self.shadow_fade = None;
                     } else if ang >= step {
+                        self.shadow_step_count += 1;
                         if fade_ms > 0.0 && self.ensure_two_shadow_sets() {
                             self.shadow_fade = Some((d, now));
                             self.shadow_cur_set ^= 1;
@@ -2333,13 +2346,20 @@ impl Renderer {
             }
             let Some(mesh) = self.meshes.get(mesh_id.0 as usize).filter(|m| m.index_count > 0) else { continue };
             let mat = self.materials.get(mr.material.0 as usize).unwrap_or(&fallback_mat);
-            let is_blend = mat.alpha_mode == AlphaMode::Blend;
+            let mat_blend = mat.alpha_mode == AlphaMode::Blend;
+            // per-entity fade: drawn blended, shadow stays as the material would cast it
+            let faded = mr.opacity < 0.999 && !mat.water && !mat.terrain && !mat.ui;
+            if faded && mr.opacity <= 0.001 && !mr.cast_shadows {
+                continue;
+            }
+            let is_blend = mat_blend || faded;
             let is_mask = matches!(mat.alpha_mode, AlphaMode::Mask(_));
             let center = model.transform_point3(mesh.bounds_center);
             let radius = mesh.bounds_radius * scale;
-            let casts = mr.cast_shadows && !is_blend && shadows_on;
+            let casts = mr.cast_shadows && (!mat_blend || mat.blend_casts_shadow) && shadows_on;
             let in_frustum = planes.iter().all(|p| p.truncate().dot(center) + p.w >= -radius);
-            let drawn = if is_blend { in_frustum } else { gpu || in_frustum };
+            // opacity 0: not drawn, still casts
+            let drawn = if is_blend { in_frustum } else { gpu || in_frustum } && !(faded && mr.opacity <= 0.001);
             if !drawn {
                 culled += 1;
                 if !casts {
@@ -2347,17 +2367,18 @@ impl Renderer {
                 }
             }
             let shading = if mat.terrain { -1.0 } else if mat.water { 3.0 } else if mat.ui { 2.0 } else if mat.unlit { 1.0 } else { 0.0 };
-            let alpha = match mat.alpha_mode {
+            let cast_alpha = match mat.alpha_mode {
                 AlphaMode::Opaque => 0.0,
                 AlphaMode::Mask(c) => c.clamp(0.001, 1.0),
                 AlphaMode::Blend => -1.0,
             };
+            let alpha = if faded { -1.0 } else { cast_alpha };
             // Normal matrix = inverse transpose of the upper 3x3 (the shaders only use that part).
             let normal = Mat4::from_mat3(glam::Mat3::from_mat4(model).inverse().transpose());
             let raw = InstanceRaw {
                 model: model.to_cols_array_2d(),
                 normal: normal.to_cols_array_2d(),
-                base_color: mat.base_color.into(),
+                base_color: (mat.base_color * Vec4::new(1.0, 1.0, 1.0, if faded { mr.opacity.max(0.0) } else { 1.0 })).into(),
                 emissive_metallic: if mat.terrain {
                     mat.terrain_params
                 } else if mat.water {
@@ -2392,7 +2413,18 @@ impl Renderer {
             raws.push(raw);
             bounds.push([center.x, center.y, center.z, radius]);
             if casts {
-                casters.push(((is_mask as u64) << 63 | (if is_mask { tex as u64 } else { 0 }) << 32 | mesh_id.0 as u64, mi));
+                // a faded entity casts with its unfaded record (full alpha, original alpha test)
+                let ci = if faded {
+                    let mut r = raw;
+                    r.base_color = mat.base_color.into();
+                    r.params[3] = cast_alpha;
+                    raws.push(r);
+                    bounds.push([center.x, center.y, center.z, radius]);
+                    raws.len() as u32 - 1
+                } else {
+                    mi
+                };
+                casters.push(((is_mask as u64) << 63 | (if is_mask { tex as u64 } else { 0 }) << 32 | mesh_id.0 as u64, ci));
             }
             if !drawn {
                 continue;
@@ -2527,6 +2559,9 @@ impl Renderer {
             gpu_culling: gpu,
             lights: light_stats,
             cascades: splits[..n_casc].to_vec(),
+            shadow_hash: cascade_mats[..n_casc].iter().flat_map(|m| m.to_cols_array()).enumerate().map(|(i, v)| v as f64 * (i as f64 * 0.618 + 1.0)).sum(),
+            shadow_steps: self.shadow_step_count,
+            shadow_fade: prev_weight,
             ..Default::default()
         };
         let groups: Vec<GpuBindGroup> = key_list.iter().map(|k| self.material_group(*k)).collect();

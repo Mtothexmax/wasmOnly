@@ -42,7 +42,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("stats", "Frame/sim timing, renderer stats, entity and body counts."),
     ("entities", "List entities. args: {name?: substring, limit?: 200, with?: 'mesh'|'body'|'light'|'label'|'camera'}"),
     ("entity", "Full detail of one entity. args: {id}"),
-    ("set", "Modify an entity. args: {id, pos?: [x,y,z], rot?: [deg x,y,z], scale?: [x,y,z], vel?: [x,y,z], color?: '#rrggbb'}"),
+    ("set", "Modify an entity. args: {id, pos?: [x,y,z], rot?: [deg x,y,z], scale?: [x,y,z], vel?: [x,y,z], color?: '#rrggbb', opacity?: 0..1 (this entity and its children; keeps its shadow)}"),
     ("spawn", "Spawn a primitive or a glTF model. args: {shape: 'cube'|'sphere', pos, size?: 1, color?: '#rrggbb', body?: 'dynamic'|'fixed'|'none', name?} or {gltf: 'assets/x.glb', pos, size?: scale, auto_lod?: bool}"),
     ("despawn", "Remove entity and children. args: {id}"),
     ("pause", "Pause simulation (rendering continues)."),
@@ -239,11 +239,22 @@ fn parse_color(s: &str) -> Option<u32> {
     u32::from_str_radix(s.trim_start_matches('#'), 16).ok()
 }
 
+/// `{id}` or `{name}` (the first entity with that name, lowest id).
 fn entity_arg(ctx: &Ctx, args: &Value) -> Result<Entity, String> {
+    if let (None, Some(name)) = (args.get("id"), args.get("name").and_then(|v| v.as_str())) {
+        return ctx
+            .world
+            .query::<(Entity, &crate::scene::Name)>()
+            .iter()
+            .filter(|(_, n)| n.0 == name)
+            .map(|(e, _)| e)
+            .min_by_key(|e| e.id())
+            .ok_or(format!("no entity named '{name}'"));
+    }
     let id = args
         .get("id")
         .and_then(|v| v.as_u64())
-        .ok_or("missing numeric 'id'")?;
+        .ok_or("missing numeric 'id' (or 'name')")?;
     ctx.world
         .iter()
         .map(|r| r.entity())
@@ -425,6 +436,16 @@ pub(crate) fn handle<G: Game>(
                     .map_err(|_| "entity has no mesh")?;
                 if let Some(m) = ctx.renderer.material_mut(mid) {
                     m.base_color = crate::renderer::srgb_hex(c);
+                }
+            }
+            if let Some(o) = a.get("opacity").and_then(|v| v.as_f64()) {
+                // glTF models: the root has no mesh, its descendants do
+                let mut targets = vec![e];
+                targets.extend(crate::scene::descendants_of(&ctx.world, &[e]));
+                for t in targets {
+                    if let Ok(mut mr) = ctx.world.get::<&mut MeshRenderer>(t) {
+                        mr.opacity = o.clamp(0.0, 1.0) as f32;
+                    }
                 }
             }
             crate::scene::propagate_transforms(&mut ctx.world);

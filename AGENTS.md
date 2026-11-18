@@ -105,6 +105,12 @@ normal `cargo` output above it.
   Moving sun: shadows follow the light in `shadow_step_deg` steps (default 0.5) with a `shadow_fade_ms` cross-fade
   (default 400; a second shadow-map set is allocated on first use), so the texel grid does not re-snap every frame
   (shimmering edges). `shadow_step_deg: 0` = follow every frame.
+  Proof per frame: `stats.render.shadow_hash` (cascade matrices) stays constant between `shadow_steps`;
+  `shadow_fade` > 0 while cross-fading.
+- **Opacity:** `MeshRenderer.opacity` (0..1) fades one entity without material copies; it moves to the blend pass
+  and keeps its full shadow (0 = invisible, still casts). `set {id|name, opacity}` (applies to children, e.g. glTF).
+  `Material.blend_casts_shadow` lets blended materials cast. Test: `games/demo/tests/opacity.txt`. Entity commands
+  accept `{name}` instead of `{id}`.
   Lens flare: `render {lens_flare: 0..}` (0 = off); test `games/demo/tests/flare.txt` (visible / hidden behind the tower).
 - **Water:** `Material::water` + `ctx.spawn_water(name, mat, size, t)` / `ctx.spawn_ocean(mat, y)`; tune `wave_height`,
   `wave_scale`, `water_chop`, `water_clarity`, `water_foam`, `water_vertex_spacing`; `render {water_ssr, water_refraction,

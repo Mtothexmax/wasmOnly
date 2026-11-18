@@ -85,6 +85,10 @@ pub struct MeshRenderer {
     pub cast_shadows: bool,
     /// Render layer 0..31; a camera draws it if bit `layer` is set in `Camera::layers`.
     pub layer: u8,
+    /// Per-entity opacity 0..1 (1 = as the material says). Below 1 the entity is drawn in the
+    /// blend pass with its alpha scaled, and keeps casting its full shadow (see-through
+    /// occluders, fade-outs) — no material copies needed.
+    pub opacity: f32,
 }
 
 impl MeshRenderer {
@@ -94,6 +98,7 @@ impl MeshRenderer {
             material,
             cast_shadows: true,
             layer: 0,
+            opacity: 1.0,
         }
     }
 }

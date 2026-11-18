@@ -1,0 +1,15 @@
+# Per-entity opacity: a faded tree (glTF, children carry the meshes) stays visible at 25 %
+# and keeps casting its full shadow.
+reload
+screen play
+wait 1500
+call sky {"cycle":false}
+call render {"sun_dir":[-0.5,-0.8,-0.3]}
+frames 5
+screenshot shots/opacity-full.png
+call set {"name":"tree.glb","opacity":0.25}
+frames 5
+screenshot shots/opacity-faded.png
+expect stats.render.transparent >= 1
+call set {"name":"tree.glb","opacity":1}
+call sky {"cycle":true,"time":15.5}
