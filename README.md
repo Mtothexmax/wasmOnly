@@ -38,6 +38,8 @@ Chrome-Erweiterung „C/C++ DevTools Support (DWARF)“ setzt du Breakpoints dir
 | SIMD | `+simd128` für den ganzen Build (glam und rapier nutzen es) | ✅ |
 | Grafik | WebGPU direkt über `web-sys` (unstable cfg), WGSL inkl. Compute-Shader | ✅ |
 | Rendering | Forward-PBR (GGX), 4× MSAA, ACES-Tonemapping | ✅ |
+| Material-Maps | Normal Mapping (Tangentenraum aus Bildschirm-Ableitungen, kein Vertex-Tangent nötig), Height-Maps für **Vertex-Displacement** (auf `MeshData::grid/disk`) und **Parallax Occlusion Mapping**; Normal-/Height-Maps aus jedem Textur-Preset (`ctx.generate_maps`) | ✅ · Schatten nutzen das unverschobene Mesh |
+| Wasser | `Material::water(tief, flach)`: Wellen (Vertex + Fragment), feine Kräuselung aus Rausch-Gradienten, Fresnel-Himmelsreflexion, Sonnenglitzern, Farbe nach Wassertiefe, Schaum und weiche Kanten am Ufer (liest die Szenentiefe im Blend-Pass), Wellen-Antialiasing in der Ferne | ✅ |
 | Transparenz | `AlphaMode::Opaque / Mask(cutoff) / Blend` und `double_sided` (auch aus glTF). Mask = Alpha-Test mit ausgestanzten Schatten, batcht und wird auf der GPU gecullt wie deckende Geometrie. Blend = eigener Durchgang nach allem Deckenden, pro Instanz von hinten nach vorne sortiert, ohne Tiefenschreiben | ✅ |
 | Licht | 1 Richtungslicht mit Shadow-Map (3×3 PCF, texel-snapped), bis zu 16 Punktlichter, Hemisphären-Ambient | ✅ · Clustered Lighting, CSM, Spots und IBL fehlen |
 | Culling/Draws | GPU-driven: Ein Compute-Shader macht Frustum- und Hi-Z-Occlusion-Culling pro Instanz und schreibt die Argumente für `drawIndexedIndirect`. Fallback: CPU-Frustum-Culling mit direkten Draws | ✅ |
@@ -109,7 +111,8 @@ impl Game for MyGame {
 
 Das Beispiel `games/demo` („Tumble“) nutzt alle Systeme: Ball steuern, Kistenturm von der Insel
 stoßen, schießen, HUD-Buttons, ein Terminal als World Panel (Neustart, Schatten, Zeitlupe, Ton),
-3D-Sound mit Effekten (Laser mit Echo, Aufprall mit Hall, Wind als Ambience), prozedurale Texturen für
+einen Teich (Steinrand mit Normal- und Parallax-Mapping, Kiesboden mit Displacement, Wasser-Shader),
+ein Meer mit demselben Wasser-Shader, 3D-Sound mit Effekten (Laser mit Echo, Aufprall mit Hall, Wind als Ambience), prozedurale Texturen für
 Boden, Klippe und Metall, glTF-Bäume, gekochte Felsen und dynamische glTF-Kisten.
 
 ## Threads (optional, Nightly)

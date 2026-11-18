@@ -47,7 +47,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("music", "Streamed music. args: {} = state | {play: url, fade?: 1.5, volume?: 1, loop?: true} | {stop: true, fade?} | {prefetch: url}. State per track: buffering/playing/paused/blocked/error, time, duration, buffered_s/pct."),
     ("audio_stop", "Stop a voice (or all). args: {voice?}"),
     ("sfx", "Synthesize a sound from a preset and register it. args: {preset, name?: preset, seed?: 0 (0 = exact preset, else a mutation), overrides?: {wave, freq, freq_end, duty, attack, decay, sustain, sustain_time, release, vibrato_depth, vibrato_rate, arp_mult, arp_time, partials, noise_mix, lowpass, highpass, bitcrush, volume}}. Returns duration, peak, rms and the full recipe. args {} lists presets."),
-    ("texgen", "Generate a seamless procedural texture. args: {preset, size?: 256, seed?: 1, scale?: 1, colors?: ['#dark','#light'], apply_to?: entity id (sets that entity's material texture)}. args {} lists presets."),
+    ("texgen", "Generate a seamless procedural texture. args: {preset, size?: 256, seed?: 1, scale?: 1, colors?: ['#dark','#light'], apply_to?: entity id (sets that entity's material texture), normal?: strength (also generates + applies a normal map), parallax?: uv depth (applies the height map as parallax)}. args {} lists presets."),
     ("audio_set", "Master audio. args: {volume?, music_volume?, sfx_volume?, muted?, pause_on_blur?: bool (suspend while the tab is unfocused, default true)}"),
     ("panels", "World panels (clickable 3D UI): widgets with rects, on-screen centres (CSS px), hover, click history."),
     ("panel_click", "Click a world panel through the engine path. args: {id, widget?: name} | {id, x, y: panel px}. Returns the action or null."),
@@ -735,6 +735,16 @@ pub(crate) fn handle<G: Game>(
                 m.texture = Some(id);
                 m.base_color = glam::Vec4::ONE;
                 m.checker = 0.0;
+                if let Some(strength) = a.get("normal").and_then(|v| v.as_f64()) {
+                    let px = t.generate_normal(strength as f32);
+                    m.normal_texture = Some(ctx.renderer.add_texture_rgba_linear(t.size, t.size, &px, &format!("{}:normal", t.label()))?);
+                    m.normal_scale = 1.0;
+                }
+                if let Some(p) = a.get("parallax").and_then(|v| v.as_f64()) {
+                    let px = t.generate_height();
+                    m.height_texture = Some(ctx.renderer.add_texture_rgba_linear(t.size, t.size, &px, &format!("{}:height", t.label()))?);
+                    m.parallax = p as f32;
+                }
                 let new_mid = ctx.renderer.add_material(m);
                 if let Ok(mut mr) = ctx.world.get::<&mut MeshRenderer>(e) {
                     mr.material = new_mid;

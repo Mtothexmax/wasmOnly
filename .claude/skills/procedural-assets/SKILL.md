@@ -17,6 +17,10 @@ let tex = ctx.generate_texture(&TexGen::new(TexPreset::Stone).size(256).seed(3).
 let mat = ctx.renderer.add_material(Material { texture: tex, ..Material::color(0xffffff) });
 ```
 
+Normal and height maps of the same preset: `ctx.generate_maps(&TexGen::new(TexPreset::Bricks), 5.0)`
+(height = brightness, normals via Sobel, both tile). Try it live:
+`texgen {"preset":"bricks","apply_to":ID,"normal":5,"parallax":0.06}`.
+
 To repeat a texture across a big surface, scale the mesh UVs (see `tiled_cube` in `games/demo/src/lib.rs`).
 
 Iterate live (no rebuild):

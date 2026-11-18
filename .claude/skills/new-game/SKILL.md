@@ -61,6 +61,25 @@ player position, phase, counts). This is what `call game_state` returns.
 Components (in `engine::scene`): `Transform`, `Parent`, `Name`, `MeshRenderer`, `Camera`,
 `PointLight {color, intensity, range}` (max 16 active), `WorldLabel` (DOM label anchored in 3D).
 
+## Normal / height maps, displacement, water
+
+```rust
+// colour + normal + height map from any texture preset (normal/height are linear textures)
+let stone = ctx.generate_maps(&TexGen::new(TexPreset::Stone).size(256).seed(11), 4.0);
+let rim = ctx.renderer.add_material(Material {
+    texture: stone.color,
+    ..Material::color(0xffffff).normal_map(stone.normal, 1.0).parallax_map(stone.height, 0.04)
+});
+// real vertex displacement: needs vertices -> MeshData::grid / ::disk
+let bed_mesh = ctx.renderer.add_mesh("bed", &engine::mesh::MeshData::disk(2.2, 32, 64, 3.0));
+let bed = ctx.renderer.add_material(Material { texture: p.color, ..Material::color(0xffffff).displace(p.height, 0.12) });
+// water (blend pass, reads scene depth): deep + shallow colour, waves on a grid/disk mesh
+let pond = ctx.renderer.add_material(Material { wave_height: 0.012, wave_scale: 2.2, ..Material::water(0x0e3b3a, 0x5fa89a) });
+```
+
+Parallax works on any mesh (per pixel); displacement moves vertices (shadows still use the flat mesh).
+Water colour depends on what is *below* it: give a pond a bed, foam appears where it meets geometry.
+
 ## Transparency
 
 ```rust

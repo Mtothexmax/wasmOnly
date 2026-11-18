@@ -41,8 +41,24 @@ pub struct Material {
     pub ui: bool,
     /// How `base_color.a * texture.a` is used (see [`AlphaMode`]).
     pub alpha_mode: AlphaMode,
-    /// Render both faces (leaves, grass cards, glass panes). Back faces get a flipped normal.
+    /// Render both faces (leaves, grass cards, glass panes). Back faces get a mirrored normal.
     pub double_sided: bool,
+    /// Tangent-space normal map (linear texture, e.g. [`crate::texgen::TexGen::normal_map`]).
+    pub normal_texture: Option<TextureId>,
+    /// Normal-map strength (1 = as authored).
+    pub normal_scale: f32,
+    /// Height map (linear, white = high) used by `displacement` and `parallax`.
+    pub height_texture: Option<TextureId>,
+    /// Vertex displacement along the normal in mesh units, centred on height 0.5. Needs a
+    /// tessellated mesh (`MeshData::grid`). Shadows use the undisplaced mesh.
+    pub displacement: f32,
+    /// Parallax occlusion mapping depth in UV units (≈ 0.02–0.08). Per pixel, works on low-poly meshes.
+    pub parallax: f32,
+    /// Water surface (see [`Material::water`]): `base_color` = deep colour, `emissive` = shallow colour.
+    pub water: bool,
+    /// Water: wave height (world units) and wave frequency scale.
+    pub wave_height: f32,
+    pub wave_scale: f32,
 }
 
 /// Transparency of a material (glTF semantics).
@@ -73,6 +89,14 @@ impl Default for Material {
             ui: false,
             alpha_mode: AlphaMode::Opaque,
             double_sided: false,
+            normal_texture: None,
+            normal_scale: 1.0,
+            height_texture: None,
+            displacement: 0.0,
+            parallax: 0.0,
+            water: false,
+            wave_height: 0.0,
+            wave_scale: 1.0,
         }
     }
 }
@@ -112,6 +136,40 @@ impl Material {
     pub fn two_sided(mut self) -> Self {
         self.double_sided = true;
         self
+    }
+    /// Normal map with strength.
+    pub fn normal_map(mut self, tex: Option<TextureId>, strength: f32) -> Self {
+        self.normal_texture = tex;
+        self.normal_scale = strength;
+        self
+    }
+    /// Height map driving parallax occlusion mapping (`parallax` in UV units).
+    pub fn parallax_map(mut self, height: Option<TextureId>, parallax: f32) -> Self {
+        self.height_texture = height;
+        self.parallax = parallax;
+        self
+    }
+    /// Height map driving vertex displacement (`amount` in mesh units; use a `MeshData::grid` mesh).
+    pub fn displace(mut self, height: Option<TextureId>, amount: f32) -> Self {
+        self.height_texture = height;
+        self.displacement = amount;
+        self
+    }
+    /// Water surface: animated waves, Fresnel sky reflection, sun glint, colour by water depth
+    /// (`shallow` -> `deep` sRGB hex), foam and soft edges at the shore. Drawn in the blend pass;
+    /// use a tessellated mesh (`MeshData::grid`) so the waves can move the vertices.
+    pub fn water(deep: u32, shallow: u32) -> Self {
+        Self {
+            name: "water".into(),
+            base_color: srgb_hex(deep),
+            emissive: srgb_hex(shallow).truncate(),
+            roughness: 0.05,
+            alpha_mode: AlphaMode::Blend,
+            water: true,
+            wave_height: 0.035,
+            wave_scale: 1.0,
+            ..Default::default()
+        }
     }
 }
 
@@ -219,6 +277,7 @@ struct Globals {
     ground_color: [f32; 4],
     counts: [u32; 4],
     point_lights: [GpuPointLight; MAX_POINT_LIGHTS],
+    time: [f32; 4],
 }
 
 #[repr(C)]
@@ -229,6 +288,7 @@ struct InstanceRaw {
     base_color: [f32; 4],
     emissive_metallic: [f32; 4],
     params: [f32; 4],
+    maps: [f32; 4],
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -240,6 +300,8 @@ pub struct TexInfo {
     pub height: u32,
     pub mips: u32,
     pub uploads: u32,
+    /// Linear (data) texture: normal / height maps. Colour textures are sRGB.
+    pub linear: bool,
 }
 
 /// Distance-based level of detail. `meshes[0]` is used up to `distances[0]` (camera distance
@@ -289,6 +351,11 @@ pub struct Renderer {
     bgl0: GpuBindGroupLayout,
     bgl0_shadow: GpuBindGroupLayout,
     bgl1: GpuBindGroupLayout,
+    /// Material group: base colour, sampler, normal map, height map.
+    bgl_mat: GpuBindGroupLayout,
+    /// Group 0 for the blend pass: bgl0 + the opaque scene depth (binding 5).
+    bgl0_t: GpuBindGroupLayout,
+    bind0_t: Option<GpuBindGroup>,
     globals_buf: GpuBuffer,
     instance_buf: GpuBuffer,
     /// Instance indices drawn by the main pass (identity on CPU path, written by cull.wgsl on GPU path).
@@ -308,10 +375,17 @@ pub struct Renderer {
     meshes: Vec<GpuMesh>,
     materials: Vec<Material>,
     /// Index 0 = 1x1 white default texture.
-    textures: Vec<GpuBindGroup>,
+    tex_views: Vec<GpuTextureView>,
+    /// 1x1 flat normal (0.5, 0.5, 1) used when a material has no normal map.
+    flat_normal: Option<GpuTextureView>,
+    /// Material bind groups by (base, normal, height) internal texture index (u32::MAX = default).
+    mat_groups: std::collections::HashMap<(u32, u32, u32), GpuBindGroup>,
+    /// Seconds since start (water animation).
+    start_ms: f64,
     /// GPU texture objects parallel to `textures` (for updates + mip generation).
     tex_objects: Vec<TexInfo>,
     mip_pipeline: GpuRenderPipeline,
+    mip_pipeline_linear: GpuRenderPipeline,
     mip_sampler: GpuSampler,
     pub settings: RenderSettings,
     pub stats: FrameStats,
@@ -419,6 +493,48 @@ impl Renderer {
         let bgl1 = device
             .create_bind_group_layout(&GpuBindGroupLayoutDescriptor::new(&[tex_entry, samp_entry]))
             .map_err(js_err)?;
+        let mat_tex = |binding: u32, vis: u32| {
+            let e = GpuBindGroupLayoutEntry::new(binding, vis);
+            let t = GpuTextureBindingLayout::new();
+            t.set_sample_type(GpuTextureSampleType::Float);
+            e.set_texture(&t);
+            e
+        };
+        let mat_samp = GpuBindGroupLayoutEntry::new(1, vf);
+        let s = GpuSamplerBindingLayout::new();
+        s.set_type(GpuSamplerBindingType::Filtering);
+        mat_samp.set_sampler(&s);
+        let bgl_mat = device
+            .create_bind_group_layout(&GpuBindGroupLayoutDescriptor::new(&[
+                mat_tex(0, vf),
+                mat_samp,
+                mat_tex(2, gpu_shader_stage::FRAGMENT),
+                mat_tex(3, vf),
+            ]))
+            .map_err(js_err)?;
+        let depth_entry = GpuBindGroupLayoutEntry::new(5, gpu_shader_stage::FRAGMENT);
+        let dt = GpuTextureBindingLayout::new();
+        dt.set_sample_type(GpuTextureSampleType::Depth);
+        dt.set_multisampled(true);
+        depth_entry.set_texture(&dt);
+        let st2 = GpuBindGroupLayoutEntry::new(2, gpu_shader_stage::FRAGMENT);
+        let t2 = GpuTextureBindingLayout::new();
+        t2.set_sample_type(GpuTextureSampleType::Depth);
+        st2.set_texture(&t2);
+        let ss2 = GpuBindGroupLayoutEntry::new(3, gpu_shader_stage::FRAGMENT);
+        let s2 = GpuSamplerBindingLayout::new();
+        s2.set_type(GpuSamplerBindingType::Comparison);
+        ss2.set_sampler(&s2);
+        let bgl0_t = device
+            .create_bind_group_layout(&GpuBindGroupLayoutDescriptor::new(&[
+                uniform_entry(0, vf),
+                storage_entry(1, vf),
+                storage_entry(4, gpu_shader_stage::VERTEX),
+                st2,
+                ss2,
+                depth_entry,
+            ]))
+            .map_err(js_err)?;
 
         // --- Shaders & pipelines ----------------------------------------------------------
         let common = include_str!("shaders/common.wgsl");
@@ -443,7 +559,11 @@ impl Renderer {
 
         let layout = device.create_pipeline_layout(&GpuPipelineLayoutDescriptor::new(&[
             JsNullable::wrap(bgl0.clone()),
-            JsNullable::wrap(bgl1.clone()),
+            JsNullable::wrap(bgl_mat.clone()),
+        ]));
+        let layout_t = device.create_pipeline_layout(&GpuPipelineLayoutDescriptor::new(&[
+            JsNullable::wrap(bgl0_t.clone()),
+            JsNullable::wrap(bgl_mat.clone()),
         ]));
         // Main pipelines: (blend, double_sided) variants of the same PBR shader.
         let make_pipeline = |blend: bool, two_sided: bool| -> Result<GpuRenderPipeline, String> {
@@ -463,7 +583,7 @@ impl Renderer {
                 target.set_blend(&GpuBlendState::new(&a, &c));
             }
             let fs = GpuFragmentState::new(&pbr_module, &[JsNullable::wrap(target)]);
-            fs.set_entry_point("fs_main");
+            fs.set_entry_point(if blend { "fs_blend" } else { "fs_main" });
             let prim = GpuPrimitiveState::new();
             prim.set_topology(GpuPrimitiveTopology::TriangleList);
             prim.set_cull_mode(if two_sided { GpuCullMode::None } else { GpuCullMode::Back });
@@ -473,7 +593,7 @@ impl Renderer {
             ds.set_depth_compare(GpuCompareFunction::Less);
             let ms = GpuMultisampleState::new();
             ms.set_count(SAMPLES);
-            let desc = GpuRenderPipelineDescriptor::new(&layout, &vs);
+            let desc = GpuRenderPipelineDescriptor::new(if blend { &layout_t } else { &layout }, &vs);
             desc.set_label(match (blend, two_sided) {
                 (false, false) => "pbr-opaque",
                 (false, true) => "pbr-opaque-2s",
@@ -511,7 +631,7 @@ impl Renderer {
         // Alpha-tested casters (foliage): same depth-only pass + a fragment stage that discards.
         let mask_layout = device.create_pipeline_layout(&GpuPipelineLayoutDescriptor::new(&[
             JsNullable::wrap(bgl0_shadow.clone()),
-            JsNullable::wrap(bgl1.clone()),
+            JsNullable::wrap(bgl_mat.clone()),
         ]));
         let mvs = GpuVertexState::new(&shadow_module);
         mvs.set_entry_point("vs_shadow_mask");
@@ -565,19 +685,18 @@ impl Renderer {
             device.create_pipeline_layout(&GpuPipelineLayoutDescriptor::new(&[JsNullable::wrap(
                 bgl1.clone(),
             )]));
-        let mvs = GpuVertexState::new(&mip_module);
-        mvs.set_entry_point("vs");
-        let mfs = GpuFragmentState::new(
-            &mip_module,
-            &[JsNullable::wrap(GpuColorTargetState::new(
-                GpuTextureFormat::Rgba8unormSrgb,
-            ))],
-        );
-        mfs.set_entry_point("fs");
-        let mdesc = GpuRenderPipelineDescriptor::new(&mip_layout, &mvs);
-        mdesc.set_label("mipgen");
-        mdesc.set_fragment(&mfs);
-        let mip_pipeline = device.create_render_pipeline(&mdesc).map_err(js_err)?;
+        let mip_for = |fmt: GpuTextureFormat, label: &str| -> Result<GpuRenderPipeline, String> {
+            let mvs = GpuVertexState::new(&mip_module);
+            mvs.set_entry_point("vs");
+            let mfs = GpuFragmentState::new(&mip_module, &[JsNullable::wrap(GpuColorTargetState::new(fmt))]);
+            mfs.set_entry_point("fs");
+            let mdesc = GpuRenderPipelineDescriptor::new(&mip_layout, &mvs);
+            mdesc.set_label(label);
+            mdesc.set_fragment(&mfs);
+            device.create_render_pipeline(&mdesc).map_err(js_err)
+        };
+        let mip_pipeline = mip_for(GpuTextureFormat::Rgba8unormSrgb, "mipgen")?;
+        let mip_pipeline_linear = mip_for(GpuTextureFormat::Rgba8unorm, "mipgen-linear")?;
         let md = GpuSamplerDescriptor::new();
         md.set_mag_filter(GpuFilterMode::Linear);
         md.set_min_filter(GpuFilterMode::Linear);
@@ -623,6 +742,9 @@ impl Renderer {
             bgl0,
             bgl0_shadow,
             bgl1,
+            bgl_mat,
+            bgl0_t,
+            bind0_t: None,
             globals_buf,
             instance_buf,
             visible_buf,
@@ -640,9 +762,13 @@ impl Renderer {
             size: (0, 0),
             meshes: vec![],
             materials: vec![],
-            textures: vec![],
+            tex_views: vec![],
+            flat_normal: None,
+            mat_groups: std::collections::HashMap::new(),
+            start_ms: crate::log::now_ms(),
             tex_objects: vec![],
             mip_pipeline,
+            mip_pipeline_linear,
             mip_sampler,
             settings: RenderSettings::default(),
             stats: FrameStats::default(),
@@ -661,6 +787,7 @@ impl Renderer {
             last_view_proj: Mat4::IDENTITY,
         };
         r.create_white_texture()?;
+        r.flat_normal = Some(r.create_solid(GpuTextureFormat::Rgba8unorm, (0.5, 0.5, 1.0, 1.0), "flat-normal")?);
         let cube = r.add_mesh("cube", &MeshData::cube(1.0));
         let sphere = r.add_mesh("sphere", &MeshData::sphere(0.5, 32, 16));
         let plane = r.add_mesh("plane", &MeshData::plane(1.0, 1.0));
@@ -736,6 +863,21 @@ impl Renderer {
         (full, shadow)
     }
 
+    /// 1x1 texture of one colour (clear pass), not registered as a public texture.
+    fn create_solid(&self, fmt: GpuTextureFormat, c: (f64, f64, f64, f64), label: &str) -> Result<GpuTextureView, String> {
+        let desc = GpuTextureDescriptor::new(fmt, &nums(&[1, 1]), gpu_texture_usage::TEXTURE_BINDING | gpu_texture_usage::RENDER_ATTACHMENT);
+        desc.set_label(label);
+        let tex = self.device.create_texture(&desc).map_err(js_err)?;
+        let view = tex.create_view().map_err(js_err)?;
+        let enc = self.device.create_command_encoder();
+        let att = GpuRenderPassColorAttachment::new_with_gpu_texture_view(GpuLoadOp::Clear, GpuStoreOp::Store, &view);
+        att.set_clear_value_gpu_color_dict(&GpuColorDict::new(c.3, c.2, c.1, c.0));
+        let pass = enc.begin_render_pass(&GpuRenderPassDescriptor::new(&[JsNullable::wrap(att)])).map_err(js_err)?;
+        pass.end();
+        self.queue.submit(&[enc.finish()]);
+        Ok(view)
+    }
+
     /// 1x1 white texture, filled by a clear pass (no texel upload API needed).
     fn create_white_texture(&mut self) -> Result<(), String> {
         let desc = GpuTextureDescriptor::new(
@@ -766,31 +908,52 @@ impl Renderer {
                 height: 1,
                 mips: 1,
                 uploads: 1,
+                linear: true,
             },
         );
         Ok(())
     }
 
     fn push_texture_view(&mut self, view: &GpuTextureView, info: TexInfo) -> TextureId {
-        let bg = self.device.create_bind_group(&GpuBindGroupDescriptor::new(
-            &[
-                GpuBindGroupEntry::new_with_gpu_texture_view(0, view),
-                GpuBindGroupEntry::new(1, &self.color_sampler),
-            ],
-            &self.bgl1,
-        ));
-        self.textures.push(bg);
+        self.tex_views.push(view.clone());
         self.tex_objects.push(info);
         // Public ids are 0-based and exclude the internal white texture.
-        TextureId((self.textures.len() as u32).saturating_sub(2))
+        TextureId((self.tex_views.len() as u32).saturating_sub(2))
+    }
+
+    /// Bind group for a (base, normal, height) combination of internal texture indices.
+    fn material_group(&mut self, key: (u32, u32, u32)) -> GpuBindGroup {
+        if let Some(g) = self.mat_groups.get(&key) {
+            return g.clone();
+        }
+        let view = |i: u32| self.tex_views.get(i as usize).unwrap_or(&self.tex_views[0]).clone();
+        let base = view(key.0);
+        let normal = if key.1 == u32::MAX { self.flat_normal.clone().unwrap_or_else(|| view(0)) } else { view(key.1) };
+        let height = if key.2 == u32::MAX { view(0) } else { view(key.2) };
+        let g = self.device.create_bind_group(&GpuBindGroupDescriptor::new(
+            &[
+                GpuBindGroupEntry::new_with_gpu_texture_view(0, &base),
+                GpuBindGroupEntry::new(1, &self.color_sampler),
+                GpuBindGroupEntry::new_with_gpu_texture_view(2, &normal),
+                GpuBindGroupEntry::new_with_gpu_texture_view(3, &height),
+            ],
+            &self.bgl_mat,
+        ));
+        self.mat_groups.insert(key, g.clone());
+        g
     }
 
     /// Creates an empty sRGB color texture with a full mip chain (fill it with [`Self::update_texture`]).
     pub fn create_texture(&mut self, w: u32, h: u32, label: &str) -> Result<TextureId, String> {
+        self.create_texture_fmt(w, h, label, false)
+    }
+
+    /// Like [`Self::create_texture`]; `linear` = data texture (normal/height maps, no sRGB decode).
+    pub fn create_texture_fmt(&mut self, w: u32, h: u32, label: &str, linear: bool) -> Result<TextureId, String> {
         let (w, h) = (w.max(1), h.max(1));
         let mips = 32 - w.max(h).leading_zeros();
         let desc = GpuTextureDescriptor::new(
-            GpuTextureFormat::Rgba8unormSrgb,
+            if linear { GpuTextureFormat::Rgba8unorm } else { GpuTextureFormat::Rgba8unormSrgb },
             &nums(&[w, h]),
             gpu_texture_usage::TEXTURE_BINDING
                 | gpu_texture_usage::COPY_DST
@@ -809,6 +972,7 @@ impl Renderer {
                 height: h,
                 mips,
                 uploads: 0,
+                linear,
             },
         ))
     }
@@ -827,12 +991,12 @@ impl Renderer {
             .copy_external_image_to_texture_with_u32_sequence(&src, &dst, &nums(&[w, h]))
             .map_err(js_err)?;
         info.uploads += 1;
-        let mips = info.mips;
-        self.generate_mips(&tex, mips)
+        let (mips, linear) = (info.mips, info.linear);
+        self.generate_mips(&tex, mips, linear)
     }
 
     /// Downsamples level i-1 into level i for every mip (render passes, linear filter).
-    fn generate_mips(&self, tex: &GpuTexture, mips: u32) -> Result<(), String> {
+    fn generate_mips(&self, tex: &GpuTexture, mips: u32, linear: bool) -> Result<(), String> {
         if mips <= 1 {
             return Ok(());
         }
@@ -861,7 +1025,7 @@ impl Renderer {
             let pass = enc
                 .begin_render_pass(&GpuRenderPassDescriptor::new(&[JsNullable::wrap(att)]))
                 .map_err(js_err)?;
-            pass.set_pipeline(&self.mip_pipeline);
+            pass.set_pipeline(if linear { &self.mip_pipeline_linear } else { &self.mip_pipeline });
             pass.set_bind_group(0, Some(&bg));
             pass.draw(3);
             pass.end();
@@ -882,20 +1046,23 @@ impl Renderer {
     }
 
     /// Uploads raw RGBA8 sRGB pixels (`w * h * 4` bytes, top-left first) and builds mips.
-    pub fn add_texture_rgba(
-        &mut self,
-        w: u32,
-        h: u32,
-        data: &[u8],
-        label: &str,
-    ) -> Result<TextureId, String> {
+    pub fn add_texture_rgba(&mut self, w: u32, h: u32, data: &[u8], label: &str) -> Result<TextureId, String> {
+        self.add_texture_rgba_fmt(w, h, data, label, false)
+    }
+
+    /// Uploads raw RGBA8 *linear* pixels (normal / height maps) and builds mips.
+    pub fn add_texture_rgba_linear(&mut self, w: u32, h: u32, data: &[u8], label: &str) -> Result<TextureId, String> {
+        self.add_texture_rgba_fmt(w, h, data, label, true)
+    }
+
+    fn add_texture_rgba_fmt(&mut self, w: u32, h: u32, data: &[u8], label: &str, linear: bool) -> Result<TextureId, String> {
         if data.len() != (w * h * 4) as usize {
             return Err(format!(
                 "add_texture_rgba: {} bytes for {w}x{h}",
                 data.len()
             ));
         }
-        let id = self.create_texture(w, h, label)?;
+        let id = self.create_texture_fmt(w, h, label, linear)?;
         let info = &mut self.tex_objects[id.0 as usize + 1];
         let tex = info.tex.clone().ok_or("texture has no GPU object")?;
         info.uploads += 1;
@@ -907,7 +1074,7 @@ impl Renderer {
         self.queue
             .write_texture_with_u8_slice_and_u32_sequence(&dst, data, &layout, &nums(&[w, h]))
             .map_err(js_err)?;
-        self.generate_mips(&tex, mips)?;
+        self.generate_mips(&tex, mips, linear)?;
         Ok(id)
     }
 
@@ -1002,7 +1169,7 @@ impl Renderer {
         (
             self.meshes.len(),
             self.materials.len(),
-            self.textures.len().saturating_sub(1),
+            self.tex_views.len().saturating_sub(1),
         )
     }
 
@@ -1041,6 +1208,7 @@ impl Renderer {
             .create_texture(&depth)
             .ok()
             .and_then(|t| t.create_view().ok());
+        self.bind0_t = None;
         if let (Some(c), Some(d)) = (&mut self.cull, &self.depth_view) {
             if let Err(e) = c.resize(&self.device, w, h, d) {
                 crate::log_warn!("hi-z resize: {e}");
@@ -1074,6 +1242,7 @@ impl Renderer {
         );
         self.bind0 = a;
         self.bind0_shadow = b;
+        self.bind0_t = None; // rebuilt lazily (needs the depth view)
         Ok(())
     }
 
@@ -1132,6 +1301,7 @@ impl Renderer {
             };
             n_lights += 1;
         }
+        let (near, far) = world.query::<&Camera>().iter().next().map(|c| (c.near, c.far)).unwrap_or((0.1, 500.0));
         let globals = Globals {
             view_proj: view_proj.to_cols_array_2d(),
             light_view_proj: light_view_proj.to_cols_array_2d(),
@@ -1142,6 +1312,7 @@ impl Renderer {
             ground_color: s.ground_color.extend(1.0).into(),
             counts: [n_lights as u32, s.shadows as u32, s.debug_view, 0],
             point_lights,
+            time: [((crate::log::now_ms() - self.start_ms) / 1000.0) as f32, near, far, 0.0],
         };
         self.queue
             .write_buffer_with_u32_and_u8_slice(&self.globals_buf, 0, bytemuck::bytes_of(&globals))
@@ -1164,6 +1335,9 @@ impl Renderer {
         // Model matrices; normal matrices (inverse-transpose) are computed afterwards with the job system.
         let mut models: Vec<Mat4> = vec![];
         let fallback_mat = Material::default();
+        // Material bind groups are keyed by (base, normal, height); `tex` below is an index into key_list.
+        let mut key_ids: std::collections::HashMap<(u32, u32, u32), u32> = std::collections::HashMap::new();
+        let mut key_list: Vec<(u32, u32, u32)> = vec![];
         let mut culled = 0u32;
         let mut lod_counts = [0u32; 4];
         for (g, mr, lod) in world.query::<(&GlobalTransform, &MeshRenderer, Option<&Lod>)>().iter() {
@@ -1184,7 +1358,7 @@ impl Renderer {
             }
             let Some(mesh) = self.meshes.get(mesh_id.0 as usize) else { continue };
             let mat = self.materials.get(mr.material.0 as usize).unwrap_or(&fallback_mat);
-            let shading = if mat.ui { 2.0 } else if mat.unlit { 1.0 } else { 0.0 };
+            let shading = if mat.water { 3.0 } else if mat.ui { 2.0 } else if mat.unlit { 1.0 } else { 0.0 };
             let alpha = match mat.alpha_mode {
                 AlphaMode::Opaque => 0.0,
                 AlphaMode::Mask(c) => c.clamp(0.001, 1.0),
@@ -1196,8 +1370,26 @@ impl Renderer {
                 base_color: mat.base_color.into(),
                 emissive_metallic: mat.emissive.extend(mat.metallic).into(),
                 params: [mat.roughness, mat.checker, shading, alpha],
+                maps: if mat.water {
+                    [0.0, mat.wave_height, 0.0, mat.wave_scale]
+                } else {
+                    [
+                        if mat.normal_texture.is_some() { mat.normal_scale } else { 0.0 },
+                        if mat.height_texture.is_some() { mat.displacement } else { 0.0 },
+                        if mat.height_texture.is_some() { mat.parallax } else { 0.0 },
+                        0.0,
+                    ]
+                },
             };
-            let tex = mat.texture.map(|t| t.0 + 1).unwrap_or(0);
+            let key = (
+                mat.texture.map(|t| t.0 + 1).unwrap_or(0),
+                mat.normal_texture.map(|t| t.0 + 1).unwrap_or(u32::MAX),
+                mat.height_texture.map(|t| t.0 + 1).unwrap_or(u32::MAX),
+            );
+            let tex = *key_ids.entry(key).or_insert_with(|| {
+                key_list.push(key);
+                key_list.len() as u32 - 1
+            });
             let mi = models.len() as u32;
             models.push(model);
             let is_blend = mat.alpha_mode == AlphaMode::Blend;
@@ -1279,6 +1471,20 @@ impl Renderer {
             gpu_culling: gpu,
             ..Default::default()
         };
+        let groups: Vec<GpuBindGroup> = key_list.iter().map(|k| self.material_group(*k)).collect();
+        if self.bind0_t.is_none() {
+            self.bind0_t = Some(self.device.create_bind_group(&GpuBindGroupDescriptor::new(
+                &[
+                    GpuBindGroupEntry::new_with_gpu_buffer(0, &self.globals_buf),
+                    GpuBindGroupEntry::new_with_gpu_buffer(1, &self.instance_buf),
+                    GpuBindGroupEntry::new_with_gpu_texture_view(2, &self.shadow_view),
+                    GpuBindGroupEntry::new(3, &self.shadow_sampler),
+                    GpuBindGroupEntry::new_with_gpu_buffer(4, &self.visible_buf),
+                    GpuBindGroupEntry::new_with_gpu_texture_view(5, &depth),
+                ],
+                &self.bgl0_t,
+            )));
+        }
         let encoder = self.device.create_command_encoder();
 
         // --- GPU culling (compute) ----------------------------------------------------------
@@ -1346,8 +1552,7 @@ impl Renderer {
                         pass.set_pipeline(if mask { &self.shadow_mask_pipeline } else { &self.shadow_pipeline });
                     }
                     if mask && bound != Some((true, tex)) {
-                        let bg = self.textures.get(tex as usize).unwrap_or(&self.textures[0]);
-                        pass.set_bind_group(1, Some(bg));
+                        pass.set_bind_group(1, Some(&groups[tex as usize]));
                     }
                     bound = Some((mask, tex));
                     let mesh = &self.meshes[mesh_id as usize];
@@ -1367,12 +1572,9 @@ impl Renderer {
             pass.end();
         }
 
-        // --- Main pass: opaque (indirect on the GPU path) then blended back to front -------
+        // --- Opaque pass (indirect on the GPU path); keeps colour + depth for the blend pass ---
         {
-            let surface = self.context.get_current_texture().map_err(js_err)?;
-            let surface_view = surface.create_view().map_err(js_err)?;
-            let att = GpuRenderPassColorAttachment::new_with_gpu_texture_view(GpuLoadOp::Clear, GpuStoreOp::Discard, &msaa);
-            att.set_resolve_target_gpu_texture_view(&surface_view);
+            let att = GpuRenderPassColorAttachment::new_with_gpu_texture_view(GpuLoadOp::Clear, GpuStoreOp::Store, &msaa);
             let cc = self.settings.clear_color;
             // clear color is linear; canvas is not sRGB -> approximate gamma
             let gm = |x: f32| x.max(0.0).powf(1.0 / 2.2) as f64;
@@ -1380,10 +1582,10 @@ impl Renderer {
             let datt = GpuRenderPassDepthStencilAttachment::new_with_gpu_texture_view(&depth);
             datt.set_depth_clear_value(1.0);
             datt.set_depth_load_op(GpuLoadOp::Clear);
-            datt.set_depth_store_op(if gpu { GpuStoreOp::Store } else { GpuStoreOp::Discard });
+            datt.set_depth_store_op(GpuStoreOp::Store);
             let desc = GpuRenderPassDescriptor::new(&[JsNullable::wrap(att)]);
             desc.set_depth_stencil_attachment(&datt);
-            desc.set_label("main");
+            desc.set_label("opaque");
             let pass = encoder.begin_render_pass(&desc).map_err(js_err)?;
             pass.set_bind_group(0, Some(&self.bind0));
             let mut bound_tex = u32::MAX;
@@ -1396,8 +1598,7 @@ impl Renderer {
                     bound_pipe = pi;
                 }
                 if tex != bound_tex {
-                    let bg = self.textures.get(tex as usize).unwrap_or(&self.textures[0]);
-                    pass.set_bind_group(1, Some(bg));
+                    pass.set_bind_group(1, Some(&groups[tex as usize]));
                     bound_tex = tex;
                 }
                 let mesh = &self.meshes[mesh_id as usize];
@@ -1411,6 +1612,26 @@ impl Renderer {
                 // GPU path: upper bound (candidates); the exact count lives on the GPU.
                 stats.triangles += (mesh.index_count / 3) as u64 * count as u64;
             }
+            pass.end();
+        }
+
+        // --- Blend pass: back to front, depth read-only *and* bound as a texture (water) -----
+        {
+            let surface = self.context.get_current_texture().map_err(js_err)?;
+            let surface_view = surface.create_view().map_err(js_err)?;
+            let att = GpuRenderPassColorAttachment::new_with_gpu_texture_view(GpuLoadOp::Load, GpuStoreOp::Discard, &msaa);
+            att.set_resolve_target_gpu_texture_view(&surface_view);
+            let datt = GpuRenderPassDepthStencilAttachment::new_with_gpu_texture_view(&depth);
+            datt.set_depth_read_only(true);
+            let desc = GpuRenderPassDescriptor::new(&[JsNullable::wrap(att)]);
+            desc.set_depth_stencil_attachment(&datt);
+            desc.set_label("blend");
+            let pass = encoder.begin_render_pass(&desc).map_err(js_err)?;
+            if let Some(b0) = &self.bind0_t {
+                pass.set_bind_group(0, Some(b0));
+            }
+            let mut bound_tex = u32::MAX;
+            let mut bound_pipe = usize::MAX;
             for &(two_sided, tex, mesh_id, first, count) in &blend_runs {
                 let pi = 2 + two_sided as usize;
                 if pi != bound_pipe {
@@ -1418,8 +1639,7 @@ impl Renderer {
                     bound_pipe = pi;
                 }
                 if tex != bound_tex {
-                    let bg = self.textures.get(tex as usize).unwrap_or(&self.textures[0]);
-                    pass.set_bind_group(1, Some(bg));
+                    pass.set_bind_group(1, Some(&groups[tex as usize]));
                     bound_tex = tex;
                 }
                 let mesh = &self.meshes[mesh_id as usize];

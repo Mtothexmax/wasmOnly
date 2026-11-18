@@ -157,6 +157,23 @@ impl Ctx {
 
     /// Generates a procedural texture (see [`crate::texgen`]) and uploads it with mips.
     /// Falls back to the white texture (id 0 of the white is internal; returns None) on error.
+    /// Colour + normal + height maps of one preset (normal/height are linear textures). Use with
+    /// `Material::normal_map`, `parallax_map` or `displace`.
+    pub fn generate_maps(&mut self, t: &crate::texgen::TexGen, normal_strength: f32) -> crate::texgen::TexMaps {
+        let color = self.generate_texture(t);
+        let label = t.label();
+        let up = |r: &mut crate::renderer::Renderer, px: Vec<u8>, kind: &str| match r.add_texture_rgba_linear(t.size, t.size, &px, &format!("{label}:{kind}")) {
+            Ok(id) => Some(id),
+            Err(e) => {
+                log_error!("texgen {label} {kind}: {e}");
+                None
+            }
+        };
+        let normal = up(&mut self.renderer, t.generate_normal(normal_strength), "normal");
+        let height = up(&mut self.renderer, t.generate_height(), "height");
+        crate::texgen::TexMaps { color, normal, height }
+    }
+
     pub fn generate_texture(
         &mut self,
         t: &crate::texgen::TexGen,

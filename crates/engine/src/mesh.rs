@@ -132,6 +132,56 @@ impl MeshData {
         }
     }
 
+    /// Flat grid in the XZ plane facing +Y, `size` wide, `segments` x `segments` quads, UVs 0..uv_scale.
+    /// Use it for displacement-mapped surfaces and water (vertices to move).
+    pub fn grid(size: f32, segments: u32, uv_scale: f32) -> Self {
+        let n = segments.max(1);
+        let h = size * 0.5;
+        let mut vertices = Vec::with_capacity(((n + 1) * (n + 1)) as usize);
+        for z in 0..=n {
+            for x in 0..=n {
+                let (u, v) = (x as f32 / n as f32, z as f32 / n as f32);
+                vertices.push(Vertex { pos: [-h + u * size, 0.0, -h + v * size], normal: [0.0, 1.0, 0.0], uv: [u * uv_scale, v * uv_scale] });
+            }
+        }
+        let mut indices = Vec::with_capacity((n * n * 6) as usize);
+        for z in 0..n {
+            for x in 0..n {
+                let i = z * (n + 1) + x;
+                indices.extend([i, i + n + 1, i + 1, i + 1, i + n + 1, i + n + 2]);
+            }
+        }
+        MeshData { vertices, indices }
+    }
+
+    /// Disk in the XZ plane facing +Y (pond surfaces, round platforms): `rings` x `segments`
+    /// vertices so it can be displaced; UVs are planar, `uv_scale` repeats across the diameter.
+    pub fn disk(radius: f32, rings: u32, segments: u32, uv_scale: f32) -> Self {
+        let (rings, segs) = (rings.max(1), segments.max(3));
+        let mut vertices = vec![Vertex { pos: [0.0, 0.0, 0.0], normal: [0.0, 1.0, 0.0], uv: [0.5 * uv_scale, 0.5 * uv_scale] }];
+        for r in 1..=rings {
+            let rr = radius * r as f32 / rings as f32;
+            for s in 0..segs {
+                let a = s as f32 / segs as f32 * std::f32::consts::TAU;
+                let (x, z) = (a.cos() * rr, a.sin() * rr);
+                let uv = [(x / (2.0 * radius) + 0.5) * uv_scale, (z / (2.0 * radius) + 0.5) * uv_scale];
+                vertices.push(Vertex { pos: [x, 0.0, z], normal: [0.0, 1.0, 0.0], uv });
+            }
+        }
+        let ring = |r: u32, s: u32| 1 + (r - 1) * segs + s % segs;
+        let mut indices = vec![];
+        for s in 0..segs {
+            indices.extend([0, ring(1, s + 1), ring(1, s)]);
+        }
+        for r in 1..rings {
+            for s in 0..segs {
+                let (a, b, c, d) = (ring(r, s), ring(r, s + 1), ring(r + 1, s), ring(r + 1, s + 1));
+                indices.extend([a, b, c, b, d, c]);
+            }
+        }
+        MeshData { vertices, indices }
+    }
+
     /// 1x1 quad in the XY plane facing +Z; UV (0,0) = top-left (screen/panel convention).
     pub fn quad() -> Self {
         let n = [0.0, 0.0, 1.0];

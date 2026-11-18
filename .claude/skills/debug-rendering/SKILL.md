@@ -66,6 +66,12 @@ node tools/bridge.mjs call render '{"occlusion_culling":false}' # GPU frustum on
 - Up to 16 point lights (`PointLight` component); more are ignored.
 - Instances sorted by texture then mesh; one storage buffer that grows as needed.
 - Textures get full mip chains (GPU blit) and 8x anisotropic filtering. KTX2 is not supported.
+- Frame = shadow pass -> **opaque pass** (stores colour + depth) -> **blend pass** (depth read-only and
+  bound as `scene_depth` for water) -> Hi-Z. Water/blend shaders use `fs_blend`, opaque `fs_main`.
+- Material maps: `Instance.maps` = (normal strength, displacement, parallax, water wave scale). Normal and
+  height maps must be *linear* textures (`add_texture_rgba_linear` / `generate_maps`); a normal map uploaded
+  as sRGB looks wrong (too bright, tilted). `render {"debug_view":1}` shows the mapped normals.
+- Water flicker/moiré far away = waves smaller than a pixel; `waves()` fades them by pixel footprint.
 - Main pass draws `instances[visible_ids[instance_index]]` (binding 4): identity on the CPU path,
   compacted by `cull.wgsl` on the GPU path. `hiz.wgsl` builds the max-depth pyramid after the main pass.
 - Transparency: `stats.render.transparent` / `transparent_draw_calls` count blended instances (CPU frustum

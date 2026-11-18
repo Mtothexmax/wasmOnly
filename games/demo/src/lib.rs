@@ -16,6 +16,9 @@ pub fn main() {
 }
 
 const PLAYER_SPAWN: Vec3 = Vec3::new(0.0, 1.0, 9.0);
+/// Pond centre and inner radius.
+const POND: Vec3 = Vec3::new(-6.5, 0.0, 7.5);
+const POND_R: f32 = 2.1;
 const ISLAND_HALF: f32 = 14.0;
 /// A jump press stays valid this many fixed steps (pressed slightly before landing still jumps).
 const JUMP_BUFFER_STEPS: u32 = 8;
@@ -166,13 +169,48 @@ impl Game for Tumble {
         };
         let island_mesh = tiled_cube(ctx, "island", 7.0);
 
-        // Water around the island: alpha-blended (AlphaMode::Blend), drawn after opaque, no depth write.
-        let water_tex = ctx.generate_texture(&TexGen::new(TexPreset::Water).size(256).seed(5));
+        // Sea around the island: water shader (waves, Fresnel sky reflection, sun glint, depth colour).
         let water_mesh = ctx.renderer.add_mesh("water", &engine::mesh::MeshData::plane(1.0, 60.0));
-        let water_mat = ctx.renderer.add_material(Material { texture: water_tex, roughness: 0.15, ..Material::color(0xbfe6ff).transparent(0.62) });
+        let water_mat = ctx.renderer.add_material(Material { wave_height: 0.09, wave_scale: 0.35, ..Material::water(0x0b3a5a, 0x2f8fa8) });
         let w = ctx.spawn_mesh("water", water_mesh, water_mat, Transform::from_xyz(0.0, -2.2, 0.0).with_scale(Vec3::new(400.0, 1.0, 400.0)));
         if let Ok(mut mr) = ctx.world.get::<&mut MeshRenderer>(w) {
             mr.cast_shadows = false;
+        }
+
+        // Pond: raised stone rim (normal + parallax mapped), pebble bed (vertex displacement),
+        // water surface (water shader: depth colour over the bed, foam where it meets the stones).
+        {
+            let stone = ctx.generate_maps(&TexGen::new(TexPreset::Stone).size(256).seed(11).scale(0.6), 4.0);
+            let rim_mat = ctx.renderer.add_material(Material {
+                texture: stone.color,
+                roughness: 0.85,
+                ..Material::color(0xffffff).normal_map(stone.normal, 1.0).parallax_map(stone.height, 0.04)
+            });
+            let segments = 16;
+            for k in 0..segments {
+                let a = k as f32 / segments as f32 * std::f32::consts::TAU;
+                let r = POND_R + 0.3;
+                let p = POND + Vec3::new(a.cos() * r, 0.28, a.sin() * r);
+                let rot = Quat::from_rotation_y(-a + std::f32::consts::FRAC_PI_2);
+                let t = Transform::from_translation(p).with_rotation(rot).with_scale(Vec3::new(1.02, 0.56, 0.6));
+                let e = ctx.spawn_mesh("pond-rim", ctx.renderer.builtin.cube, rim_mat, t);
+                ctx.physics.add(&mut ctx.world, e, RigidBodyBuilder::fixed(), ColliderBuilder::cuboid(0.51, 0.28, 0.3));
+            }
+            let pebbles = ctx.generate_maps(&TexGen::new(TexPreset::Dirt).size(256).seed(21).scale(1.4), 3.0);
+            let bed_mesh = ctx.renderer.add_mesh("pond-bed", &engine::mesh::MeshData::disk(POND_R + 0.1, 32, 64, 3.0));
+            let bed_mat = ctx.renderer.add_material(Material {
+                texture: pebbles.color,
+                roughness: 0.9,
+                ..Material::color(0xc8c0b0).normal_map(pebbles.normal, 1.0).displace(pebbles.height, 0.12)
+            });
+            let bed = ctx.spawn_mesh("pond-bed", bed_mesh, bed_mat, Transform::from_translation(POND + Vec3::Y * 0.04));
+            ctx.physics.add(&mut ctx.world, bed, RigidBodyBuilder::fixed(), ColliderBuilder::cylinder(0.02, POND_R));
+            let surface = ctx.renderer.add_mesh("pond-water", &engine::mesh::MeshData::disk(POND_R + 0.15, 24, 64, 1.0));
+            let pond_mat = ctx.renderer.add_material(Material { wave_height: 0.012, wave_scale: 2.2, ..Material::water(0x0e3b3a, 0x5fa89a) });
+            let w = ctx.spawn_mesh("pond-water", surface, pond_mat, Transform::from_translation(POND + Vec3::Y * 0.45));
+            if let Ok(mut mr) = ctx.world.get::<&mut MeshRenderer>(w) {
+                mr.cast_shadows = false;
+            }
         }
 
         // Grass tufts: two crossed quads, alpha-tested (AlphaMode::Mask), double-sided, cut-out shadows.
@@ -196,11 +234,11 @@ impl Game for Tumble {
         let mut placed = 0;
         while placed < 300 {
             let (x, z) = (ctx.rng.range(-13.0, 13.0), ctx.rng.range(-13.0, 13.0));
-            if x.abs() < 4.0 && z > -6.5 && z < 2.0 {
+            if (x.abs() < 4.0 && z > -6.5 && z < 2.0) || (x - POND.x).hypot(z - POND.z) < POND_R + 0.9 {
                 continue; // keep the tower area clear
             }
             let s = ctx.rng.range(0.5, 0.9);
-            let t = Transform::from_xyz(x, 0.0, z).with_rotation(Quat::from_rotation_y(ctx.rng.range(0.0, 3.14))).with_scale(Vec3::new(s, s * 0.8, s));
+            let t = Transform::from_xyz(x, 0.0, z).with_rotation(Quat::from_rotation_y(ctx.rng.range(0.0, std::f32::consts::PI))).with_scale(Vec3::new(s, s * 0.8, s));
             ctx.spawn_mesh("grass", tuft_mesh, tuft_mat, t);
             placed += 1;
         }

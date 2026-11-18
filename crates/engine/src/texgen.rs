@@ -150,6 +150,42 @@ impl TexGen {
         self.colors = Some([dark, light]);
         self
     }
+    /// Height map (linear RGBA, grey = height) derived from the preset: brightness = height, so
+    /// mortar, cracks and grout are low. Tiles seamlessly like the colour texture.
+    pub fn generate_height(&self) -> Vec<u8> {
+        let px = self.generate();
+        let mut out = Vec::with_capacity(px.len());
+        for p in px.as_chunks::<4>().0 {
+            let l = (0.2126 * p[0] as f32 + 0.7152 * p[1] as f32 + 0.0722 * p[2] as f32) as u8;
+            out.extend_from_slice(&[l, l, l, 255]);
+        }
+        out
+    }
+
+    /// Tangent-space normal map (linear RGBA, +Y = up in the texture / -v) from the height map,
+    /// Sobel filter with wrap-around (seamless). `strength` ≈ 1–8.
+    pub fn generate_normal(&self, strength: f32) -> Vec<u8> {
+        let n = self.size as usize;
+        let hp = self.generate_height();
+        let h = |x: isize, y: isize| -> f32 {
+            let (x, y) = (x.rem_euclid(n as isize) as usize, y.rem_euclid(n as isize) as usize);
+            hp[(y * n + x) * 4] as f32 / 255.0
+        };
+        let mut out = Vec::with_capacity(n * n * 4);
+        let k = strength * n as f32 / 256.0;
+        for y in 0..n as isize {
+            for x in 0..n as isize {
+                let dx = (h(x + 1, y - 1) + 2.0 * h(x + 1, y) + h(x + 1, y + 1)) - (h(x - 1, y - 1) + 2.0 * h(x - 1, y) + h(x - 1, y + 1));
+                let dy = (h(x - 1, y + 1) + 2.0 * h(x, y + 1) + h(x + 1, y + 1)) - (h(x - 1, y - 1) + 2.0 * h(x, y - 1) + h(x + 1, y - 1));
+                // texture rows grow downwards (+v); tangent-space +Y points along +v (bitangent)
+                let v = glam::Vec3::new(-dx * k, -dy * k, 1.0).normalize();
+                let e = |c: f32| ((c * 0.5 + 0.5) * 255.0).round() as u8;
+                out.extend_from_slice(&[e(v.x), e(v.y), e(v.z), 255]);
+            }
+        }
+        out
+    }
+
     pub fn label(&self) -> String {
         format!(
             "texgen:{}:{}:s{}:x{}",
@@ -436,6 +472,14 @@ impl Gen {
             }
         }
     }
+}
+
+/// Texture ids produced by `Ctx::generate_maps`.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct TexMaps {
+    pub color: Option<crate::renderer::TextureId>,
+    pub normal: Option<crate::renderer::TextureId>,
+    pub height: Option<crate::renderer::TextureId>,
 }
 
 /// Mean color (sRGB hex) of generated pixels — cheap AI-side sanity check.
