@@ -37,6 +37,9 @@ pub struct DebugMode {
     file: Option<String>,
     pending: Vec<String>,
     last_cam_ms: f64,
+    last_perf_ms: f64,
+    /// frame intervals (ms) since the last perf line
+    frame_dts: Vec<f32>,
     last_flush_ms: f64,
     lines: u64,
     keys: u64,
@@ -200,6 +203,32 @@ impl DebugMode {
                 }
             }
         });
+    }
+
+    /// Performance line once per second while on: fps, frame-time percentiles, CPU phases, GPU passes.
+    pub(crate) fn record_perf(&mut self, now: f64, step: u64, frame: u64, frame_dt_ms: f32, snapshot: impl FnOnce() -> serde_json::Value) {
+        if !self.on {
+            self.frame_dts.clear();
+            return;
+        }
+        self.frame_dts.push(frame_dt_ms);
+        if now - self.last_perf_ms < 1000.0 {
+            return;
+        }
+        self.last_perf_ms = now;
+        let mut d = std::mem::take(&mut self.frame_dts);
+        d.sort_by(|a, b| a.total_cmp(b));
+        let pct = |p: f32| d.get(((d.len() as f32 - 1.0) * p).round().max(0.0) as usize).copied().unwrap_or(0.0);
+        let r = |v: f32| (v * 100.0).round() / 100.0;
+        let mut v = snapshot();
+        v["t"] = json!((now * 10.0).round() / 10.0);
+        v["step"] = json!(step);
+        v["frame"] = json!(frame);
+        v["kind"] = json!("perf");
+        v["frames"] = json!(d.len());
+        v["frame_ms"] = json!({"p50": r(pct(0.5)), "p95": r(pct(0.95)), "max": r(pct(1.0))});
+        v["slow_frames_over_20ms"] = json!(d.iter().filter(|x| **x > 20.0).count());
+        self.push(v);
     }
 
     /// Small HUD badge (empty when off).

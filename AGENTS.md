@@ -63,6 +63,12 @@ normal `cargo` output above it.
   `launch --sound` only when the user wants to listen.
 - **Culling/LOD:** `stats.render` has `gpu_culling`, `gpu_frustum_culled`, `gpu_occluded`, `gpu_visible`
   (async readback, 1-3 frames old) and `lod_levels`. `render {gpu_culling:false}` switches to the CPU path.
+- **Frame rate / stutter:** `node tools/bridge.mjs perf [--ms 3000] [--profile]` measures real rAF intervals and
+  returns `frame_ms` p50/p95/p99, `missed_frames_pct`, `cpu_phases` (game_fixed, physics, update, engine, render),
+  `gpu_ms` per pass (cull, shadow, opaque, blend, hiz; WebGPU timestamp queries) and a `verdict`
+  (smooth / gpu-bound / cpu-bound / stutter). `--profile` adds a CDP CPU profile (`top_self` functions).
+  Live values: `stats.time.phases`, `stats.render.gpu_ms`. When the *user* sees low fps, ask them to press ` while
+  it happens: debug mode writes a `"kind":"perf"` line per second (p50/p95/max, slow frames, phases, GPU) into the log.
 
 ## Code map
 

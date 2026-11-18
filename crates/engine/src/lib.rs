@@ -13,6 +13,7 @@ pub mod audio;
 pub mod debug;
 pub mod debugmode;
 pub mod gltf_loader;
+pub mod gpu_timing;
 pub(crate) mod gpu_cull;
 pub mod input;
 pub mod jobs;

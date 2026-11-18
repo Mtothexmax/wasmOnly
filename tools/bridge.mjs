@@ -17,6 +17,8 @@
 //                                                    (exit 1 on problems; --strict also fails on warnings)
 //   node tools/bridge.mjs flicker [--frames 6] [--jitter 0.2] [--threshold 48] [--out heat.png]
 //                                                    screenshots with flipped draw order + perturbed depth -> flickering regions
+//   node tools/bridge.mjs perf [--ms 3000] [--profile] frame times, engine CPU phases, GPU pass times,
+//                                                    verdict (vsync/gpu/cpu-bound); --profile adds top CPU functions
 //   node tools/bridge.mjs mcp                        run as MCP server (stdio) — see .mcp.json
 //
 // Options: --port 9222 (CDP port), --url <page url to target/open>
@@ -26,7 +28,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { check, flicker } from './qa.mjs';
+import { check, flicker, perf } from './qa.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const argv = process.argv.slice(2);
@@ -202,6 +204,8 @@ const TOOLS = [
     inputSchema: { type: 'object', properties: { flicker: { type: 'boolean' }, strict: { type: 'boolean' } } } },
   { name: 'flicker', description: 'Flicker scan: several screenshots alternating draw order and depth mapping (time frozen, HUD hidden, pixels stay put); returns flickering regions with the entity under each (z-fighting, shadow acne, shimmering).',
     inputSchema: { type: 'object', properties: { frames: { type: 'number' }, threshold: { type: 'number' } } } },
+  { name: 'perf', description: 'Performance capture: frame-time percentiles, engine CPU phases, GPU time per pass, verdict (smooth / gpu-bound / cpu-bound / stutter); profile=true adds the top CPU functions (Chrome sampling profiler).',
+    inputSchema: { type: 'object', properties: { ms: { type: 'number' }, profile: { type: 'boolean' } } } },
   { name: 'eval_js', description: 'Evaluate a JavaScript expression in the page (promises awaited, result returned by value).',
     inputSchema: { type: 'object', properties: { expression: { type: 'string' } }, required: ['expression'] } },
 ];
@@ -233,6 +237,7 @@ async function runTool(name, a = {}) {
     case 'screenshot': return { content: [{ type: 'image', data: await withSession((s) => s.screenshot()), mimeType: 'image/png' }] };
     case 'reload': return text(await withSession((s) => s.reload()));
     case 'eval_js': return text(await withSession((s) => s.eval(a.expression)));
+    case 'perf': return text(await withSession((s) => perf(s, { ms: a.ms, profile: !!a.profile })));
     case 'check': return text(await withSession((s) => check(s, { flicker: !!a.flicker, strict: !!a.strict })));
     case 'flicker': return text(await withSession((s) => flicker(s, { frames: a.frames, threshold: a.threshold })));
     default: throw new Error(`unknown tool ${name}`);
@@ -270,7 +275,7 @@ function mcp() {
 
 // ------------------------------------------------------------------------------------------------
 const out = (v) => console.log(JSON.stringify(v, null, 2));
-const positional = argv.filter((a, i) => !a.startsWith('--') && !(i > 0 && argv[i - 1].startsWith('--') && !['--headless', '--release', '--sound', '--flicker', '--strict'].includes(argv[i - 1])));
+const positional = argv.filter((a, i) => !a.startsWith('--') && !(i > 0 && argv[i - 1].startsWith('--') && !['--headless', '--release', '--sound', '--flicker', '--strict', '--profile'].includes(argv[i - 1])));
 const [cmd, ...rest] = positional;
 
 try {
@@ -301,6 +306,10 @@ try {
       if (!r.ok) process.exitCode = 1;
       break;
     }
+    case 'perf': {
+      out(await withSession((s) => perf(s, { ms: Number(opt('--ms', 3000)), profile: flag('--profile') })));
+      break;
+    }
     case 'flicker': {
       const num = (n, d) => (opt(n) !== undefined ? Number(opt(n)) : d);
       const r = await withSession((s) => flicker(s, { frames: num('--frames', 6), jitter: num('--jitter', 0.2), threshold: num('--threshold', 48), out: opt('--out') }));
@@ -310,7 +319,7 @@ try {
     }
     case 'mcp': mcp(); break;
     default:
-      console.error('usage: node tools/bridge.mjs launch|status|call|eval|screenshot|reload|wait|console|check|flicker|mcp  (see header of this file)');
+      console.error('usage: node tools/bridge.mjs launch|status|call|eval|screenshot|reload|wait|console|check|flicker|perf|mcp  (see header of this file)');
       process.exitCode = 2;
   }
 } catch (e) {

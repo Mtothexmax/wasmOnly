@@ -61,6 +61,17 @@ fn nums(v: &[u32]) -> Vec<Number> {
     v.iter().map(|&x| Number::from(x)).collect()
 }
 
+fn compute_pass(enc: &GpuCommandEncoder, ts: Option<GpuComputePassTimestampWrites>) -> GpuComputePassEncoder {
+    match ts {
+        Some(w) => {
+            let d = GpuComputePassDescriptor::new();
+            d.set_timestamp_writes(&w);
+            enc.begin_compute_pass_with_descriptor(&d)
+        }
+        None => enc.begin_compute_pass(),
+    }
+}
+
 pub(crate) struct GpuCull {
     cull_pipeline: GpuComputePipeline,
     init_pipeline: GpuComputePipeline,
@@ -321,6 +332,7 @@ impl GpuCull {
         params: &CullParams,
         items: &[CullItem],
         args: &[DrawArgs],
+        ts: Option<GpuComputePassTimestampWrites>,
     ) -> Result<(), String> {
         queue
             .write_buffer_with_u32_and_u8_slice(&self.params_buf, 0, bytemuck::bytes_of(params))
@@ -357,7 +369,7 @@ impl GpuCull {
         if items.is_empty() {
             return Ok(());
         }
-        let pass = enc.begin_compute_pass();
+        let pass = compute_pass(enc, ts);
         pass.set_label("cull");
         pass.set_pipeline(&self.cull_pipeline);
         pass.set_bind_group(0, self.cull_bg.as_ref());
@@ -372,11 +384,11 @@ impl GpuCull {
     }
 
     /// Builds the Hi-Z pyramid from this frame's depth.
-    pub fn encode_hiz(&mut self, enc: &GpuCommandEncoder, view_proj: glam::Mat4) {
+    pub fn encode_hiz(&mut self, enc: &GpuCommandEncoder, view_proj: glam::Mat4, ts: Option<GpuComputePassTimestampWrites>) {
         let Some(init) = &self.hiz_init_bg else {
             return;
         };
-        let pass = enc.begin_compute_pass();
+        let pass = compute_pass(enc, ts);
         pass.set_label("hi-z");
         pass.set_pipeline(&self.init_pipeline);
         pass.set_bind_group(0, Some(init));

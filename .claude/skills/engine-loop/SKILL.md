@@ -45,6 +45,7 @@ First time on a fresh clone: `node tools/make-sample-assets.mjs` (creates demo a
 4. Prove the behaviour with the verify-gameplay skill.
 5. Before you call it done: `node tools/bridge.mjs check` (or run the watcher as `watch --check`) — exit 0,
    `zfight.pairs` 0, no errors. Use `check --flicker` after visual/geometry work.
+6. After render/shader or heavy gameplay changes: `node tools/bridge.mjs perf` — verdict must say `smooth`.
 
 ## Command cheat sheet
 

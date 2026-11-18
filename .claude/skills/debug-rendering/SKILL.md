@@ -55,6 +55,20 @@ alternate draw order and the near plane (`render {reverse_draw_order, depth_jitt
 move — only depth ties change colour. A clean scene gives exactly 0 flicker pixels. Typical causes: modular pieces overlapping at their ends, decals/planes placed
 exactly on a surface, duplicated entities. Fix the geometry (offset ≥ 1–2 mm, different heights, inset).
 
+## Frame rate below the display rate
+
+```bash
+node tools/bridge.mjs perf --ms 3000            # verdict + frame_ms + cpu_phases + gpu_ms per pass
+node tools/bridge.mjs perf --ms 3000 --profile  # + CDP CPU profile: top self-time functions
+```
+
+Read `verdict` first. `gpu_ms` comes from timestamp queries (Chrome quantizes to ~0.1 ms): a big `opaque` means
+fill rate (canvas size x MSAA x shader cost, overdraw) — `discard` in the opaque pipelines would kill early-Z, so
+alpha-tested materials go through the separate mask pipelines (`ALPHA_TEST` override constant). Compare by
+switching things off (`render {shadows:false}`, despawning a system) and re-running `perf`. A low `fps` with
+`focus:false` in the debug Chrome is often just a background window. Logs from the user: `"kind":"perf"` lines in
+`logs/debug-*.log` (debug mode, ` key) show what their machine measured.
+
 ## 3. Visual debug views
 
 ```bash

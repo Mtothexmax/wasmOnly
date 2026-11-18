@@ -250,6 +250,8 @@ pub struct FrameStats {
     /// Alpha-blended instances drawn this frame (sorted back to front) and their draw calls.
     pub transparent: u32,
     pub transparent_draw_calls: u32,
+    /// GPU milliseconds per pass from timestamp queries (None: unsupported). Async, 1–3 frames old.
+    pub gpu_ms: Option<crate::gpu_timing::GpuTimes>,
     /// True when this frame was culled on the GPU. Then `visible` = candidates sent to the GPU and
     /// the gpu_* counters below come from an async readback (1-3 frames old).
     pub gpu_culling: bool,
@@ -364,8 +366,9 @@ pub struct Renderer {
     pub queue: GpuQueue,
     context: GpuCanvasContext,
     format: GpuTextureFormat,
-    /// [opaque, opaque double-sided, blended, blended double-sided]
-    pipelines: [GpuRenderPipeline; 4],
+    /// [opaque, opaque 2-sided, alpha-test, alpha-test 2-sided, blended, blended 2-sided].
+    /// Opaque pipelines are compiled without `discard` (early-Z).
+    pipelines: [GpuRenderPipeline; 6],
     shadow_pipeline: GpuRenderPipeline,
     shadow_mask_pipeline: GpuRenderPipeline,
     bgl0: GpuBindGroupLayout,
@@ -381,6 +384,8 @@ pub struct Renderer {
     /// Instance indices drawn by the main pass (identity on CPU path, written by cull.wgsl on GPU path).
     visible_buf: GpuBuffer,
     cull: Option<crate::gpu_cull::GpuCull>,
+    /// GPU pass timing (timestamp queries), None when the adapter lacks `timestamp-query`.
+    timing: Option<crate::gpu_timing::GpuTiming>,
     pub gpu_culling_supported: bool,
     instance_cap: u32,
     bind0: GpuBindGroup,
@@ -443,10 +448,16 @@ impl Renderer {
             .as_option()
             .ok_or("navigator.gpu.requestAdapter() returned null (no suitable GPU)")?;
         let gpu_cull_supported = adapter.features().has(crate::gpu_cull::FEATURE);
+        let timing_supported = adapter.features().has(crate::gpu_timing::FEATURE);
         let dd = GpuDeviceDescriptor::new();
+        let mut features = vec![];
         if gpu_cull_supported {
-            dd.set_required_features(&[js_sys::JsString::from(crate::gpu_cull::FEATURE)]);
+            features.push(js_sys::JsString::from(crate::gpu_cull::FEATURE));
         }
+        if timing_supported {
+            features.push(js_sys::JsString::from(crate::gpu_timing::FEATURE));
+        }
+        dd.set_required_features(&features);
         let device: GpuDevice = adapter
             .request_device_with_descriptor(&dd)
             .await
@@ -586,8 +597,10 @@ impl Renderer {
             JsNullable::wrap(bgl0_t.clone()),
             JsNullable::wrap(bgl_mat.clone()),
         ]));
-        // Main pipelines: (blend, double_sided) variants of the same PBR shader.
-        let make_pipeline = |blend: bool, two_sided: bool| -> Result<GpuRenderPipeline, String> {
+        // Main pipelines: (kind, double_sided) variants of the same PBR shader.
+        // kind 0 = opaque (no discard -> early-Z), 1 = alpha-test / UI, 2 = blend.
+        let make_pipeline = |kind: u8, two_sided: bool| -> Result<GpuRenderPipeline, String> {
+            let blend = kind == 2;
             let vs = GpuVertexState::new(&pbr_module);
             vs.set_entry_point("vs_main");
             vs.set_buffers(&[JsNullable::wrap(vertex_layout())]);
@@ -605,6 +618,9 @@ impl Renderer {
             }
             let fs = GpuFragmentState::new(&pbr_module, &[JsNullable::wrap(target)]);
             fs.set_entry_point(if blend { "fs_blend" } else { "fs_main" });
+            let consts = js_sys::Object::new();
+            let _ = js_sys::Reflect::set(&consts, &"ALPHA_TEST".into(), &(if kind == 0 { 0.0 } else { 1.0 }).into());
+            fs.set_constants(consts.unchecked_ref());
             let prim = GpuPrimitiveState::new();
             prim.set_topology(GpuPrimitiveTopology::TriangleList);
             prim.set_cull_mode(if two_sided { GpuCullMode::None } else { GpuCullMode::Back });
@@ -615,11 +631,13 @@ impl Renderer {
             let ms = GpuMultisampleState::new();
             ms.set_count(SAMPLES);
             let desc = GpuRenderPipelineDescriptor::new(if blend { &layout_t } else { &layout }, &vs);
-            desc.set_label(match (blend, two_sided) {
-                (false, false) => "pbr-opaque",
-                (false, true) => "pbr-opaque-2s",
-                (true, false) => "pbr-blend",
-                (true, true) => "pbr-blend-2s",
+            desc.set_label(match (kind, two_sided) {
+                (0, false) => "pbr-opaque",
+                (0, true) => "pbr-opaque-2s",
+                (1, false) => "pbr-mask",
+                (1, true) => "pbr-mask-2s",
+                (_, false) => "pbr-blend",
+                (_, true) => "pbr-blend-2s",
             });
             desc.set_fragment(&fs);
             desc.set_primitive(&prim);
@@ -627,7 +645,14 @@ impl Renderer {
             desc.set_multisample(&ms);
             device.create_render_pipeline(&desc).map_err(js_err)
         };
-        let pipelines = [make_pipeline(false, false)?, make_pipeline(false, true)?, make_pipeline(true, false)?, make_pipeline(true, true)?];
+        let pipelines = [
+            make_pipeline(0, false)?,
+            make_pipeline(0, true)?,
+            make_pipeline(1, false)?,
+            make_pipeline(1, true)?,
+            make_pipeline(2, false)?,
+            make_pipeline(2, true)?,
+        ];
 
         let shadow_layout =
             device.create_pipeline_layout(&GpuPipelineLayoutDescriptor::new(&[JsNullable::wrap(
@@ -752,6 +777,11 @@ impl Renderer {
             None
         };
 
+        let timing = if timing_supported {
+            crate::gpu_timing::GpuTiming::new(&device).map_err(|e| crate::log_warn!("GPU timing disabled: {e}")).ok()
+        } else {
+            None
+        };
         let mut r = Renderer {
             device,
             queue,
@@ -770,6 +800,7 @@ impl Renderer {
             instance_buf,
             visible_buf,
             cull,
+            timing,
             gpu_culling_supported: gpu_cull_supported,
             instance_cap,
             bind0,
@@ -1362,7 +1393,8 @@ impl Renderer {
         let planes = frustum_planes(&view_proj);
         let cam_fwd_n = cam_fwd.normalize_or(Vec3::NEG_Z);
         // (double_sided, texture, mesh, instance, bounds, model index)
-        let mut visible: Vec<(bool, u32, u32, InstanceRaw, [f32; 4], u32)> = vec![];
+        // (pipeline 0..3, texture key, mesh, instance, bounds, model index); opaque pipelines sort first
+        let mut visible: Vec<(u8, u32, u32, InstanceRaw, [f32; 4], u32)> = vec![];
         // (view depth, double_sided, texture, mesh, instance, model index)
         let mut blended: Vec<(f32, bool, u32, u32, InstanceRaw, u32)> = vec![];
         // (alpha-tested, texture, mesh, instance, model index)
@@ -1442,7 +1474,8 @@ impl Renderer {
                     culled += 1;
                 }
             } else if gpu || in_frustum {
-                visible.push((mat.double_sided, tex, mesh_id.0, raw, [center.x, center.y, center.z, radius], mi));
+                let pipe = (if is_mask || mat.ui { 2 } else { 0 }) + mat.double_sided as u8;
+                visible.push((pipe, tex, mesh_id.0, raw, [center.x, center.y, center.z, radius], mi));
             } else {
                 culled += 1;
             }
@@ -1465,7 +1498,7 @@ impl Renderer {
         casters.sort_by_key(|c| (c.0, c.1, c.2));
 
         // Opaque batches: runs of equal (sides, texture, mesh) -> one (indirect) draw each.
-        let mut batches: Vec<(bool, u32, u32, u32, u32)> = vec![]; // (double_sided, texture, mesh, first, count)
+        let mut batches: Vec<(u8, u32, u32, u32, u32)> = vec![]; // (pipeline, texture, mesh, first, count)
         for (i, v) in visible.iter().enumerate() {
             match batches.last_mut() {
                 Some(b) if b.0 == v.0 && b.1 == v.1 && b.2 == v.2 => b.4 += 1,
@@ -1523,6 +1556,9 @@ impl Renderer {
                 &self.bgl0_t,
             )));
         }
+        if let Some(t) = self.timing.as_mut() {
+            t.begin_frame();
+        }
         let encoder = self.device.create_command_encoder();
 
         // --- GPU culling (compute) ----------------------------------------------------------
@@ -1555,7 +1591,8 @@ impl Renderer {
                     hiz_mips: c.hiz_mips,
                     _pad: [0; 3],
                 };
-                c.encode_cull(&self.device, &self.queue, &encoder, &self.visible_buf, &params, &items, &args)?;
+                let ts = self.timing.as_mut().and_then(|t| t.compute_writes(crate::gpu_timing::CULL));
+                c.encode_cull(&self.device, &self.queue, &encoder, &self.visible_buf, &params, &items, &args, ts)?;
                 let k = *c.last_counters.borrow();
                 stats.gpu_frustum_culled = k[0];
                 stats.gpu_occluded = k[1];
@@ -1574,6 +1611,9 @@ impl Renderer {
             let desc = GpuRenderPassDescriptor::new(&[]);
             desc.set_depth_stencil_attachment(&att);
             desc.set_label("shadow");
+            if let Some(w) = self.timing.as_mut().and_then(|t| t.render_writes(crate::gpu_timing::SHADOW)) {
+                desc.set_timestamp_writes(&w);
+            }
             let pass = encoder.begin_render_pass(&desc).map_err(js_err)?;
             if self.settings.shadows && !casters.is_empty() {
                 pass.set_bind_group(0, Some(&self.bind0_shadow));
@@ -1624,13 +1664,16 @@ impl Renderer {
             let desc = GpuRenderPassDescriptor::new(&[JsNullable::wrap(att)]);
             desc.set_depth_stencil_attachment(&datt);
             desc.set_label("opaque");
+            if let Some(w) = self.timing.as_mut().and_then(|t| t.render_writes(crate::gpu_timing::OPAQUE)) {
+                desc.set_timestamp_writes(&w);
+            }
             let pass = encoder.begin_render_pass(&desc).map_err(js_err)?;
             pass.set_bind_group(0, Some(&self.bind0));
             let mut bound_tex = u32::MAX;
             let mut bound_pipe = usize::MAX;
             let args_buf = self.cull.as_ref().filter(|_| gpu).map(|c| c.args_buf.clone());
             for (b, &(two_sided, tex, mesh_id, first, count)) in batches.iter().enumerate() {
-                let pi = two_sided as usize;
+                let pi = two_sided as usize; // pipeline index 0..3
                 if pi != bound_pipe {
                     pass.set_pipeline(&self.pipelines[pi]);
                     bound_pipe = pi;
@@ -1664,6 +1707,9 @@ impl Renderer {
             let desc = GpuRenderPassDescriptor::new(&[JsNullable::wrap(att)]);
             desc.set_depth_stencil_attachment(&datt);
             desc.set_label("blend");
+            if let Some(w) = self.timing.as_mut().and_then(|t| t.render_writes(crate::gpu_timing::BLEND)) {
+                desc.set_timestamp_writes(&w);
+            }
             let pass = encoder.begin_render_pass(&desc).map_err(js_err)?;
             if let Some(b0) = &self.bind0_t {
                 pass.set_bind_group(0, Some(b0));
@@ -1671,7 +1717,7 @@ impl Renderer {
             let mut bound_tex = u32::MAX;
             let mut bound_pipe = usize::MAX;
             for &(two_sided, tex, mesh_id, first, count) in &blend_runs {
-                let pi = 2 + two_sided as usize;
+                let pi = 4 + two_sided as usize;
                 if pi != bound_pipe {
                     pass.set_pipeline(&self.pipelines[pi]);
                     bound_pipe = pi;
@@ -1695,11 +1741,19 @@ impl Renderer {
         let mut readback = false;
         if gpu {
             if let Some(c) = self.cull.as_mut() {
-                c.encode_hiz(&encoder, view_proj);
+                let ts = self.timing.as_mut().and_then(|t| t.compute_writes(crate::gpu_timing::HIZ));
+                c.encode_hiz(&encoder, view_proj, ts);
                 readback = c.encode_readback(&encoder);
             }
         }
+        if let Some(t) = &self.timing {
+            t.encode_resolve(&encoder);
+        }
         self.queue.submit(&[encoder.finish()]);
+        if let Some(t) = &self.timing {
+            t.start_readback();
+            stats.gpu_ms = Some(*t.last.borrow());
+        }
         if readback {
             if let Some(c) = &self.cull {
                 c.start_readback();

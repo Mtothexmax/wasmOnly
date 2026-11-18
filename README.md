@@ -63,6 +63,7 @@ Chrome-Erweiterung „C/C++ DevTools Support (DWARF)“ setzt du Breakpoints dir
 | Build | `tools/dev.mjs` (cargo + wasm-bindgen, `wasm-opt` falls vorhanden). Toolchains festgelegt: Stable 1.99.0, Thread-Backend nightly-2026-11-01 | ✅ |
 | AI-Tooling | `window.engine.call`, strukturierte Logs, deterministisches Stepping, CDP-Bridge, MCP, `.claude/`-Skills | ✅ |
 | Z-Fighting / Flackern | `engine.call("zfight")` findet koplanare, überlappende Flächen verschiedener Objekte (läuft im Debug-Build automatisch nach Szenenänderungen und warnt im Log). `bridge flicker` vergleicht Screenshots mit umgekehrter Zeichenreihenfolge und verschobener Tiefenabbildung (Pixel bleiben stehen) und nennt die flackernden Objekte. `bridge check` / `dev.mjs build --check` ist der Build-Check (Exit-Code 1 bei Problemen) | ✅ |
+| Performance | `bridge perf [--profile]`: echte Frame-Intervalle (p50/p95/p99, verpasste Frames), CPU-Zeit pro Engine-Phase, GPU-Zeit pro Pass (WebGPU-Timestamp-Queries), optional CPU-Profil per CDP, mit Urteil (smooth/gpu-bound/cpu-bound/stutter). Deckende Pipelines ohne `discard` (Early-Z), Alpha-Test über eigene Mask-Pipelines. Im Debug-Modus landet jede Sekunde eine `perf`-Zeile im Log | ✅ |
 | Debug-Modus | Taste <kbd>`</kbd> (Taste links neben 1, auf deutschen Tastaturen <kbd>^</kbd> oder Shift+´): protokolliert jeden Tasten- und Mausdruck und einmal pro Sekunde die Kamera als JSON-Zeilen in `logs/debug-JJJJMMTT-hhmmss.log` (über den Dev-Server), zeigt ein DEBUG-Badge | ✅ |
 
 ## Architektur

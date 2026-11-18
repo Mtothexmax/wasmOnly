@@ -48,6 +48,22 @@ pub trait Game: 'static {
     }
 }
 
+/// CPU time per engine phase in ms (exponentially smoothed). `steps` = fixed steps last frame.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct Phases {
+    /// `Game::fixed_update` (all fixed steps of the frame).
+    pub game_fixed: f32,
+    /// rapier `step` (all fixed steps of the frame).
+    pub physics: f32,
+    /// `Game::update` + input, panels, touch.
+    pub update: f32,
+    /// transforms, panel redraw, audio, debug tools.
+    pub engine: f32,
+    /// `Renderer::render` CPU side (culling, sorting, uploads, command encoding).
+    pub render: f32,
+    pub steps: u32,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Time {
     pub fixed_dt: f32,
@@ -61,8 +77,14 @@ pub struct Time {
     pub frame_ms: f32,
     pub time_scale: f32,
     pub paused: bool,
+    /// CPU milliseconds per engine phase (smoothed): where a frame's CPU time goes.
+    pub phases: Phases,
     #[serde(skip)]
     accumulator: f32,
+    #[serde(skip)]
+    acc_game_fixed: f32,
+    #[serde(skip)]
+    acc_physics: f32,
 }
 
 /// Deterministic xorshift64* RNG (seed it via `engine.call("seed", {value})` for reproducible runs).
@@ -319,10 +341,15 @@ impl Ctx {
 
 /// Runs one fixed simulation step (game logic, then physics).
 pub(crate) fn fixed_step<G: Game>(ctx: &mut Ctx, game: &mut G) {
+    let t0 = log::now_ms();
     game.fixed_update(ctx);
+    let t1 = log::now_ms();
     let dt = ctx.time.fixed_dt;
     let Ctx { physics, world, .. } = ctx;
     physics.step(world, dt);
+    let t2 = log::now_ms();
+    ctx.time.acc_game_fixed += (t1 - t0) as f32;
+    ctx.time.acc_physics += (t2 - t1) as f32;
     ctx.time.step += 1;
     ctx.time.sim_time = ctx.time.step as f64 * dt as f64;
     log::set_step(ctx.time.step);
@@ -391,7 +418,10 @@ async fn start<G: Game>(game: G) -> Result<(), String> {
             frame_ms: 0.0,
             time_scale: 1.0,
             paused: false,
+            phases: Phases::default(),
             accumulator: 0.0,
+            acc_game_fixed: 0.0,
+            acc_physics: 0.0,
         },
         rng: Rng(0x9E37_79B9_7F4A_7C15),
         canvas: canvas.clone(),
@@ -456,6 +486,9 @@ fn resize(c: &mut Ctx) {
 
 fn frame<G: Game>(c: &mut Ctx, game: &mut G, dt: f32) {
     let t0 = log::now_ms();
+    let step0 = c.time.step;
+    c.time.acc_game_fixed = 0.0;
+    c.time.acc_physics = 0.0;
     c.time.frame += 1;
     c.time.frame_dt = dt;
     c.input.poll_gamepad();
@@ -473,6 +506,7 @@ fn frame<G: Game>(c: &mut Ctx, game: &mut G, dt: f32) {
             c.time.accumulator = 0.0; // spiral-of-death guard
         }
     }
+    let t_fixed = log::now_ms();
     // Touch: joystick axis + hold detection; taps on world panels click them (and are consumed).
     c.input.touch.update(log::now_ms());
     if !c.input.touch.taps.is_empty() && !c.panels.is_empty() {
@@ -514,6 +548,7 @@ fn frame<G: Game>(c: &mut Ctx, game: &mut G, dt: f32) {
         }
     }
     game.update(c, dt);
+    let t_update = log::now_ms();
     scene::propagate_transforms(&mut c.world);
     c.panels.flush(&mut c.renderer);
     {
@@ -530,6 +565,21 @@ fn frame<G: Game>(c: &mut Ctx, game: &mut G, dt: f32) {
             .map(|(_, g)| g.0);
         let (now, step, frame) = (log::now_ms(), c.time.step, c.time.frame);
         c.debug_mode.tick(now, step, frame, cam);
+        let snap = || {
+            serde_json::json!({
+                "fps": (c.time.fps * 10.0).round() / 10.0,
+                "cpu_frame_ms": (c.time.frame_ms * 100.0).round() / 100.0,
+                "cpu_phases": c.time.phases,
+                "gpu_ms": c.renderer.stats.gpu_ms,
+                "canvas": [c.renderer.stats.width, c.renderer.stats.height],
+                "draw_calls": c.renderer.stats.draw_calls,
+                "triangles": c.renderer.stats.triangles,
+                "entities": c.world.len(),
+                "bodies": c.physics.body_count(),
+            })
+        };
+        let v = if c.debug_mode.on() { snap() } else { serde_json::Value::Null }; // only built while logging
+        c.debug_mode.record_perf(now, step, frame, c.time.frame_dt * 1000.0, || v);
         let badge = c.debug_mode.badge_html();
         c.ui.set("debugmode", &badge);
     }
@@ -543,6 +593,7 @@ fn frame<G: Game>(c: &mut Ctx, game: &mut G, dt: f32) {
         .map(|(_, g)| g.0);
     c.audio.update(&c.world, cam);
 
+    let t_engine = log::now_ms();
     match c.renderer.render(&c.world) {
         Ok(()) => c.last_render_error = None,
         Err(e) => {
@@ -552,6 +603,7 @@ fn frame<G: Game>(c: &mut Ctx, game: &mut G, dt: f32) {
             }
         }
     }
+    let t_render = log::now_ms();
     let vp = c.renderer.last_view_proj;
     let (cw, ch) = (
         c.canvas.client_width() as f32,
@@ -564,6 +616,17 @@ fn frame<G: Game>(c: &mut Ctx, game: &mut G, dt: f32) {
     let ms = (log::now_ms() - t0) as f32;
     let a = 0.1;
     c.time.frame_ms = c.time.frame_ms * (1.0 - a) + ms * a;
+    {
+        let fixed_other = ((t_fixed - t0) as f32 - c.time.acc_game_fixed - c.time.acc_physics).max(0.0);
+        let p = &mut c.time.phases;
+        let m = |old: f32, new: f32| old * (1.0 - a) + new * a;
+        p.game_fixed = m(p.game_fixed, c.time.acc_game_fixed);
+        p.physics = m(p.physics, c.time.acc_physics);
+        p.update = m(p.update, (t_update - t_fixed) as f32 + fixed_other);
+        p.engine = m(p.engine, (t_engine - t_update) as f32 + (log::now_ms() - t_render) as f32);
+        p.render = m(p.render, (t_render - t_engine) as f32);
+        p.steps = (c.time.step - step0) as u32;
+    }
     if dt > 0.0 {
         c.time.fps = c.time.fps * (1.0 - a) + (1.0 / dt) * a;
     }

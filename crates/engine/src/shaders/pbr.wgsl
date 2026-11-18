@@ -11,6 +11,11 @@
 @group(1) @binding(2) var normal_tex: texture_2d<f32>;
 @group(1) @binding(3) var height_tex: texture_2d<f32>;
 
+// Pipeline constant: false for the opaque pipelines, so they contain no `discard` and the GPU can
+// reject hidden fragments before shading (early-Z). Mask (alpha-test) and UI materials use the
+// pipelines with ALPHA_TEST = true.
+override ALPHA_TEST: bool = true;
+
 struct VsIn {
     @location(0) pos: vec3f,
     @location(1) normal: vec3f,
@@ -210,7 +215,7 @@ fn shade(i: VsOut, front: bool, d: Deriv, face_n: vec3f) -> Surface {
     let alpha_mode = inst.params.w;
     var alpha = inst.base_color.a * tex.a;
     if (alpha_mode > 0.0) {            // mask (alpha test)
-        if (alpha < alpha_mode) { discard; }
+        if (ALPHA_TEST && alpha < alpha_mode) { discard; }
         alpha = 1.0;
     } else if (alpha_mode == 0.0) {    // opaque
         alpha = 1.0;
@@ -221,10 +226,11 @@ fn shade(i: VsOut, front: bool, d: Deriv, face_n: vec3f) -> Surface {
         let c = floor(i.world.x * checker) + floor(i.world.z * checker);
         albedo *= select(1.0, 0.78, (i32(c) & 1) == 0);
     }
-    let shadow = select(1.0, shadow_factor(i.world, n), g.counts.y == 1u);
+    var shadow = 1.0;
+    if (g.counts.y == 1u) { shadow = shadow_factor(i.world, n); }
 
     if (inst.params.z > 1.5) { // ui surface (world panels): texture as-is, alpha-tested
-        if (tex.a < 0.5) { discard; }
+        if (ALPHA_TEST && tex.a < 0.5) { discard; }
         return Surface(vec4f(pow(albedo, vec3f(1.0 / 2.2)), 1.0), n, shadow);
     }
     if (inst.params.z > 0.5) { // unlit
@@ -320,7 +326,8 @@ fn water(i: VsOut, d: Deriv) -> vec4f {
     let deep = inst.base_color.rgb;
     let shallow = inst.emissive_metallic.rgb;
     let l_sun = normalize(-g.sun_dir.xyz);
-    let shadow = select(1.0, shadow_factor(i.world, vec3f(0.0, 1.0, 0.0)), g.counts.y == 1u);
+    var shadow = 1.0;
+    if (g.counts.y == 1u) { shadow = shadow_factor(i.world, vec3f(0.0, 1.0, 0.0)); }
     let lit = g.sun_color.rgb * g.sun_dir.w * (0.25 + 0.35 * max(dot(n, l_sun), 0.0)) * shadow + g.sky_color.rgb * 0.6;
     let body = mix(shallow, deep, depth_t) * lit;
 
