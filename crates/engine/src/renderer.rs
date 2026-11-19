@@ -934,6 +934,8 @@ pub struct Renderer {
     adapt: (f32, f32, u32),
     adapt_last_change: f64,
     adapt_up_votes: u32,
+    /// Windows in which the GPU timestamps claimed far more time than the frame interval allows.
+    timing_strikes: u32,
     meshes: Vec<GpuMesh>,
     /// Slots of removed meshes, reused by `add_mesh` (streaming frees and re-creates chunks).
     free_meshes: Vec<u32>,
@@ -1442,6 +1444,7 @@ impl Renderer {
             adapt: (0.0, 0.0, 0),
             adapt_last_change: -1e9,
             adapt_up_votes: 0,
+            timing_strikes: 0,
             meshes: vec![],
             free_meshes: vec![],
             materials: vec![],
@@ -2228,6 +2231,19 @@ impl Renderer {
         let n = self.adapt.2 as f32;
         let (avg_gpu, avg_frame) = (self.adapt.0 / n, self.adapt.1 / n);
         self.adapt = (0.0, 0.0, 0);
+        // The GPU cannot spend much more time per frame than one frame interval (frames would pile
+        // up). Some drivers (PowerVR B-Series) return timestamps that grow without bound: after two
+        // such windows they are switched off and the frame interval is used instead.
+        if gpu.is_some() && avg_gpu > avg_frame * 2.0 + 5.0 {
+            self.timing_strikes += 1;
+            if self.timing_strikes >= 2 {
+                self.timing = None;
+                self.stats.gpu_ms = None;
+                crate::log_warn!("GPU timestamps unreliable on this device (gpu frame {avg_gpu:.0} ms vs interval {avg_frame:.0} ms): timing off, adaptive resolution uses the frame interval");
+            }
+            return;
+        }
+        self.timing_strikes = 0;
         let budget = self.settings.frame_budget_ms.max(2.0);
         let s = self.settings.render_scale.clamp(0.25, 1.0);
         let lo = self.settings.min_render_scale.clamp(0.25, 1.0);
