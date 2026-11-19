@@ -11,6 +11,8 @@ use glam::{Mat4, Vec3, Vec4};
 use hecs::World;
 use js_sys::{JsNullable, Number};
 use serde::Serialize;
+use std::cell::Cell;
+use std::rc::Rc;
 use wasm_bindgen::{JsCast, JsValue};
 use web_sys::*;
 
@@ -840,6 +842,9 @@ pub struct Renderer {
     /// [opaque, opaque 2-sided, alpha-test, alpha-test 2-sided, blended, blended 2-sided].
     /// Opaque pipelines are compiled without `discard` (early-Z).
     pipelines: [GpuRenderPipeline; 6],
+    /// Set when the driver failed to build that pipeline: its draws are skipped (see
+    /// `debug::create_pipeline_guarded`), so one broken shader does not blank the whole frame.
+    pipeline_broken: [Rc<Cell<bool>>; 6],
     shadow_pipeline: GpuRenderPipeline,
     shadow_mask_pipeline: GpuRenderPipeline,
     bgl0: GpuBindGroupLayout,
@@ -1172,7 +1177,7 @@ impl Renderer {
         ]));
         // Main pipelines: (kind, double_sided) variants of the same PBR shader.
         // kind 0 = opaque (no discard -> early-Z), 1 = alpha-test / UI, 2 = blend.
-        let make_pipeline = |kind: u8, two_sided: bool| -> Result<GpuRenderPipeline, String> {
+        let make_pipeline = |kind: u8, two_sided: bool| -> Result<(GpuRenderPipeline, Rc<Cell<bool>>), String> {
             let blend = kind == 2;
             let vs = GpuVertexState::new(&pbr_module);
             vs.set_entry_point("vs_main");
@@ -1204,21 +1209,22 @@ impl Renderer {
             let ms = GpuMultisampleState::new();
             ms.set_count(SAMPLES);
             let desc = GpuRenderPipelineDescriptor::new(if blend { &layout_t } else { &layout }, &vs);
-            desc.set_label(match (kind, two_sided) {
+            let label = match (kind, two_sided) {
                 (0, false) => "pbr-opaque",
                 (0, true) => "pbr-opaque-2s",
                 (1, false) => "pbr-mask",
                 (1, true) => "pbr-mask-2s",
                 (_, false) => "pbr-blend",
                 (_, true) => "pbr-blend-2s",
-            });
+            };
+            desc.set_label(label);
             desc.set_fragment(&fs);
             desc.set_primitive(&prim);
             desc.set_depth_stencil(&ds);
             desc.set_multisample(&ms);
-            device.create_render_pipeline(&desc).map_err(js_err)
+            crate::debug::create_pipeline_guarded(&device, &desc, label)
         };
-        let pipelines = [
+        let built = [
             make_pipeline(0, false)?,
             make_pipeline(0, true)?,
             make_pipeline(1, false)?,
@@ -1226,6 +1232,8 @@ impl Renderer {
             make_pipeline(2, false)?,
             make_pipeline(2, true)?,
         ];
+        let pipeline_broken: [Rc<Cell<bool>>; 6] = std::array::from_fn(|i| built[i].1.clone());
+        let pipelines: [GpuRenderPipeline; 6] = built.map(|b| b.0);
 
         let shadow_layout =
             device.create_pipeline_layout(&GpuPipelineLayoutDescriptor::new(&[JsNullable::wrap(
@@ -1375,6 +1383,7 @@ impl Renderer {
             queue,
             context,
             pipelines,
+            pipeline_broken,
             shadow_pipeline,
             shadow_mask_pipeline,
             bgl0,
@@ -3323,6 +3332,9 @@ impl Renderer {
                         continue;
                     }
                     let pi = pipe as usize;
+                    if self.pipeline_broken[pi].get() {
+                        continue;
+                    }
                     if pi != bound_pipe {
                         pass.set_pipeline(&self.pipelines[pi]);
                         bound_pipe = pi;
@@ -3342,6 +3354,9 @@ impl Renderer {
             for &b in &draw_order {
                 let (two_sided, tex, mesh_id, first, count) = batches[b as usize];
                 let pi = two_sided as usize; // pipeline index 0..3
+                if self.pipeline_broken[pi].get() {
+                    continue;
+                }
                 if pi != bound_pipe {
                     pass.set_pipeline(&self.pipelines[pi]);
                     bound_pipe = pi;
@@ -3394,6 +3409,9 @@ impl Renderer {
             let mut bound_pipe = usize::MAX;
             for &(two_sided, tex, mesh_id, first, count) in &blend_runs {
                 let pi = 4 + two_sided as usize;
+                if self.pipeline_broken[pi].get() {
+                    continue;
+                }
                 if pi != bound_pipe {
                     pass.set_pipeline(&self.pipelines[pi]);
                     bound_pipe = pi;

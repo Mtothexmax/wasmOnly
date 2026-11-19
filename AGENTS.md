@@ -44,7 +44,11 @@ normal `cargo` output above it.
   user can paste exactly which object they mean. Same data from the API: `call inspect '{"x":640,"y":360}'`.
 - **Errors:** Rust panics, WebGPU validation errors and WGSL compile errors (with line numbers)
   all land in the log at level `error` and in a red overlay (`#engine-error`). Startup failures
-  set `window.engine.fatal`.
+  set `window.engine.fatal`. A render pipeline the *driver* cannot build (mobile Vulkan: `VK_ERROR_UNKNOWN`)
+  is caught by error scopes (`debug::create_pipeline_guarded`): logged, shown in the overlay, and its draws are
+  skipped so the rest of the frame still renders. To find the construct a device chokes on:
+  `node tools/gpu-probe.mjs out.html`, open the page on the device: it compiles PBR/grass variants with parts
+  stubbed out and reports each (page + POST `/__log`).
 - **Z-fighting / flicker:** a screenshot cannot show flicker. Three layers:
   1. debug builds run the z-fighting test automatically after scene changes and log a warning
      (shows up in `bridge reload` / `check`);

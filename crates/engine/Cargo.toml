@@ -48,6 +48,6 @@ features = [
   "GpuCommandEncoder", "GpuCommandEncoderDescriptor", "GpuCommandBuffer", "GpuRenderPassEncoder", "GpuRenderPassDescriptor",
   "GpuRenderPassColorAttachment", "GpuRenderPassDepthStencilAttachment", "GpuLoadOp", "GpuStoreOp", "GpuColorDict",
   "GpuIndexFormat", "GpuExtent3dDict", "GpuCopyExternalImageSourceInfo", "GpuCopyExternalImageDestInfo",
-  "GpuDeviceDescriptor", "GpuRequestAdapterOptions", "GpuPowerPreference", "GpuUncapturedErrorEvent", "GpuError",
+  "GpuDeviceDescriptor", "GpuRequestAdapterOptions", "GpuPowerPreference", "GpuUncapturedErrorEvent", "GpuError", "GpuErrorFilter",
   "gpu_buffer_usage", "gpu_texture_usage", "gpu_shader_stage", "GpuCompilationInfo", "GpuCompilationMessage", "GpuCompilationMessageType",
 ]

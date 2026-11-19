@@ -120,6 +120,39 @@ fn show_overlay(title: &str, msg: &str) {
     el.set_inner_html(&format!("<b>{}</b><pre>{}</pre>", esc(title), esc(msg)));
 }
 
+/// Creates a render pipeline inside error scopes. A pipeline the driver cannot build (e.g.
+/// `VK_ERROR_UNKNOWN` from a mobile Vulkan driver) is invalid, and one `set_pipeline` with it
+/// invalidates the whole command buffer, so nothing at all would be drawn. The returned flag turns
+/// `true` once the failure is known (asynchronously, a frame or two later): callers skip draws with
+/// that pipeline, the rest of the frame still renders. The error is logged and shown in the overlay.
+pub fn create_pipeline_guarded(
+    device: &web_sys::GpuDevice,
+    desc: &web_sys::GpuRenderPipelineDescriptor,
+    label: &str,
+) -> Result<(web_sys::GpuRenderPipeline, Rc<std::cell::Cell<bool>>), String> {
+    device.push_error_scope(web_sys::GpuErrorFilter::Internal);
+    device.push_error_scope(web_sys::GpuErrorFilter::Validation);
+    let created = device.create_render_pipeline(desc);
+    let validation = device.pop_error_scope();
+    let internal = device.pop_error_scope();
+    let pipeline = created.map_err(|e| format!("{label}: {e:?}"))?;
+    let broken = Rc::new(std::cell::Cell::new(false));
+    let flag = broken.clone();
+    let label = label.to_string();
+    wasm_bindgen_futures::spawn_local(async move {
+        for p in [validation, internal] {
+            let Ok(v) = wasm_bindgen_futures::JsFuture::from(p).await else { continue };
+            let Ok(err) = v.dyn_into::<web_sys::GpuError>() else { continue };
+            flag.set(true);
+            let msg = err.message();
+            log::write(Level::Error, format!("WebGPU: render pipeline \"{label}\" failed, its draws are skipped: {msg}"));
+            show_overlay(&format!("Render pipeline \"{label}\" failed on this GPU"), &msg);
+            break;
+        }
+    });
+    Ok((pipeline, broken))
+}
+
 pub fn install_gpu_error_handler(device: &web_sys::GpuDevice) {
     let cb = Closure::<dyn FnMut(web_sys::GpuUncapturedErrorEvent)>::new(
         |ev: web_sys::GpuUncapturedErrorEvent| {

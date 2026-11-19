@@ -20,6 +20,10 @@ WGSL line numbers count from the top of **`common.wgsl` + the shader**: `common.
 prepended to every shader in `crates/engine/src/shaders/`. Shared layouts (`Globals`,
 `Instance`) live there and must match the Rust structs in `renderer.rs` byte for byte.
 
+Works on desktop, nothing 3D on a phone, log says `CreateGraphicsPipelines failed` / `VK_ERROR_UNKNOWN`:
+the driver rejects the generated SPIR-V (not a WGSL error). Those pipelines are skipped (overlay names
+them). Bisect on the device with `node tools/gpu-probe.mjs <page.html>` (variants with stubbed functions).
+
 ## 2. Narrow it down with numbers
 
 ```bash

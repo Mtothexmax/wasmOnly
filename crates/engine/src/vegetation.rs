@@ -63,6 +63,8 @@ struct GrassParams {
 pub(crate) struct GrassRenderer {
     pub settings: GrassSettings,
     pipeline: GpuRenderPipeline,
+    /// Set when the driver failed to build the pipeline (`debug::create_pipeline_guarded`).
+    broken: std::rc::Rc<std::cell::Cell<bool>>,
     bgl: GpuBindGroupLayout,
     params: GpuBuffer,
     height: Option<(GpuTexture, GpuTextureView, u32)>,
@@ -110,9 +112,9 @@ impl GrassRenderer {
         d.set_primitive(&prim);
         d.set_depth_stencil(&ds);
         d.set_multisample(&ms);
-        let pipeline = device.create_render_pipeline(&d).map_err(js_err)?;
+        let (pipeline, broken) = crate::debug::create_pipeline_guarded(device, &d, "grass")?;
         let params = device.create_buffer(&GpuBufferDescriptor::new(std::mem::size_of::<GrassParams>() as u32, gpu_buffer_usage::UNIFORM | gpu_buffer_usage::COPY_DST)).map_err(js_err)?;
-        Ok(Self { settings: GrassSettings::default(), pipeline, bgl, params, height: None, group: None, splat: None, terrain: None, last_blades: 0 })
+        Ok(Self { settings: GrassSettings::default(), pipeline, broken, bgl, params, height: None, group: None, splat: None, terrain: None, last_blades: 0 })
     }
 
     /// (Re)uploads the heightmap (row-major, `res`²) as an r32float texture.
@@ -173,6 +175,9 @@ impl GrassRenderer {
 
     pub fn draw(&self, pass: &GpuRenderPassEncoder, bind0: &GpuBindGroup, any_material: &GpuBindGroup, blades: u32) {
         let Some(g) = &self.group else { return };
+        if self.broken.get() {
+            return; // the driver could not build it (logged once): skip grass, keep the frame
+        }
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, Some(bind0));
         pass.set_bind_group(1, Some(any_material));
