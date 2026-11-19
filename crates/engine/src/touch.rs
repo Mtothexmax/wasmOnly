@@ -21,8 +21,21 @@ const TAP_PX: f32 = 12.0;
 const HOLD_MS: f64 = 450.0;
 const SWIPE_PX: f32 = 60.0;
 const SWIPE_MS: f64 = 300.0;
-/// Joystick radius in CSS px.
+/// Joystick radius in CSS px. The ring follows a finger that leaves it, so pulling back from far
+/// outside never drops the stick to a small deflection.
 pub const STICK_RADIUS: f32 = 60.0;
+/// Below this fraction of the radius the stick reads zero (resting thumb jitter).
+pub const STICK_DEADZONE: f32 = 0.12;
+/// From this fraction of the radius on the stick reads full deflection (1.0): a thumb that drifts
+/// a little towards the centre keeps full speed.
+pub const STICK_FULL: f32 = 0.6;
+
+/// Stick axis from the finger offset in px: dead zone, then linear up to full at `STICK_FULL`.
+pub fn stick_axis(offset: Vec2) -> Vec2 {
+    let len = offset.length() / STICK_RADIUS;
+    let m = ((len - STICK_DEADZONE) / (STICK_FULL - STICK_DEADZONE)).clamp(0.0, 1.0);
+    offset.normalize_or_zero() * m
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -83,6 +96,12 @@ impl Gestures {
         let d = pos - t.pos;
         t.pos = pos;
         t.travel = t.travel.max((pos - t.start).length());
+        if t.role == TouchRole::Joystick {
+            let off = pos - t.start;
+            if off.length() > STICK_RADIUS {
+                t.start = pos - off.normalize() * STICK_RADIUS;
+            }
+        }
         if t.role == TouchRole::Look && lookers == 1 {
             self.look_delta += d;
         }
@@ -115,8 +134,7 @@ impl Gestures {
         self.axis = Vec2::ZERO;
         for t in &mut self.touches {
             if t.role == TouchRole::Joystick {
-                let v = (t.pos - t.start) / STICK_RADIUS;
-                let v = if v.length() > 1.0 { v.normalize() } else { v };
+                let v = stick_axis(t.pos - t.start);
                 self.axis = Vec2::new(v.x, -v.y);
             } else if !t.held && t.travel < TAP_PX && now - t.start_ms > HOLD_MS {
                 t.held = true;
