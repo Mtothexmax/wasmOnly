@@ -936,6 +936,9 @@ pub struct Renderer {
     adapt_up_votes: u32,
     /// Windows in which the GPU timestamps claimed far more time than the frame interval allows.
     timing_strikes: u32,
+    /// `copyExternalImageToTexture` works on this device (PowerVR B-Series writes zeros); if not,
+    /// `update_texture` decodes through a 2D canvas and uploads with `writeTexture`.
+    external_copy_ok: bool,
     meshes: Vec<GpuMesh>,
     /// Slots of removed meshes, reused by `add_mesh` (streaming frees and re-creates chunks).
     free_meshes: Vec<u32>,
@@ -1011,6 +1014,17 @@ impl Renderer {
             .await
             .map_err(js_err)?;
         let queue = device.queue();
+        let external_copy_ok = match probe_external_copy(&device, &queue).await {
+            Ok(true) => true,
+            Ok(false) => {
+                crate::log_warn!("copyExternalImageToTexture writes no data on this GPU: images are uploaded through a 2D canvas + writeTexture");
+                false
+            }
+            Err(e) => {
+                crate::log_warn!("image upload self-test failed ({e}): images are uploaded through a 2D canvas + writeTexture");
+                false
+            }
+        };
 
         let context: GpuCanvasContext = canvas
             .get_context("webgpu")
@@ -1445,6 +1459,7 @@ impl Renderer {
             adapt_last_change: -1e9,
             adapt_up_votes: 0,
             timing_strikes: 0,
+            external_copy_ok,
             meshes: vec![],
             free_meshes: vec![],
             materials: vec![],
@@ -1839,11 +1854,22 @@ impl Renderer {
             .ok_or("unknown texture")?;
         let tex = info.tex.clone().ok_or("texture has no GPU object")?;
         let (w, h) = (bmp.width().min(info.width), bmp.height().min(info.height));
-        let src = GpuCopyExternalImageSourceInfo::new(bmp);
-        let dst = GpuCopyExternalImageDestInfo::new(&tex);
-        self.queue
-            .copy_external_image_to_texture_with_u32_sequence(&src, &dst, &nums(&[w, h]))
-            .map_err(js_err)?;
+        if self.external_copy_ok {
+            let src = GpuCopyExternalImageSourceInfo::new(bmp);
+            let dst = GpuCopyExternalImageDestInfo::new(&tex);
+            self.queue
+                .copy_external_image_to_texture_with_u32_sequence(&src, &dst, &nums(&[w, h]))
+                .map_err(js_err)?;
+        } else {
+            let px = bitmap_pixels(bmp, w, h)?;
+            let dst = GpuTexelCopyTextureInfo::new(&tex);
+            let layout = GpuTexelCopyBufferLayout::new();
+            layout.set_bytes_per_row(w * 4);
+            layout.set_rows_per_image(h);
+            self.queue
+                .write_texture_with_u8_slice_and_u32_sequence(&dst, &px, &layout, &nums(&[w, h]))
+                .map_err(js_err)?;
+        }
         info.uploads += 1;
         let (mips, linear) = (info.mips, info.linear);
         self.generate_mips(&tex, mips, linear)
@@ -3571,4 +3597,60 @@ impl LightBufs {
         }
         Ok(changed)
     }
+}
+
+/// RGBA bytes of an ImageBitmap (2D canvas, not premultiplied; fallback upload path).
+fn bitmap_pixels(bmp: &ImageBitmap, w: u32, h: u32) -> Result<Vec<u8>, String> {
+    let canvas = OffscreenCanvas::new(w, h).map_err(js_err)?;
+    let ctx: OffscreenCanvasRenderingContext2d =
+        canvas.get_context("2d").map_err(js_err)?.ok_or("no 2d context")?.unchecked_into();
+    ctx.draw_image_with_image_bitmap(bmp, 0.0, 0.0).map_err(js_err)?;
+    Ok(ctx.get_image_data(0, 0, w as i32, h as i32).map_err(js_err)?.data().0)
+}
+
+/// Uploads a known colour with `copyExternalImageToTexture` and reads it back: false when the
+/// driver silently writes zeros (PowerVR B-Series, Android Chrome).
+async fn probe_external_copy(device: &GpuDevice, queue: &GpuQueue) -> Result<bool, String> {
+    const S: u32 = 4;
+    let canvas = OffscreenCanvas::new(S, S).map_err(js_err)?;
+    let ctx: OffscreenCanvasRenderingContext2d =
+        canvas.get_context("2d").map_err(js_err)?.ok_or("no 2d context")?.unchecked_into();
+    ctx.set_fill_style_str("rgb(200,150,50)");
+    ctx.fill_rect(0.0, 0.0, S as f64, S as f64);
+    let bmp = canvas.transfer_to_image_bitmap().map_err(js_err)?;
+    let desc = GpuTextureDescriptor::new(
+        GpuTextureFormat::Rgba8unorm,
+        &nums(&[S, S]),
+        gpu_texture_usage::COPY_DST | gpu_texture_usage::COPY_SRC | gpu_texture_usage::RENDER_ATTACHMENT,
+    );
+    desc.set_label("external-copy probe");
+    let tex = device.create_texture(&desc).map_err(js_err)?;
+    queue
+        .copy_external_image_to_texture_with_u32_sequence(
+            &GpuCopyExternalImageSourceInfo::new(&bmp),
+            &GpuCopyExternalImageDestInfo::new(&tex),
+            &nums(&[S, S]),
+        )
+        .map_err(js_err)?;
+    let buf = device
+        .create_buffer(&GpuBufferDescriptor::new(256 * S, gpu_buffer_usage::MAP_READ | gpu_buffer_usage::COPY_DST))
+        .map_err(js_err)?;
+    let enc = device.create_command_encoder();
+    let dst = GpuTexelCopyBufferInfo::new(&buf);
+    dst.set_bytes_per_row(256);
+    dst.set_rows_per_image(S);
+    enc.copy_texture_to_buffer_with_u32_sequence(&GpuTexelCopyTextureInfo::new(&tex), &dst, &nums(&[S, S]))
+        .map_err(js_err)?;
+    queue.submit(&[enc.finish()]);
+    wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(JsValue::from(buf.map_async(gpu_map_mode::READ))))
+        .await
+        .map_err(js_err)?;
+    let range = buf.get_mapped_range().map_err(|e| format!("{e:?}"))?;
+    let px = js_sys::Uint8Array::new(&range).to_vec();
+    buf.unmap();
+    buf.destroy();
+    tex.destroy();
+    bmp.close();
+    let p = &px[256 + 4..256 + 8];
+    Ok(p[0].abs_diff(200) < 8 && p[1].abs_diff(150) < 8 && p[2].abs_diff(50) < 8 && p[3] > 200)
 }

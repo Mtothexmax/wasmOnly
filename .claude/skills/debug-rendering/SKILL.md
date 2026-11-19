@@ -27,6 +27,11 @@ Known cause (PowerVR B-Series, Android 10): a WGSL helper that samples a texture
 LUT) called from *several* places in one entry point. Keep one call site per sampling helper (loop over the
 taps, compute the colour in branches and call `finish` once).
 
+Textures from images (glTF) black on a device, no error: `node tools/gpu-probe-tex.mjs <page.html>` uploads a known
+colour every way and reads each stage back. PowerVR B-Series: `copyExternalImageToTexture` writes zeros. The renderer
+self-tests this at startup (`probe_external_copy`) and then uploads through a 2D canvas + `writeTexture`; the log
+warns "copyExternalImageToTexture writes no data on this GPU".
+
 ## 2. Narrow it down with numbers
 
 ```bash
