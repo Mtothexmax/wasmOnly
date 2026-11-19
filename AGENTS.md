@@ -164,6 +164,11 @@ normal `cargo` output above it.
   (smooth / gpu-bound / cpu-bound / stutter). `--profile [--top 40]` adds a CDP CPU profile (`top_self` functions).
   Live values: `stats.time.phases`, `stats.render.gpu_ms`. When the *user* sees low fps, ask them to press ` while
   it happens: debug mode writes a `"kind":"perf"` line per second (p50/p95/max, slow frames, phases, GPU) into the log.
+- **Input lag on a GPU-bound device:** without a limit Chrome queues frames and the screen shows one that is
+  up to a second old (desktop repro: 320vw canvas, 7 frames in flight, 1 s latency). `render {max_frames_in_flight}`
+  (default 2; one extra while `gpu_latency_ms` < 40) skips rendering a frame (simulation and input still run) until
+  the GPU catches up. `stats.render`: `frames_in_flight`, `gpu_latency_ms` (submit -> GPU done, about in-flight x GPU
+  frame time), `frames_skipped`.
 - **GPU time, the honest number:** `gpu_ms.frame` = first pass begin to last pass end. It is larger than `total`
   (the sum of the passes) because clears, MSAA resolves and copies run *between* the timed passes;
   `gpu_ms.timeline` has begin/end per pass (cull, shadow, opaque, blend, hiz, post), so the gaps show them.

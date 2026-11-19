@@ -384,7 +384,15 @@ pub(crate) fn step_characters(ctx: &mut Ctx, dt: f32) {
         if cc.blocked_time > 0.5 && cc.warn_cooldown <= 0.0 {
             cc.warn_cooldown = 3.0;
             cc.stuck_reports += 1;
-            crate::log_warn!("character #{} stuck: wants {:.1} m/s, moves {:.2} m/s, blocked by {} (grounded={})", e.id(), want_speed, got_speed, names(&ctx.world, &cc.colliders), cc.grounded);
+            // the floor a grounded character stands on touches it all the time: not a blocker
+            let feet = t.translation.y - cc.half_height - cc.radius + cc.step_height;
+            let blockers: Vec<ColliderHandle> = cc
+                .colliders
+                .iter()
+                .copied()
+                .filter(|&h| !cc.grounded || ctx.physics.world.colliders.get(h).is_none_or(|c| c.compute_aabb().maxs.y > feet))
+                .collect();
+            crate::log_warn!("character #{} stuck: wants {:.1} m/s, moves {:.2} m/s, blocked by {} (grounded={})", e.id(), want_speed, got_speed, names(&ctx.world, &blockers), cc.grounded);
         }
         if ceiling && cc.warn_cooldown <= 0.0 {
             cc.warn_cooldown = 3.0;

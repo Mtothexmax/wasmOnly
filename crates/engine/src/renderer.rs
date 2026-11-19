@@ -466,6 +466,11 @@ pub struct RenderSettings {
     /// Hi-Z switches itself off for 5 s when it culls less than this fraction of the opaque
     /// candidates (averaged over 1 s; a top-down view hides little), then probes again. 0 = never.
     pub occlusion_min_ratio: f32,
+    /// Frames the GPU may lag behind (submitted, not finished). When reached, the frame is not
+    /// rendered (simulation and input still run), so a GPU-bound device shows a recent frame
+    /// instead of one from a long queue (input lag). One extra frame is allowed while the measured
+    /// latency (`stats.render.gpu_latency_ms`) stays under 40 ms. 0 = no limit.
+    pub max_frames_in_flight: u32,
     /// World-space offset added to the camera position (flicker detection: tiny shifts between
     /// screenshots reveal z-fighting and shimmering).
     pub camera_jitter: Vec3,
@@ -595,6 +600,7 @@ impl Default for RenderSettings {
             occlusion_culling: true,
             occlusion_min_triangles: 100_000,
             occlusion_min_ratio: 0.08,
+            max_frames_in_flight: 2,
             camera_jitter: Vec3::ZERO,
             freeze_time: false,
             depth_jitter: 0.0,
@@ -665,6 +671,12 @@ pub struct FrameStats {
     /// Shadow passes rendered this frame (the others reused their cached map).
     pub shadow_passes_rendered: u32,
     pub shadow_passes_cached: u32,
+    /// Main-view frames submitted but not finished by the GPU (`onSubmittedWorkDone`).
+    pub frames_in_flight: u32,
+    /// Submit -> GPU done of the main view, smoothed (ms). Large = the GPU runs behind (input lag).
+    pub gpu_latency_ms: f32,
+    /// Frames not rendered because `max_frames_in_flight` was reached (total).
+    pub frames_skipped: u64,
     /// Per cascade of the current set: re-rendered this frame (false = cached map reused).
     pub shadow_cascades_rendered: Vec<bool>,
     /// Hi-Z occlusion culling ran this frame (off: too little geometry, or auto off).
@@ -936,6 +948,11 @@ pub struct Renderer {
     adapt_up_votes: u32,
     /// Windows in which the GPU timestamps claimed far more time than the frame interval allows.
     timing_strikes: u32,
+    /// Frame pacing: (frames in flight, smoothed submit -> done latency in ms).
+    in_flight: Rc<Cell<(u32, f32)>>,
+    frames_skipped: u64,
+    /// When frames started being skipped (a promise that never resolves must not stop rendering).
+    skip_since: Option<f64>,
     /// `copyExternalImageToTexture` works on this device (PowerVR B-Series writes zeros); if not,
     /// `update_texture` decodes through a 2D canvas and uploads with `writeTexture`.
     external_copy_ok: bool,
@@ -1459,6 +1476,9 @@ impl Renderer {
             adapt_last_change: -1e9,
             adapt_up_votes: 0,
             timing_strikes: 0,
+            in_flight: Rc::new(Cell::new((0, 0.0))),
+            frames_skipped: 0,
+            skip_since: None,
             external_copy_ok,
             meshes: vec![],
             free_meshes: vec![],
@@ -2418,6 +2438,23 @@ impl Renderer {
 
     /// Renders due render textures, then the main view to the canvas.
     pub fn render(&mut self, world: &World) -> Result<(), String> {
+        let (fl, lat) = self.in_flight.get();
+        let max = self.settings.max_frames_in_flight;
+        // a GPU that keeps up resolves its promise about one vsync late: allow one extra frame
+        // until the latency shows a real backlog (no dropped frames on a fast desktop)
+        if max > 0 && (fl > max || (fl >= max && lat > 40.0)) {
+            let now = crate::log::now_ms();
+            let since = *self.skip_since.get_or_insert(now);
+            if now - since < 1000.0 {
+                self.frames_skipped += 1;
+                self.stats.frames_skipped = self.frames_skipped;
+                self.stats.frames_in_flight = fl;
+                return Ok(());
+            }
+            // a GPU promise that never resolves: forget it and render again
+            self.in_flight.set((0, lat));
+        }
+        self.skip_since = None;
         self.apply_render_scale();
         for i in 0..self.rtts.len() {
             if !self.rtts[i].due() {
@@ -3527,6 +3564,22 @@ impl Renderer {
             t.encode_resolve(&encoder);
         }
         self.queue.submit(&[encoder.finish()]);
+        if main {
+            let cell = self.in_flight.clone();
+            let (fl, lat) = cell.get();
+            cell.set((fl + 1, lat));
+            stats.frames_in_flight = fl + 1;
+            stats.gpu_latency_ms = lat;
+            stats.frames_skipped = self.frames_skipped;
+            let t0 = crate::log::now_ms();
+            let done = self.queue.on_submitted_work_done();
+            wasm_bindgen_futures::spawn_local(async move {
+                let _ = wasm_bindgen_futures::JsFuture::from(done).await;
+                let (fl, lat) = cell.get();
+                let ms = (crate::log::now_ms() - t0) as f32;
+                cell.set((fl.saturating_sub(1), if lat == 0.0 { ms } else { lat * 0.9 + ms * 0.1 }));
+            });
+        }
         if let Some(t) = self.timing.as_ref().filter(|_| main) {
             t.start_readback();
             stats.gpu_ms = Some(*t.last.borrow());
