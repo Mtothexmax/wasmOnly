@@ -172,6 +172,10 @@ function sendStream(stream, res, urlPath) {
     if (waits > 0) stream.pause();
   });
   stream.on('end', () => res.end());
+  // a file locked by a running build (EBUSY on Windows) must not kill the server
+  stream.on('error', (e) => {
+    if (!res.headersSent) { res.statusCode = 503; res.end(String(e.code || e)); } else res.destroy();
+  });
   res.on('close', () => stream.destroy());
 }
 

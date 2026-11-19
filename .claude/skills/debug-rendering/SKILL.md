@@ -23,6 +23,9 @@ prepended to every shader in `crates/engine/src/shaders/`. Shared layouts (`Glob
 Works on desktop, nothing 3D on a phone, log says `CreateGraphicsPipelines failed` / `VK_ERROR_UNKNOWN`:
 the driver rejects the generated SPIR-V (not a WGSL error). Those pipelines are skipped (overlay names
 them). Bisect on the device with `node tools/gpu-probe.mjs <page.html>` (variants with stubbed functions).
+Known cause (PowerVR B-Series, Android 10): a WGSL helper that samples a texture (shadow taps, fog's sky
+LUT) called from *several* places in one entry point. Keep one call site per sampling helper (loop over the
+taps, compute the colour in branches and call `finish` once).
 
 ## 2. Narrow it down with numbers
 

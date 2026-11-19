@@ -183,15 +183,10 @@ fn cascade_shadow(world: vec3f, n: vec3f, k: u32, prev: bool) -> f32 {
 // Cascaded shadow maps: cascade by view depth, blended over the last 15% of each cascade, faded
 // out at the shadow distance. While a stepped sun cross-fades, the previous direction's set is
 // blended in (weight shadow_sets.z).
+// Up to 4 taps (cascade k and k+1, current and previous set) go through ONE call site of
+// cascade_shadow in a loop: PowerVR's Vulkan driver failed to build the pipeline
+// (VK_ERROR_UNKNOWN) when the sampling function was called from several places.
 fn shadow_factor(world: vec3f, n: vec3f) -> f32 {
-    let s = shadow_set_factor(world, n, false);
-    if (g.shadow_sets.z > 0.0) {
-        return mix(s, shadow_set_factor(world, n, true), g.shadow_sets.z);
-    }
-    return s;
-}
-
-fn shadow_set_factor(world: vec3f, n: vec3f, prev: bool) -> f32 {
     let vz = -(g.view * vec4f(world, 1.0)).z;
     let count = g.counts.w;
     var k = 0u;
@@ -200,17 +195,23 @@ fn shadow_set_factor(world: vec3f, n: vec3f, prev: bool) -> f32 {
         k++;
     }
     if (k >= count) { return 1.0; }
-    var s = cascade_shadow(world, n, k, prev);
     let start = select(0.0, g.cascade_splits[max(k, 1u) - 1u], k > 0u);
     let end = g.cascade_splits[k];
     let band = mix(start, end, 0.85);
     let t = clamp((vz - band) / max(end - band, 1e-3), 0.0, 1.0);
-    if (t > 0.0) {
-        var next = 1.0;
-        if (k + 1u < count) { next = cascade_shadow(world, n, k + 1u, prev); }
-        s = mix(s, next, t);
+    let fade = g.shadow_sets.z;
+    var sum = 0.0;
+    for (var j = 0u; j < 4u; j++) {
+        let next = (j & 1u) == 1u;
+        let prev = j >= 2u;
+        let w = select(1.0 - t, t, next) * select(1.0 - fade, fade, prev);
+        if (w <= 0.0) { continue; }
+        let kk = k + select(0u, 1u, next);
+        var s = 1.0; // beyond the last cascade: lit
+        if (kk < count) { s = cascade_shadow(world, n, kk, prev); }
+        sum += w * s;
     }
-    return s;
+    return sum;
 }
 
 // Clustered point + spot lights: only the lights assigned to this pixel's froxel.
@@ -382,18 +383,17 @@ fn shade(i: VsOut, front: bool, d: Deriv, face_n: vec3f) -> Surface {
         if (ALPHA_TEST && tex.a < 0.5) { discard; }
         return Surface(vec4f(albedo, 0.0), n, shadow); // alpha 0: not tonemapped
     }
-    if (inst.params.z > 0.5) { // unlit
-        return Surface(vec4f(finish(albedo + inst.emissive_metallic.rgb, i.world), alpha), n, shadow);
+    // one call of finish (fog) for lit and unlit (see shadow_factor: one call site per sampling helper)
+    var color = albedo + inst.emissive_metallic.rgb; // unlit
+    if (inst.params.z <= 0.5) {
+        let metallic = select(inst.emissive_metallic.a, 0.0, is_terrain);
+        let rough = clamp(inst.params.x, 0.04, 1.0);
+        color = brdf(n, v, l_sun, albedo, metallic, rough) * g.sun_color.rgb * g.sun_dir.w * shadow;
+        color += cluster_lights(i.clip, i.world, n, v, albedo, metallic, rough);
+        let hemi = mix(g.ground_color.rgb, g.sky_color.rgb, n.y * 0.5 + 0.5);
+        color += hemi * albedo * (1.0 - metallic * 0.6);
+        if (!is_terrain) { color += inst.emissive_metallic.rgb; }
     }
-
-    let metallic = select(inst.emissive_metallic.a, 0.0, is_terrain);
-    let rough = clamp(inst.params.x, 0.04, 1.0);
-    var color = vec3f(0.0);
-    color += brdf(n, v, l_sun, albedo, metallic, rough) * g.sun_color.rgb * g.sun_dir.w * shadow;
-    color += cluster_lights(i.clip, i.world, n, v, albedo, metallic, rough);
-    let hemi = mix(g.ground_color.rgb, g.sky_color.rgb, n.y * 0.5 + 0.5);
-    color += hemi * albedo * (1.0 - metallic * 0.6);
-    if (!is_terrain) { color += inst.emissive_metallic.rgb; }
     return Surface(vec4f(finish(color, i.world), alpha), n, shadow);
 }
 
