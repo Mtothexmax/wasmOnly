@@ -27,6 +27,11 @@ pub(super) const LEVELS: usize = 8;
 pub(super) const NONE: u32 = u32::MAX;
 /// Shadow passes the culling pass can fill at once (current + fading set of cascades).
 pub(super) const PASSES: usize = 2 * MAX_CASCADES;
+/// Shadow id lists: per pass q the static (or all) casters in list q, the dynamic ones in q + PASSES
+/// (static shadow cache: see `RenderSettings::shadow_static_cache`).
+pub(super) const SHADOW_LISTS: usize = 2 * PASSES;
+/// Frames without a change after which a dynamic caster counts as static again (2 s).
+const DYN_FRAMES: u64 = 120;
 const N_COUNTERS: usize = 12;
 
 #[repr(C)]
@@ -65,7 +70,10 @@ pub(super) struct SceneParams {
     pub n_sgroups: u32,
     pub pass_mask: u32,
     pub n_args: u32,
-    pub _pad: [u32; 2],
+    /// Bit q: pass q is split (static casters -> list q, dynamic -> list q + PASSES).
+    pub pass_split: u32,
+    /// Bit q: a split pass also needs its static list this frame (static cache re-rendered).
+    pub static_mask: u32,
     pub pass_lv: [[[f32; 4]; 4]; PASSES],
     pub pass_box: [[f32; 4]; PASSES],
 }
@@ -119,6 +127,8 @@ struct SlotInfo {
     mesh_ver: u64,
     /// Second slot of a faded caster (its unfaded shadow record), NONE otherwise.
     shadow_slot: u32,
+    /// Frame of the last move / deformation (dynamic caster while recent).
+    changed_frame: u64,
     // derived
     obj: GpuObject,
     main: bool,
@@ -244,8 +254,12 @@ pub(super) struct GpuScene {
     pub args_dirty: bool,
     /// Bounding spheres of shadow casters that changed this frame (old and new), for the shadow cache.
     pub shadow_changes: Vec<[f32; 4]>,
+    /// The part of `shadow_changes` that touches the static casters (static shadow cache).
+    pub shadow_static_changes: Vec<[f32; 4]>,
     /// Everything changed (first frame, shadows toggled): no cached shadow layer is valid.
     pub shadow_reset: bool,
+    /// Casters currently flagged dynamic (info.y bit 2), checked for expiry every frame.
+    dyn_slots: Vec<u32>,
     /// Slots changed this frame and why (for `gpu_scene`: what keeps uploads / shadows busy).
     changed: Vec<(u32, &'static str)>,
     /// Triangles (LOD 0) and count of the main-view objects.
@@ -296,7 +310,7 @@ impl GpuScene {
 
     /// Ids per shadow pass, and the total id-buffer size the GPU writes (main + all shadow passes).
     pub fn id_layout(&self) -> (u32, u32) {
-        (self.shadow.total, self.main.total + PASSES as u32 * self.shadow.total)
+        (self.shadow.total, self.main.total + SHADOW_LISTS as u32 * self.shadow.total)
     }
 
     pub fn slots(&self) -> u32 {
@@ -342,6 +356,29 @@ impl GpuScene {
         let o = &self.infos[i].obj;
         if o.info[1] & 2 != 0 {
             self.shadow_changes.push(o.sphere);
+            if o.info[1] & 4 == 0 {
+                self.shadow_static_changes.push(o.sphere);
+            }
+        }
+    }
+
+    /// Bounding spheres of the casters currently drawn into the dynamic shadow lists.
+    pub fn dynamic_spheres(&self) -> impl Iterator<Item = [f32; 4]> + '_ {
+        self.dyn_slots.iter().map(|&i| &self.infos[i as usize]).filter(|f| f.active && f.obj.info[1] & 6 == 6).map(|f| f.obj.sphere)
+    }
+
+    /// A caster moved or deformed: it renders into the dynamic shadow list from now on (until it
+    /// stays still for `DYN_FRAMES`). Call after noting its old shape, so the static cache drops it.
+    fn make_dynamic(&mut self, i: usize, frame: u64) {
+        let inf = &mut self.infos[i];
+        if inf.obj.info[1] & 2 == 0 {
+            return;
+        }
+        inf.changed_frame = frame;
+        if inf.obj.info[1] & 4 == 0 {
+            inf.obj.info[1] |= 4;
+            self.dyn_slots.push(i as u32);
+            self.dirty.push(i as u32);
         }
     }
 
@@ -389,6 +426,7 @@ impl GpuScene {
     pub fn sync(&mut self, world: &World, pool: &mut InstancePool, materials: &[Material], mat_ver: &[u32], meshes: &[GpuMesh], shadows_on: bool) {
         let frame = pool.frame;
         self.shadow_changes.clear();
+        self.shadow_static_changes.clear();
         self.changed.clear();
         if self.shadows_on != Some(shadows_on) {
             self.shadows_on = Some(shadows_on);
@@ -423,9 +461,12 @@ impl GpuScene {
                             self.changed.push((s, "mesh deformed"));
                             // deformed mesh (skinning, morphs): same draw, new shadow
                             self.infos[i].mesh_ver = mv;
-                            self.note_shadow(i);
-                            if ss != NONE {
-                                self.note_shadow(ss as usize);
+                            for k in [i as u32, ss] {
+                                if k != NONE {
+                                    self.note_shadow(k as usize);
+                                    self.make_dynamic(k as usize, frame);
+                                    self.note_shadow(k as usize);
+                                }
                             }
                         }
                         continue;
@@ -441,6 +482,22 @@ impl GpuScene {
             self.rebuild(ek, &g.0, mr, lod, mv, mat_v, pool, materials, meshes, shadows_on, frame);
             if let Some(&s) = pool.slot_of.get(&(ek, false)) {
                 self.changed.push((s, "rebuilt"));
+            }
+        }
+        // dynamic casters that stayed still long enough go back into the static shadow cache
+        let mut k = 0;
+        while k < self.dyn_slots.len() {
+            let i = self.dyn_slots[k] as usize;
+            let inf = &self.infos[i];
+            if !inf.active || inf.obj.info[1] & 4 == 0 {
+                self.dyn_slots.swap_remove(k);
+            } else if frame.saturating_sub(inf.changed_frame) > DYN_FRAMES {
+                self.infos[i].obj.info[1] &= !4;
+                self.note_shadow(i);
+                self.dirty.push(i as u32);
+                self.dyn_slots.swap_remove(k);
+            } else {
+                k += 1;
             }
         }
         // entities that are gone (despawned, MeshRenderer removed)
@@ -520,6 +577,7 @@ impl GpuScene {
         let c = classify(model, mr, mat, shadows_on);
         pool.put((ek, false), &c.raw);
         self.note_shadow(i);
+        self.make_dynamic(i, frame);
         let scale = scale_of(model);
         let o = model.w_axis.truncate();
         let ss = self.infos[i].shadow_slot;
@@ -550,6 +608,7 @@ impl GpuScene {
             }
             let s = ss as usize;
             self.note_shadow(s);
+            self.make_dynamic(s, frame);
             self.infos[s].seen = frame;
             self.infos[s].obj.sphere = sphere;
             self.infos[s].obj.origin = origin;
@@ -648,6 +707,7 @@ impl GpuScene {
             lod: lod.map(|l| LodKey { meshes: l.meshes.iter().map(|m| m.0).collect(), distances: l.distances.clone(), cull_beyond: l.cull_beyond }),
             mesh_ver: mv,
             shadow_slot: new_shadow,
+            changed_frame: 0,
             obj,
             main,
             tris,
@@ -673,11 +733,11 @@ impl GpuScene {
         self.main.layout();
         self.shadow.layout();
         let ic = |m: u32| meshes.get(m as usize).map_or(0, |g| g.index_count);
-        let mut args = Vec::with_capacity(self.main.keys.len() + PASSES * self.shadow.keys.len());
+        let mut args = Vec::with_capacity(self.main.keys.len() + SHADOW_LISTS * self.shadow.keys.len());
         for (k, &first) in self.main.keys.iter().zip(&self.main.first) {
             args.push(DrawArgs { index_count: ic(k.2), instance_count: 0, first_index: 0, base_vertex: 0, first_instance: first });
         }
-        for p in 0..PASSES as u32 {
+        for p in 0..SHADOW_LISTS as u32 {
             let base = self.main.total + p * self.shadow.total;
             for (k, &first) in self.shadow.keys.iter().zip(&self.shadow.first) {
                 args.push(DrawArgs { index_count: ic(k.2), instance_count: 0, first_index: 0, base_vertex: 0, first_instance: base + first });

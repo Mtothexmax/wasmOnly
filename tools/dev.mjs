@@ -2,6 +2,7 @@
 // Build + serve + watch for the wasmOnly engine. Zero npm dependencies (Node >= 22).
 //
 //   node tools/dev.mjs build [--game demo] [--release] [--threads]   -> dist/
+//   --out <dir> builds/serves another folder instead of dist/ (set CARGO_TARGET_DIR too when another watcher builds the same game)
 //     --threads: threads backend (Web Worker pool, shared memory, atomics). Uses the pinned nightly
 //     from Cargo.toml [workspace.metadata.wasmonly] threads-toolchain + build-std; output in target/threads.
 //   node tools/dev.mjs serve [--port 8080]               -> static server for dist/ (+ /__events live reload)
@@ -40,7 +41,8 @@ const game = GAME_DIR ? crateName(GAME_DIR) : opt('--game', 'demo');
 if (GAME_DIR && !game) { console.error(`${GAME_DIR}/Cargo.toml: no [package] name`); process.exit(2); }
 /** Project root: the game repo for --game-dir, else this repo. */
 const PROJECT = GAME_DIR ?? ROOT;
-const DIST = path.join(PROJECT, 'dist');
+/** Output folder (`--out <dir>`: a second build of the same game, e.g. a benchmark copy, without touching dist/). */
+const DIST = opt('--out') ? path.resolve(opt('--out')) : path.join(PROJECT, 'dist');
 const GAME_SRC = GAME_DIR ?? path.join(ROOT, 'games', game);
 const release = flag('--release');
 const threads = flag('--threads');
@@ -91,7 +93,7 @@ export function build() {
     : ['build', '-p', game, '--target', 'wasm32-unknown-unknown'];
   if (release) cargoArgs.push('--release');
   const env = { ...process.env };
-  let targetDir = path.join(PROJECT, 'target');
+  let targetDir = process.env.CARGO_TARGET_DIR ? path.resolve(process.env.CARGO_TARGET_DIR) : path.join(PROJECT, 'target');
   let toolchain = null;
   if (threads) {
     toolchain = threadsToolchain();

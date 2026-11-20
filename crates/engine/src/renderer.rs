@@ -215,8 +215,15 @@ struct ShadowLayer {
     depth: f32,
     /// GPU-driven path: a caster touching the layer changed since it was rendered.
     dirty: bool,
+    /// Static shadow cache: the layer's static copy holds the static casters for `mat`, and
+    /// whether a static caster touching the layer changed since.
+    static_ok: bool,
+    static_dirty: bool,
     /// CPU path: hash of the casters whose shadow lands in the cascade's own depth slice.
     near: u64,
+    /// Texel rect (x, y, w, h) the dynamic casters were drawn into last time: restored from the
+    /// static copy before they are drawn again (their old shadow must go).
+    dyn_rect: Option<[u32; 4]>,
 }
 /// Uniform slot stride for per-cascade matrices (minUniformBufferOffsetAlignment).
 const CASCADE_SLOT: u32 = 256;
@@ -448,6 +455,11 @@ pub struct RenderSettings {
     /// cascades (1..) are fitted with a margin and reused while the camera moves inside it; when
     /// only casters moved, they refresh every `shadow_refresh` frames (cascade 0 every frame).
     pub shadow_cache: bool,
+    /// Static shadow cache (GPU-driven path, with `shadow_cache`): each cascade keeps a copy with
+    /// only the static casters. When only dynamic casters (moved or deformed in the last 2 s:
+    /// heroes, NPCs, physics bodies) changed, the cascade is that copy plus the dynamic casters drawn
+    /// on top, instead of every caster again (a walking hero in a forest: thousands of trees).
+    pub shadow_static_cache: bool,
     /// Frames between refreshes of cascades 1, 2, 3 when only their casters changed.
     pub shadow_refresh: [u32; 3],
     /// Extra radius of cascades 1.. with the cache on (fraction), so a cached map still covers the
@@ -593,6 +605,7 @@ impl Default for RenderSettings {
             shadow_step_deg: 0.5,
             shadow_fade_ms: 400.0,
             shadow_cache: true,
+            shadow_static_cache: true,
             shadow_refresh: [2, 3, 4],
             shadow_margin: 0.08,
             light_cluster_far: 400.0,
@@ -671,6 +684,10 @@ pub struct FrameStats {
     /// Shadow passes rendered this frame (the others reused their cached map).
     pub shadow_passes_rendered: u32,
     pub shadow_passes_cached: u32,
+    /// Static shadow copies re-rendered this frame (the other split passes only drew the dynamic casters).
+    pub shadow_static_rendered: u32,
+    /// Shadow-map texels restored from the static copies this frame (dirty rects of moving casters).
+    pub shadow_restored_texels: u32,
     /// Main-view frames submitted but not finished by the GPU (`onSubmittedWorkDone`).
     pub frames_in_flight: u32,
     /// Submit -> GPU done of the main view, smoothed (ms). Large = the GPU runs behind (input lag).
@@ -906,6 +923,11 @@ pub struct Renderer {
     /// Shadow map array (sampling view) + one attachment view per cascade layer.
     shadow_view: GpuTextureView,
     shadow_layers: Vec<GpuTextureView>,
+    /// Static shadow cache: per layer a depth texture with only the static casters and a bind
+    /// group to read it (lazy).
+    static_shadow: Vec<Option<(GpuTextureView, GpuBindGroup)>>,
+    /// Writes a rect of a static copy back into a shadow layer (fullscreen triangle, frag_depth).
+    shadow_restore: (GpuRenderPipeline, GpuBindGroupLayout),
     shadow_size: u32,
     /// Shadow-map sets allocated (1, or 2 once a stepped sun cross-fades).
     shadow_sets: u32,
@@ -1290,6 +1312,7 @@ impl Renderer {
         sdesc.set_primitive(&sprim);
         sdesc.set_depth_stencil(&sds);
         let shadow_pipeline = device.create_render_pipeline(&sdesc).map_err(js_err)?;
+        let shadow_restore = Self::make_shadow_restore(&device)?;
         // Alpha-tested casters (foliage): same depth-only pass + a fragment stage that discards.
         let mask_layout = device.create_pipeline_layout(&GpuPipelineLayoutDescriptor::new(&[
             JsNullable::wrap(bgl0_shadow.clone()),
@@ -1322,7 +1345,7 @@ impl Renderer {
         );
         st.set_label("shadow-cascades");
         drop(st);
-        let (shadow_view, shadow_layers) = Self::make_shadow_maps(&device, shadow_size, 1)?;
+        let (_, shadow_view, shadow_layers) = Self::make_shadow_maps(&device, shadow_size, 1)?;
         // two sets of cascade slots: the second one is used while a stepped sun cross-fades
         let cascade_buf = device
             .create_buffer(&GpuBufferDescriptor::new(CASCADE_SLOT * 2 * MAX_CASCADES as u32, gpu_buffer_usage::UNIFORM | gpu_buffer_usage::COPY_DST))
@@ -1453,6 +1476,8 @@ impl Renderer {
             bind0_shadow,
             shadow_view,
             shadow_layers,
+            static_shadow: vec![],
+            shadow_restore,
             shadow_size,
             shadow_sets: 1,
             shadow_dir: None,
@@ -1612,7 +1637,7 @@ impl Renderer {
     }
 
     /// Shadow-map array with `sets` x MAX_CASCADES layers (+ one attachment view per layer).
-    fn make_shadow_maps(device: &GpuDevice, size: u32, sets: u32) -> Result<(GpuTextureView, Vec<GpuTextureView>), String> {
+    fn make_shadow_maps(device: &GpuDevice, size: u32, sets: u32) -> Result<(GpuTexture, GpuTextureView, Vec<GpuTextureView>), String> {
         let layers = sets * MAX_CASCADES as u32;
         let st = GpuTextureDescriptor::new(SHADOW_FORMAT, &nums(&[size, size, layers]), gpu_texture_usage::RENDER_ATTACHMENT | gpu_texture_usage::TEXTURE_BINDING);
         st.set_label("shadow-cascades");
@@ -1628,7 +1653,54 @@ impl Renderer {
             d.set_array_layer_count(1);
             views.push(tex.create_view_with_descriptor(&d).map_err(js_err)?);
         }
-        Ok((view, views))
+        Ok((tex, view, views))
+    }
+
+    /// Attachment view of layer `layer`'s static shadow copy (allocated on first use).
+    fn static_shadow_view(&mut self, layer: usize) -> Result<GpuTextureView, String> {
+        if self.static_shadow.len() <= layer {
+            self.static_shadow.resize(layer + 1, None);
+        }
+        if self.static_shadow[layer].is_none() {
+            let d = GpuTextureDescriptor::new(SHADOW_FORMAT, &nums(&[self.shadow_size, self.shadow_size]), gpu_texture_usage::RENDER_ATTACHMENT | gpu_texture_usage::TEXTURE_BINDING);
+            d.set_label("shadow-static");
+            let view = self.device.create_texture(&d).map_err(js_err)?.create_view().map_err(js_err)?;
+            let bg = self.device.create_bind_group(&GpuBindGroupDescriptor::new(&[GpuBindGroupEntry::new_with_gpu_texture_view(0, &view)], &self.shadow_restore.1));
+            self.static_shadow[layer] = Some((view, bg));
+        }
+        Ok(self.static_shadow[layer].as_ref().unwrap().0.clone())
+    }
+
+    /// Pipeline that copies depth from a static shadow copy into the bound shadow layer, limited to
+    /// the scissor rect (WebGPU only copies whole depth textures; the dirty part is tiny).
+    fn make_shadow_restore(device: &GpuDevice) -> Result<(GpuRenderPipeline, GpuBindGroupLayout), String> {
+        let code = "@group(0) @binding(0) var src: texture_depth_2d;\n\
+            @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {\n\
+              let p = vec2f(f32((i << 1u) & 2u), f32(i & 2u));\n\
+              return vec4f(p * 2.0 - 1.0, 0.0, 1.0);\n\
+            }\n\
+            @fragment fn fs(@builtin(position) p: vec4f) -> @builtin(frag_depth) f32 {\n\
+              return textureLoad(src, vec2i(p.xy), 0);\n\
+            }\n";
+        let module = device.create_shader_module(&GpuShaderModuleDescriptor::new(code));
+        let e = GpuBindGroupLayoutEntry::new(0, gpu_shader_stage::FRAGMENT);
+        let t = GpuTextureBindingLayout::new();
+        t.set_sample_type(GpuTextureSampleType::Depth);
+        e.set_texture(&t);
+        let bgl = device.create_bind_group_layout(&GpuBindGroupLayoutDescriptor::new(&[e])).map_err(js_err)?;
+        let layout = device.create_pipeline_layout(&GpuPipelineLayoutDescriptor::new(&[JsNullable::wrap(bgl.clone())]));
+        let vs = GpuVertexState::new(&module);
+        vs.set_entry_point("vs");
+        let fs = GpuFragmentState::new(&module, &[]);
+        fs.set_entry_point("fs");
+        let ds = GpuDepthStencilState::new(SHADOW_FORMAT);
+        ds.set_depth_write_enabled(true);
+        ds.set_depth_compare(GpuCompareFunction::Always);
+        let d = GpuRenderPipelineDescriptor::new(&layout, &vs);
+        d.set_label("shadow-restore");
+        d.set_fragment(&fs);
+        d.set_depth_stencil(&ds);
+        Ok((device.create_render_pipeline(&d).map_err(js_err)?, bgl))
     }
 
     /// Allocates the second shadow-map set (cross-fading a stepped sun). False if that failed.
@@ -1637,7 +1709,7 @@ impl Renderer {
             return true;
         }
         match Self::make_shadow_maps(&self.device, self.shadow_size, 2) {
-            Ok((view, layers)) => {
+            Ok((_, view, layers)) => {
                 self.shadow_view = view;
                 self.shadow_layers = layers;
                 self.shadow_sets = 2;
@@ -2232,7 +2304,8 @@ impl Renderer {
         )
     }
 
-    /// Canvas size in device pixels (the scene may render smaller, see `render_scale`).
+    /// Full-resolution canvas size in device pixels (CSS size x devicePixelRatio). The scene and
+    /// the canvas backing store use `scene_size_for` of it (`render_scale`).
     pub fn size(&self) -> (u32, u32) {
         self.canvas_size
     }
@@ -2250,10 +2323,17 @@ impl Renderer {
 
     /// Recreates the scene targets when the canvas size or `render_scale` changed.
     fn apply_render_scale(&mut self) {
-        let s = self.settings.render_scale.clamp(0.25, 1.0);
-        let (cw, ch) = self.canvas_size;
-        let (w, h) = (((cw as f32 * s).round() as u32).max(1), ((ch as f32 * s).round() as u32).max(1));
+        let (w, h) = self.scene_size_for(self.canvas_size.0, self.canvas_size.1);
         self.resize_targets(w, h);
+    }
+
+    /// Scene size for a full-resolution canvas of `cw` x `ch` device pixels at the current
+    /// `render_scale`. The canvas backing store is sized to this too (app.rs `resize`): post
+    /// processing and the composite run at scene resolution and the browser compositor scales the
+    /// canvas to the screen, instead of a full-resolution composite pass upscaling it (4K: ~2 ms).
+    pub fn scene_size_for(&self, cw: u32, ch: u32) -> (u32, u32) {
+        let s = self.settings.render_scale.clamp(0.25, 1.0);
+        (((cw as f32 * s).round() as u32).max(1), ((ch as f32 * s).round() as u32).max(1))
     }
 
     /// Adaptive resolution, called once per frame. Every change of `render_scale` reallocates the
@@ -2571,6 +2651,14 @@ impl Renderer {
             splits[k] = z1;
         }
         let cache_on = self.settings.shadow_cache && main;
+        // static shadow cache (GPU-driven path): cascade 0 gets the margin too, so its matrix (and
+        // with it the static copy) survives small camera moves; dynamic casters are redrawn on top
+        let split_on = cache_on
+            && self.settings.shadows
+            && self.settings.shadow_static_cache
+            && self.settings.gpu_culling
+            && self.cull.is_some()
+            && self.scene_gpu.is_some();
         let shadow_margin = self.settings.shadow_margin.clamp(0.0, 1.0);
         let shadow_size = self.shadow_size as f32;
         // (matrices, texel sizes, (light view, half size, depth range) per cascade for caster culling)
@@ -2594,7 +2682,7 @@ impl Renderer {
                     center += *c / 8.0;
                 }
                 let need = corners.iter().map(|c| c.distance(center)).fold(0.0f32, f32::max);
-                let margin = if k > 0 && cache_on { 1.0 + shadow_margin } else { 1.0 };
+                let margin = if (k > 0 || split_on) && cache_on { 1.0 + shadow_margin } else { 1.0 };
                 let r = (need * margin * 16.0).ceil() / 16.0;
                 let texel = 2.0 * r / shadow_size;
                 let mut c_ls = rot.transform_point3(center);
@@ -2863,13 +2951,20 @@ impl Renderer {
             // a layer is stale when a caster that changed (moved, spawned, despawned, deformed,
             // other material) touches the light box it was rendered with
             let reset = std::mem::take(&mut self.scene.shadow_reset);
-            for c in self.shadow_cache.iter_mut().filter(|c| c.valid && !c.dirty) {
-                c.dirty = reset
-                    || self.scene.shadow_changes.iter().any(|b| {
-                        let p = c.lv.transform_point3(Vec3::new(b[0], b[1], b[2]));
-                        let (r, rad) = (c.half, b[3]);
-                        p.x.abs() <= r + rad && p.y.abs() <= r + rad && -p.z >= -rad && -p.z <= c.depth + rad
-                    });
+            let touches = |c: &ShadowLayer, list: &[[f32; 4]]| {
+                list.iter().any(|b| {
+                    let p = c.lv.transform_point3(Vec3::new(b[0], b[1], b[2]));
+                    let (r, rad) = (c.half, b[3]);
+                    p.x.abs() <= r + rad && p.y.abs() <= r + rad && -p.z >= -rad && -p.z <= c.depth + rad
+                })
+            };
+            for c in self.shadow_cache.iter_mut().filter(|c| c.valid) {
+                if !c.dirty {
+                    c.dirty = reset || touches(c, &self.scene.shadow_changes);
+                }
+                if c.static_ok && !c.static_dirty {
+                    c.static_dirty = reset || touches(c, &self.scene.shadow_static_changes);
+                }
             }
         }
         // A caster whose shadow lands inside cascade k's own depth slice (where the screen samples
@@ -2892,6 +2987,9 @@ impl Renderer {
             }
         }
         let mut render_pass = vec![true; shadow_passes.len()];
+        // static shadow cache: split passes draw the static copy + dynamic casters; need_static =
+        // the static copy is re-rendered first (matrix changed or a static caster changed)
+        let mut need_static = vec![true; shadow_passes.len()];
         for (p, &(slot, layer)) in shadow_passes.iter().enumerate() {
             let k = slot % MAX_CASCADES;
             let mut content: u64 = 0xcbf2_9ce4_8422_2325;
@@ -2925,7 +3023,7 @@ impl Renderer {
             let c = &mut self.shadow_cache[layer as usize];
             let reuse = cache_on && c.valid && c.dir == dir && {
                 let same = c.mat == mat;
-                let covers = k > 0 && (center - c.center).length() + need <= c.radius;
+                let covers = (k > 0 || split_on) && (center - c.center).length() + need <= c.radius;
                 let age = self.shadow_frame.saturating_sub(c.frame);
                 let urgent = if gpu { urgent_gpu[k] } else { c.near != near };
                 if if gpu { !c.dirty } else { c.content == content } {
@@ -2939,10 +3037,21 @@ impl Renderer {
                 pass_mats[p] = c.mat;
                 let tx = c.texel;
                 if p < n_casc { texels[k] = tx; } else { prev_texels[k] = tx; }
+            } else if split_on && c.valid && c.static_ok && !c.static_dirty && c.dir == dir && (c.mat == mat || (center - c.center).length() + need <= c.radius) {
+                // only dynamic casters changed and the old matrix still covers the slice: redraw
+                // them over the static copy with that matrix (the static copy stays valid)
+                need_static[p] = false;
+                pass_mats[p] = c.mat;
+                cascade_boxes[p] = (c.lv, c.half, c.depth);
+                if p < n_casc { texels[k] = c.texel; } else { prev_texels[k] = c.texel; }
+                c.dirty = false;
+                c.frame = self.shadow_frame;
             } else {
                 let tx = if p < n_casc { texels[k] } else { prev_texels[k] };
                 let (lv, half, depth) = cascade_boxes[p];
-                *c = ShadowLayer { valid: true, mat, texel: tx, dir, center, radius, content, frame: self.shadow_frame, lv, half, depth, dirty: false, near };
+                let keep_static = split_on && c.valid && c.static_ok && !c.static_dirty && c.mat == mat && c.dir == dir;
+                need_static[p] = !keep_static;
+                *c = ShadowLayer { valid: true, mat, texel: tx, dir, center, radius, content, frame: self.shadow_frame, lv, half, depth, dirty: false, near, static_ok: split_on, static_dirty: false, dyn_rect: None };
             }
         }
         let _ = &prev_texels;
@@ -3049,7 +3158,7 @@ impl Renderer {
             // objects that changed, indirect args when group membership changed, blended ids
             let sg = self.scene_gpu.as_mut().unwrap();
             let (ng, nsg) = self.scene.group_count();
-            let n_args = ng + gpu_scene::PASSES as u32 * nsg;
+            let n_args = ng + gpu_scene::SHADOW_LISTS as u32 * nsg;
             if sg.ensure(&self.device, self.scene.slots().max(1), n_args.max(1), ng.max(1))? {
                 self.scene.upload_all = true;
                 self.scene.args_dirty = true;
@@ -3214,6 +3323,7 @@ impl Renderer {
             stats.hiz_active = use_hiz;
             let (ng, nsg) = self.scene.group_count();
             let mut pass_mask = 0u32;
+            let (mut pass_split, mut static_mask) = (0u32, 0u32);
             let mut pass_lv = [[[0.0f32; 4]; 4]; gpu_scene::PASSES];
             let mut pass_box = [[0.0f32; 4]; gpu_scene::PASSES];
             if self.settings.shadows {
@@ -3221,6 +3331,12 @@ impl Renderer {
                     if on {
                         let (lv, r, depth) = cascade_boxes[p];
                         pass_mask |= 1 << p;
+                        if split_on {
+                            pass_split |= 1 << p;
+                            if need_static[p] {
+                                static_mask |= 1 << p;
+                            }
+                        }
                         pass_lv[p] = lv.to_cols_array_2d();
                         pass_box[p] = [r, depth, 0.0, 0.0];
                     }
@@ -3239,8 +3355,9 @@ impl Renderer {
                     n_groups: ng,
                     n_sgroups: nsg,
                     pass_mask,
-                    n_args: ng + gpu_scene::PASSES as u32 * nsg,
-                    _pad: [0; 2],
+                    n_args: ng + gpu_scene::SHADOW_LISTS as u32 * nsg,
+                    pass_split,
+                    static_mask,
                     pass_lv,
                     pass_box,
                 };
@@ -3287,14 +3404,71 @@ impl Renderer {
             stats.shadow_passes_rendered = todo.len() as u32;
             stats.shadow_passes_cached = (shadow_passes.len() - todo.len()) as u32;
             stats.shadow_cascades_rendered = render_pass.iter().take(n_casc).copied().collect();
-            let n_pass = todo.len();
+            // render passes: (pass, target view, clear, id list) and a copy of the static layer
+            // before each dynamic overlay (static shadow cache)
+            // (pass, target view, clear, id list, restore: (static layer, texel rect)): split passes draw
+            // the static copy (when stale) and then the dynamic casters over the restored layer
+            let size = self.shadow_size;
+            let dyn_spheres: Vec<[f32; 4]> = if split_on && !todo.is_empty() { self.scene.dynamic_spheres().collect() } else { vec![] };
+            let mut jobs: Vec<(usize, GpuTextureView, bool, usize, Option<(usize, [u32; 4])>)> = vec![];
+            for &p in &todo {
+                let layer = shadow_passes[p].1 as usize;
+                if split_on {
+                    if need_static[p] {
+                        jobs.push((p, self.static_shadow_view(layer)?, true, p, None));
+                        stats.shadow_static_rendered += 1;
+                    }
+                    // texel rect of the dynamic casters now, united with last time's (old shadows)
+                    let m = pass_mats[p];
+                    let half = cascade_boxes[p].1.max(1e-4);
+                    let mut rect: Option<[f32; 4]> = None;
+                    for b in &dyn_spheres {
+                        let c = m.project_point3(Vec3::new(b[0], b[1], b[2]));
+                        let r = b[3] / half;
+                        let (x0, x1) = ((c.x - r) * 0.5 + 0.5, (c.x + r) * 0.5 + 0.5);
+                        let (y0, y1) = (0.5 - (c.y + r) * 0.5, 0.5 - (c.y - r) * 0.5);
+                        if x1 < 0.0 || x0 > 1.0 || y1 < 0.0 || y0 > 1.0 {
+                            continue;
+                        }
+                        rect = Some(match rect {
+                            None => [x0, y0, x1, y1],
+                            Some(q) => [q[0].min(x0), q[1].min(y0), q[2].max(x1), q[3].max(y1)],
+                        });
+                    }
+                    let px = |q: [f32; 4]| -> [u32; 4] {
+                        let f = |v: f32| (v.clamp(0.0, 1.0) * size as f32) as i64;
+                        let (x0, y0) = ((f(q[0]) - 2).max(0) as u32, (f(q[1]) - 2).max(0) as u32);
+                        let (x1, y1) = ((f(q[2]) + 3).min(size as i64) as u32, (f(q[3]) + 3).min(size as i64) as u32);
+                        [x0, y0, x1.saturating_sub(x0).max(1), y1.saturating_sub(y0).max(1)]
+                    };
+                    let now = rect.map(px);
+                    let c = &mut self.shadow_cache[layer];
+                    let union = |a: Option<[u32; 4]>, b: Option<[u32; 4]>| match (a, b) {
+                        (Some(a), Some(b)) => {
+                            let (x0, y0) = (a[0].min(b[0]), a[1].min(b[1]));
+                            let (x1, y1) = ((a[0] + a[2]).max(b[0] + b[2]), (a[1] + a[3]).max(b[1] + b[3]));
+                            Some([x0, y0, x1 - x0, y1 - y0])
+                        }
+                        (a, None) => a,
+                        (None, b) => b,
+                    };
+                    let restore = if need_static[p] { Some([0, 0, size, size]) } else { union(c.dyn_rect, now) };
+                    c.dyn_rect = now;
+                    jobs.push((p, self.shadow_layers[layer].clone(), false, p + gpu_scene::PASSES, restore.map(|r| (layer, r))));
+                    stats.shadow_restored_texels += restore.map_or(0, |r| r[2] * r[3]);
+                } else {
+                    jobs.push((p, self.shadow_layers[layer].clone(), true, p, None));
+                }
+            }
+            let n_pass = jobs.len();
             let ts = if n_pass > 0 { self.timing.as_mut().filter(|_| main).and_then(|t| t.split_writes(crate::gpu_timing::SHADOW)) } else { None };
-            for (k, &p) in todo.iter().enumerate() {
+            for (k, (p, view, clear, id_list, restore)) in jobs.iter().enumerate() {
+                let (p, clear, id_list) = (*p, *clear, *id_list);
                 let list = &cascade_casters[p];
-                let (slot, layer) = shadow_passes[p];
-                let att = GpuRenderPassDepthStencilAttachment::new_with_gpu_texture_view(&self.shadow_layers[layer as usize]);
+                let (slot, _) = shadow_passes[p];
+                let att = GpuRenderPassDepthStencilAttachment::new_with_gpu_texture_view(view);
                 att.set_depth_clear_value(1.0);
-                att.set_depth_load_op(GpuLoadOp::Clear);
+                att.set_depth_load_op(if clear { GpuLoadOp::Clear } else { GpuLoadOp::Load });
                 att.set_depth_store_op(GpuStoreOp::Store);
                 let desc = GpuRenderPassDescriptor::new(&[]);
                 desc.set_depth_stencil_attachment(&att);
@@ -3312,6 +3486,15 @@ impl Renderer {
                     }
                 }
                 let pass = encoder.begin_render_pass(&desc).map_err(js_err)?;
+                if let Some((layer, r)) = restore {
+                    if let Some((_, bg)) = self.static_shadow.get(*layer).and_then(|s| s.as_ref()) {
+                        pass.set_pipeline(&self.shadow_restore.0);
+                        pass.set_bind_group(0, Some(bg));
+                        pass.set_scissor_rect(r[0], r[1], r[2], r[3]);
+                        pass.draw(3);
+                        pass.set_scissor_rect(0, 0, self.shadow_size, self.shadow_size);
+                    }
+                }
                 if gpu && self.settings.shadows {
                     // one indirect draw per shadow group, filled by cull.wgsl for this pass
                     pass.set_bind_group(0, Some(&self.bind0_shadow[slot]));
@@ -3336,7 +3519,7 @@ impl Renderer {
                         bound = Some((mask, tex));
                         pass.set_vertex_buffer(0, Some(&mesh.vb));
                         pass.set_index_buffer(&mesh.ib, GpuIndexFormat::Uint32);
-                        pass.draw_indexed_indirect_with_u32(args, (ng + p as u32 * nsg + g) * 20);
+                        pass.draw_indexed_indirect_with_u32(args, (ng + id_list as u32 * nsg + g) * 20);
                         stats.shadow_draw_calls += 1;
                     }
                 } else if self.settings.shadows && !list.is_empty() {
@@ -3586,7 +3769,9 @@ impl Renderer {
                 let _ = wasm_bindgen_futures::JsFuture::from(done).await;
                 let (fl, lat) = cell.get();
                 let ms = (crate::log::now_ms() - t0) as f32;
-                cell.set((fl.saturating_sub(1), if lat == 0.0 { ms } else { lat * 0.9 + ms * 0.1 }));
+                // rises slowly (a real backlog builds up), drops at once when the GPU caught up
+                // (a startup spike from shader compiles must not keep skipping frames)
+                cell.set((fl.saturating_sub(1), if lat == 0.0 || ms < lat { ms } else { lat * 0.9 + ms * 0.1 }));
             });
         }
         if let Some(t) = self.timing.as_ref().filter(|_| main) {

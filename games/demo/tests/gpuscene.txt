@@ -20,7 +20,8 @@ expect stats.render.instance_upload_bytes < 20000
 # shadow cascades are filled by the GPU when they are re-rendered
 call render {"shadow_cache":false}
 frames 5
-expect gpu_scene.gpu.shadow_instances >= 50
+# GPU counters are read back asynchronously (as many frames late as the GPU queue is long)
+wait_for gpu_scene.gpu.shadow_instances >= 50 3000
 expect stats.render.shadow_draw_calls >= 5
 call render {"shadow_cache":true}
 

@@ -24,8 +24,8 @@ struct Params {
     n_sgroups: u32,    // shadow groups; pass q uses args n_groups + q * n_sgroups + sg
     pass_mask: u32,    // shadow passes rendered this frame
     n_args: u32,
-    _p0: u32,
-    _p1: u32,
+    pass_split: u32,   // bit q: static casters -> list q, dynamic ones -> list q + 8
+    static_mask: u32,  // bit q: a split pass needs its static list this frame
     pass_lv: array<mat4x4f, 8>, // light view per shadow pass
     pass_box: array<vec4f, 8>,  // x = half size, y = depth range
 }
@@ -40,7 +40,7 @@ struct Object {
     sgroups_a: vec4u,  // shadow group per LOD level (NONE = no shadow)
     sgroups_b: vec4u,
     info: vec4u,       // x = meshes | distances << 8 | cull_beyond << 16 | has_lod << 17 | layer << 24
-                       // y = 1 main view, 2 casts (0 = free slot)
+                       // y = 1 main view, 2 casts, 4 dynamic caster (0 = free slot)
 }
 
 struct DrawArgs {
@@ -177,7 +177,15 @@ fn cull(@builtin(global_invocation_id) id: vec3u) {
                 let b = p.pass_box[q];
                 let lp = p.pass_lv[q] * vec4f(c, 1.0);
                 if (abs(lp.x) <= b.x + r && abs(lp.y) <= b.x + r && -lp.z >= -r && -lp.z <= b.y + r) {
-                    append(p.n_groups + q * p.n_sgroups + sg, i);
+                    var list = q;
+                    if (((p.pass_split >> q) & 1u) != 0u) {
+                        if ((flags & 4u) != 0u) {
+                            list = q + 8u;
+                        } else if (((p.static_mask >> q) & 1u) == 0u) {
+                            continue;
+                        }
+                    }
+                    append(p.n_groups + list * p.n_sgroups + sg, i);
                     atomicAdd(&counters[3], 1u);
                 }
             }

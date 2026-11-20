@@ -648,9 +648,11 @@ fn resize(c: &mut Ctx) {
         .unwrap_or(1.0);
     let w = ((c.canvas.client_width() as f64) * dpr).round().max(1.0) as u32;
     let h = ((c.canvas.client_height() as f64) * dpr).round().max(1.0) as u32;
-    if c.canvas.width() != w || c.canvas.height() != h || c.renderer.size() != (w, h) {
-        c.canvas.set_width(w);
-        c.canvas.set_height(h);
+    // the backing store has the scene size (render_scale applied): no full-resolution post pass
+    let (bw, bh) = c.renderer.scene_size_for(w, h);
+    if c.canvas.width() != bw || c.canvas.height() != bh || c.renderer.size() != (w, h) {
+        c.canvas.set_width(bw);
+        c.canvas.set_height(bh);
         c.renderer.resize(w, h);
     }
 }

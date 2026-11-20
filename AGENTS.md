@@ -107,7 +107,7 @@ normal `cargo` output above it.
   fixed-step poses (`crate::interp`, `call interpolation {on}`, opt out per entity with `NoInterpolation`). Check
   smoothness with `call trace '{"id":N,"frames":300}'` then `call trace` -> `speed_jitter_pct` (a few % = smooth),
   frames with 0 / 2+ steps. A high fps number can hide hitches: look at `perf` `frame_ms.max` / `missed_frames_pct`.
-- **Resolution:** `render {render_scale}` (0.25..1), `auto_resolution` (default on) adapts it to
+- **Resolution:** `render {render_scale}` (0.25..1; the canvas backing store has the scene size too, the browser scales it), `auto_resolution` (default on) adapts it to
   `frame_budget_ms` of whole-frame GPU time (`gpu_ms.frame`); every change reallocates the targets (a 20-35 ms
   hitch at 4K), so it jumps once to a scale that fits and changes at most every 4 s; `stats.render` has `width/height` (scene) and `canvas`.
 - **Render settings:** `call render` lists every setting; set any by name (sky, fog_*, bloom*, exposure,
@@ -191,6 +191,12 @@ normal `cargo` output above it.
   (per cascade). `call gpu_scene` lists what changed this frame (`changed`: entity + moved / rebuilt / mesh deformed
   / removed). `render {shadow_cache:false}` = old behaviour (A/B, debugging); render textures invalidate it.
   Test: `games/demo/tests/shadowcache.txt`.
+  **Static shadow cache** (`render {shadow_static_cache}`, default on, GPU path): casters that moved or deformed in the
+  last 2 s are *dynamic* (cull.wgsl writes them into a second id list per pass). Each cascade keeps a copy with only
+  the static casters; when only dynamic casters changed, the cascade keeps its matrix (cascade 0 gets the
+  `shadow_margin` too), restores the texel rect where dynamic casters were and are (scissored frag_depth draw from the
+  copy, not a full copy: WebGPU copies depth only whole) and draws just the dynamic casters. `stats.render`:
+  `shadow_static_rendered`, `shadow_restored_texels`. Brickhollow walking at 2400x1350: shadow 3.5-5 ms -> 0.8-1.5 ms.
 - **Blend pass skip:** with no transparent draws, particles or water the opaque pass resolves straight into the HDR
   target (saves a load + store of the 4x MSAA target).
 - **Instance upload:** every drawn or shadow-casting entity owns a stable slot in the instance buffer (`InstancePool`
