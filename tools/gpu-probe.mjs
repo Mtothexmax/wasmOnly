@@ -33,7 +33,7 @@ function stub(s, name, body) {
 const T = {
   no_override: (s) => s.replace('override ALPHA_TEST: bool = true;', 'const ALPHA_TEST: bool = false;'),
   no_shadow: (s) => stub(s, 'shadow_factor', 'return 1.0;'),
-  no_cascade: (s) => stub(s, 'cascade_shadow', 'return 1.0;'),
+  no_cascade: (s) => stub(s, 'cascade_coord', 'return vec4f(0.0);'),
   no_lights: (s) => stub(s, 'cluster_lights', 'return vec3f(0.0);'),
   no_fog: (s) => stub(s, 'finish', 'return sanitize(c);'),
   no_terrain: (s) => stub(s, 'terrain_albedo', 'return vec3f(1.0);'),

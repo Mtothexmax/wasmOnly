@@ -55,7 +55,8 @@ struct DrawArgs {
 @group(0) @binding(1) var<storage, read> objects: array<Object>;
 @group(0) @binding(2) var<storage, read_write> args: array<DrawArgs>;
 @group(0) @binding(3) var<storage, read_write> ids: array<u32>;
-// 0 frustum-culled, 1 occluded, 2 visible (main), 3 shadow instances, 4..7 LOD level 0..3+, 8 LOD-culled
+// 0 frustum-culled, 1 occluded, 2 visible (main), 3 shadow instances, 4..7 LOD level 0..3+, 8 LOD-culled,
+// 9 main-view triangles drawn, 10 shadow triangles drawn
 @group(0) @binding(4) var<storage, read_write> counters: array<atomic<u32>, 12>;
 @group(0) @binding(5) var hiz: texture_2d<f32>;
 // nearest distance of a visible instance per main group (f32 bits; draw order for the next frame)
@@ -165,6 +166,7 @@ fn cull(@builtin(global_invocation_id) id: vec3u) {
             if (keep) {
                 append(g, i);
                 atomicAdd(&counters[2], 1u);
+                atomicAdd(&counters[9], args[g].index_count / 3u);
                 atomicMin(&near[g], bitcast<u32>(max(length(c - p.cam.xyz) - r, 0.0)));
             }
         }
@@ -185,8 +187,10 @@ fn cull(@builtin(global_invocation_id) id: vec3u) {
                             continue;
                         }
                     }
-                    append(p.n_groups + list * p.n_sgroups + sg, i);
+                    let a = p.n_groups + list * p.n_sgroups + sg;
+                    append(a, i);
                     atomicAdd(&counters[3], 1u);
+                    atomicAdd(&counters[10], args[a].index_count / 3u);
                 }
             }
         }

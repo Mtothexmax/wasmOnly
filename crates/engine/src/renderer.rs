@@ -38,7 +38,9 @@ pub(crate) fn ms_src(src: &str, samples: u32) -> String {
     src.replace("texture_depth_multisampled_2d", "texture_depth_2d")
 }
 const DEPTH_FORMAT: GpuTextureFormat = GpuTextureFormat::Depth24plus;
-const SHADOW_FORMAT: GpuTextureFormat = GpuTextureFormat::Depth32float;
+/// 16-bit shadow depth: half the bandwidth of depth32float for rendering and sampling (the ortho
+/// cascade depth ranges are a few hundred metres: ~5 mm steps, below the receiver bias).
+const SHADOW_FORMAT: GpuTextureFormat = GpuTextureFormat::Depth16unorm;
 /// First automatic LOD switch at this multiple of the mesh's bounding radius (see `add_mesh_with_lods`).
 pub const AUTO_LOD_FACTOR: f32 = 40.0;
 /// Shadow cascades (layers of the shadow map array).
@@ -480,6 +482,10 @@ pub struct RenderSettings {
     /// heroes, NPCs, physics bodies) changed, the cascade is that copy plus the dynamic casters drawn
     /// on top, instead of every caster again (a walking hero in a forest: thousands of trees).
     pub shadow_static_cache: bool,
+    /// Depth prepass for opaque geometry (GPU path): every opaque draw first writes depth only,
+    /// then shades with depth-equal, so each visible pixel runs the full PBR shader once instead of
+    /// once per overlapping surface (foliage).
+    pub depth_prepass: bool,
     /// Frames between refreshes of cascades 1, 2, 3 when only their casters changed.
     pub shadow_refresh: [u32; 3],
     /// Extra radius of cascades 1.. with the cache on (fraction), so a cached map still covers the
@@ -626,6 +632,7 @@ impl Default for RenderSettings {
             shadow_fade_ms: 400.0,
             shadow_cache: true,
             shadow_static_cache: true,
+            depth_prepass: true,
             shadow_refresh: [2, 3, 4],
             shadow_margin: 0.08,
             light_cluster_far: 400.0,
@@ -738,6 +745,10 @@ pub struct FrameStats {
     pub gpu_frustum_culled: u32,
     pub gpu_occluded: u32,
     pub gpu_visible: u32,
+    /// Triangles the GPU path actually drew in the main view / all shadow passes (after culling and
+    /// LOD; async readback). `triangles` is the LOD-0 upper bound of the candidates.
+    pub gpu_triangles: u32,
+    pub gpu_shadow_triangles: u32,
     pub width: u32,
     pub height: u32,
     /// Canvas size; `width`/`height` are the (possibly scaled) scene resolution.
@@ -801,6 +812,9 @@ struct Globals {
     /// x = first layer of the current cascade set, y = of the previous set, z = weight of the
     /// previous set (cross-fade, 0 = none)
     shadow_sets: [f32; 4],
+    /// Cascade k = cascade 0 scaled + offset per axis (same light rotation): xyz used.
+    cascade_scale: [[f32; 4]; MAX_CASCADES],
+    cascade_offset: [[f32; 4]; MAX_CASCADES],
 }
 
 /// Sky resources shared by every view: the atmosphere LUT (rendered per view), its sampler, the
@@ -891,6 +905,9 @@ pub struct Renderer {
     /// [opaque, opaque 2-sided, alpha-test, alpha-test 2-sided, blended, blended 2-sided].
     /// Opaque pipelines are compiled without `discard` (early-Z).
     pipelines: [GpuRenderPipeline; 6],
+    /// Depth prepass: [prepass, prepass 2-sided, opaque after prepass (depth equal), 2-sided].
+    prepass_pipelines: [GpuRenderPipeline; 4],
+    prepass_broken: [Rc<Cell<bool>>; 4],
     /// Set when the driver failed to build that pipeline: its draws are skipped (see
     /// `debug::create_pipeline_guarded`), so one broken shader does not blank the whole frame.
     pipeline_broken: [Rc<Cell<bool>>; 6],
@@ -992,6 +1009,8 @@ pub struct Renderer {
     adapt_up_votes: u32,
     /// Windows in which the GPU timestamps claimed far more time than the frame interval allows.
     timing_strikes: u32,
+    /// Frames actually rendered in the current adapt window (the frame limiter skips some).
+    adapt_rendered: u32,
     /// Frame pacing: (frames in flight, smoothed submit -> done latency in ms).
     in_flight: Rc<Cell<(u32, f32)>>,
     frames_skipped: u64,
@@ -1257,7 +1276,8 @@ impl Renderer {
         ]));
         // Main pipelines: (kind, double_sided) variants of the same PBR shader.
         // kind 0 = opaque (no discard -> early-Z), 1 = alpha-test / UI, 2 = blend.
-        let make_pipeline = |kind: u8, two_sided: bool| -> Result<(GpuRenderPipeline, Rc<Cell<bool>>), String> {
+        // variant: 0 = normal, 1 = depth prepass (depth only), 2 = after a prepass (depth equal, no write)
+        let make_pipeline_v = |kind: u8, two_sided: bool, variant: u8| -> Result<(GpuRenderPipeline, Rc<Cell<bool>>), String> {
             let blend = kind == 2;
             let vs = GpuVertexState::new(&pbr_module);
             vs.set_entry_point("vs_main");
@@ -1274,8 +1294,11 @@ impl Renderer {
                 a.set_operation(GpuBlendOperation::Add);
                 target.set_blend(&GpuBlendState::new(&a, &c));
             }
+            if variant == 1 {
+                target.set_write_mask(0);
+            }
             let fs = GpuFragmentState::new(&pbr_module, &[JsNullable::wrap(target)]);
-            fs.set_entry_point(if blend { "fs_blend" } else { "fs_main" });
+            fs.set_entry_point(if blend { "fs_blend" } else if variant == 1 { "fs_depth" } else { "fs_main" });
             let consts = js_sys::Object::new();
             let _ = js_sys::Reflect::set(&consts, &"ALPHA_TEST".into(), &(if kind == 0 { 0.0 } else { 1.0 }).into());
             fs.set_constants(consts.unchecked_ref());
@@ -1284,8 +1307,9 @@ impl Renderer {
             prim.set_cull_mode(if two_sided { GpuCullMode::None } else { GpuCullMode::Back });
             prim.set_front_face(GpuFrontFace::Ccw);
             let ds = GpuDepthStencilState::new(DEPTH_FORMAT);
-            ds.set_depth_write_enabled(!blend); // blended surfaces test but do not write depth
-            ds.set_depth_compare(GpuCompareFunction::Less);
+            ds.set_depth_write_enabled(!blend && variant != 2); // blended surfaces test but do not write depth
+            // after the prepass the depth buffer already holds the nearest surface: only it is shaded
+            ds.set_depth_compare(if variant == 2 { GpuCompareFunction::Equal } else { GpuCompareFunction::Less });
             let ms = GpuMultisampleState::new();
             ms.set_count(samples);
             let desc = GpuRenderPipelineDescriptor::new(if blend { &layout_t } else { &layout }, &vs);
@@ -1297,6 +1321,11 @@ impl Renderer {
                 (_, false) => "pbr-blend",
                 (_, true) => "pbr-blend-2s",
             };
+            let label = match variant {
+                1 => if two_sided { "pbr-prepass-2s" } else { "pbr-prepass" },
+                2 => if two_sided { "pbr-opaque-eq-2s" } else { "pbr-opaque-eq" },
+                _ => label,
+            };
             desc.set_label(label);
             desc.set_fragment(&fs);
             desc.set_primitive(&prim);
@@ -1304,6 +1333,10 @@ impl Renderer {
             desc.set_multisample(&ms);
             crate::debug::create_pipeline_guarded(&device, &desc, label)
         };
+        let make_pipeline = |kind: u8, two_sided: bool| make_pipeline_v(kind, two_sided, 0);
+        let prepass_built = [make_pipeline_v(0, false, 1)?, make_pipeline_v(0, true, 1)?, make_pipeline_v(0, false, 2)?, make_pipeline_v(0, true, 2)?];
+        let prepass_broken: [Rc<Cell<bool>>; 4] = std::array::from_fn(|i| prepass_built[i].1.clone());
+        let prepass_pipelines: [GpuRenderPipeline; 4] = prepass_built.map(|b| b.0);
         let built = [
             make_pipeline(0, false)?,
             make_pipeline(0, true)?,
@@ -1464,6 +1497,8 @@ impl Renderer {
             queue,
             context,
             pipelines,
+            prepass_pipelines,
+            prepass_broken,
             pipeline_broken,
             shadow_pipeline,
             shadow_mask_pipeline,
@@ -1527,6 +1562,7 @@ impl Renderer {
             adapt_last_change: -1e9,
             adapt_up_votes: 0,
             timing_strikes: 0,
+            adapt_rendered: 0,
             in_flight: Rc::new(Cell::new((0, 0.0))),
             frames_skipped: 0,
             frame_interval_ms: 0.0,
@@ -2305,9 +2341,25 @@ impl Renderer {
             v["gpu"] = serde_json::json!({
                 "frustum_culled": k[0], "occluded": k[1], "visible": k[2], "shadow_instances": k[3],
                 "lod_levels": [k[4], k[5], k[6], k[7]], "lod_culled": k[8],
+                "triangles": k[9], "shadow_triangles": k[10],
             });
         }
         v["active"] = serde_json::json!(self.settings.gpu_culling && self.scene_gpu.is_some());
+        // where the triangles are: main draw groups by members x triangles (LOD level of the group)
+        let mut groups: Vec<(u64, serde_json::Value)> = self
+            .scene
+            .group_members()
+            .into_iter()
+            .filter(|g| g.3 > 0)
+            .map(|(pipe, _tex, mesh, members)| {
+                let m = self.meshes.get(mesh as usize);
+                let tris = m.map_or(0, |m| m.index_count / 3) as u64;
+                (tris * members as u64, serde_json::json!({"mesh": m.map(|m| m.name.as_str()).unwrap_or("?"), "mesh_id": mesh, "pipeline": pipe, "members": members, "tris_each": tris, "tris": tris * members as u64}))
+            })
+            .collect();
+        groups.sort_by(|a, b| b.0.cmp(&a.0));
+        v["groups_total_tris"] = serde_json::json!(groups.iter().map(|g| g.0).sum::<u64>());
+        v["top_groups"] = serde_json::json!(groups.into_iter().take(20).map(|g| g.1).collect::<Vec<_>>());
         v
     }
 
@@ -2375,6 +2427,7 @@ impl Renderer {
             self.frame_interval_ms = if self.frame_interval_ms == 0.0 { ms } else { self.frame_interval_ms * 0.95 + ms * 0.05 };
         }
         if !self.settings.auto_resolution {
+            self.adapt_rendered = 0;
             self.adapt = (0.0, 0.0, 0);
             return;
         }
@@ -2387,16 +2440,18 @@ impl Renderer {
         }
         let n = self.adapt.2 as f32;
         let (avg_gpu, avg_frame) = (self.adapt.0 / n, self.adapt.1 / n);
+        // interval between frames that were rendered (skipped frames are short rAF intervals)
+        let render_interval = self.adapt.1 / std::mem::take(&mut self.adapt_rendered).max(1) as f32;
         self.adapt = (0.0, 0.0, 0);
         // The GPU cannot spend much more time per frame than one frame interval (frames would pile
         // up). Some drivers (PowerVR B-Series) return timestamps that grow without bound: after two
         // such windows they are switched off and the frame interval is used instead.
-        if gpu.is_some() && avg_gpu > avg_frame * 2.0 + 5.0 {
+        if gpu.is_some() && avg_gpu > render_interval * 2.0 + 5.0 {
             self.timing_strikes += 1;
             if self.timing_strikes >= 2 {
                 self.timing = None;
                 self.stats.gpu_ms = None;
-                crate::log_warn!("GPU timestamps unreliable on this device (gpu frame {avg_gpu:.0} ms vs interval {avg_frame:.0} ms): timing off, adaptive resolution uses the frame interval");
+                crate::log_warn!("GPU timestamps unreliable on this device (gpu frame {avg_gpu:.0} ms vs rendered-frame interval {render_interval:.0} ms): timing off, adaptive resolution uses the frame interval");
             }
             return;
         }
@@ -2568,6 +2623,7 @@ impl Renderer {
             self.in_flight.set((0, lat));
         }
         self.skip_since = None;
+        self.adapt_rendered += 1;
         self.apply_render_scale();
         for i in 0..self.rtts.len() {
             if !self.rtts[i].due() {
@@ -2810,6 +2866,8 @@ impl Renderer {
             scene_max: [0.0; 4],
             cascades_prev,
             shadow_sets: [(cur_set * MAX_CASCADES as u32) as f32, ((cur_set ^ 1) * MAX_CASCADES as u32) as f32, prev_weight, 0.0],
+            cascade_scale: [[1.0, 1.0, 1.0, 0.0]; MAX_CASCADES],
+            cascade_offset: [[0.0; 4]; MAX_CASCADES],
         };
 
         // --- Instances -------------------------------------------------------------------------
@@ -3091,6 +3149,23 @@ impl Renderer {
         }
         globals.cascades = cascades;
         globals.cascades_prev = cascades_prev;
+        // cascade k as a per-axis scale + offset of cascade 0 (both are ortho with one rotation)
+        {
+            let m0 = cascade_mats[0];
+            let row = |m: &Mat4, i: usize| Vec3::new(m.x_axis[i], m.y_axis[i], m.z_axis[i]);
+            for k in 0..n_casc {
+                let mk = cascade_mats[k];
+                let mut sc = [1.0f32; 4];
+                let mut off = [0.0f32; 4];
+                for i in 0..3 {
+                    let (r0, rk) = (row(&m0, i), row(&mk, i));
+                    sc[i] = rk.dot(r0) / r0.length_squared().max(1e-20);
+                    off[i] = mk.w_axis[i] - sc[i] * m0.w_axis[i];
+                }
+                globals.cascade_scale[k] = sc;
+                globals.cascade_offset[k] = off;
+            }
+        }
         globals.cascade_texel = texels;
         self.queue.write_buffer_with_u32_and_u8_slice(&self.cascade_buf, 0, &cascade_data).map_err(js_err)?;
 
@@ -3394,6 +3469,8 @@ impl Renderer {
                 stats.gpu_frustum_culled = k[0];
                 stats.gpu_occluded = k[1];
                 stats.gpu_visible = k[2];
+                stats.gpu_triangles = k[9];
+                stats.gpu_shadow_triangles = k[10];
                 // Hi-Z auto off (the counters lag a few frames: skip the first 10 after enabling)
                 let min_ratio = self.settings.occlusion_min_ratio;
                 if use_hiz && min_ratio > 0.0 {
@@ -3425,6 +3502,7 @@ impl Renderer {
         {
             let todo: Vec<usize> = (0..shadow_passes.len()).filter(|&p| render_pass[p]).collect();
             let shadow_groups = if gpu && !todo.is_empty() { self.scene.shadow_groups(cam_pos, lod_bias) } else { vec![] };
+            let dyn_groups = if split_on && !todo.is_empty() { self.scene.dynamic_shadow_groups() } else { vec![] };
             stats.shadow_passes_rendered = todo.len() as u32;
             stats.shadow_passes_cached = (shadow_passes.len() - todo.len()) as u32;
             stats.shadow_cascades_rendered = render_pass.iter().take(n_casc).copied().collect();
@@ -3526,7 +3604,12 @@ impl Renderer {
                     let (ng, nsg) = self.scene.group_count();
                     let mut bound: Option<(bool, u32)> = None;
                     let (lv, half, depth) = cascade_boxes[p];
+                    let overlay = id_list >= gpu_scene::PASSES;
                     for &(mask, tex, mesh_id, g) in &shadow_groups {
+                        // the dynamic overlay only needs groups that hold a dynamic caster
+                        if overlay && !dyn_groups.get(g as usize).copied().unwrap_or(false) {
+                            continue;
+                        }
                         if !self.scene.shadow_group_in_box(g, &lv, half, depth) {
                             continue;
                         }
@@ -3626,7 +3709,31 @@ impl Renderer {
             if gpu {
                 let args = self.scene_gpu.as_ref().unwrap().args_buf.clone();
                 let near = rb.as_ref().map(|r| r.1.as_slice()).unwrap_or(&[]);
-                for (pipe, tex, mesh_id, g) in self.scene.draw_order(near, self.settings.reverse_draw_order, &planes, cam_pos, lod_bias) {
+                let order = self.scene.draw_order(near, self.settings.reverse_draw_order, &planes, cam_pos, lod_bias);
+                let prepass = self.settings.depth_prepass && self.prepass_broken.iter().all(|b| !b.get());
+                if prepass {
+                    // depth only for every opaque group (alpha-tested ones are shaded normally below)
+                    let mut bound = usize::MAX;
+                    for &(pipe, tex, mesh_id, g) in &order {
+                        let mesh = &self.meshes[mesh_id as usize];
+                        if pipe > 1 || mesh.index_count == 0 {
+                            continue;
+                        }
+                        if pipe as usize != bound {
+                            pass.set_pipeline(&self.prepass_pipelines[pipe as usize]);
+                            bound = pipe as usize;
+                        }
+                        if tex != bound_tex {
+                            pass.set_bind_group(1, Some(&groups[tex as usize]));
+                            bound_tex = tex;
+                        }
+                        pass.set_vertex_buffer(0, Some(&mesh.vb));
+                        pass.set_index_buffer(&mesh.ib, GpuIndexFormat::Uint32);
+                        pass.draw_indexed_indirect_with_u32(&args, g * 20);
+                        stats.draw_calls += 1;
+                    }
+                }
+                for (pipe, tex, mesh_id, g) in order {
                     let mesh = &self.meshes[mesh_id as usize];
                     if mesh.index_count == 0 {
                         continue;
@@ -3636,7 +3743,11 @@ impl Renderer {
                         continue;
                     }
                     if pi != bound_pipe {
-                        pass.set_pipeline(&self.pipelines[pi]);
+                        if prepass && pi <= 1 {
+                            pass.set_pipeline(&self.prepass_pipelines[2 + pi]);
+                        } else {
+                            pass.set_pipeline(&self.pipelines[pi]);
+                        }
                         bound_pipe = pi;
                     }
                     if tex != bound_tex {

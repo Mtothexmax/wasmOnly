@@ -28,7 +28,9 @@ struct VsIn {
 }
 
 struct VsOut {
-    @builtin(position) clip: vec4f,
+    // invariant: the depth prepass and the shading pass (depth equal) must compute bit-identical
+    // positions although they are different pipelines
+    @invariant @builtin(position) clip: vec4f,
     @location(0) world: vec3f,
     @location(1) normal: vec3f,
     @location(2) uv: vec2f,
@@ -151,43 +153,53 @@ fn brdf(n: vec3f, v: vec3f, l: vec3f, albedo: vec3f, metallic: f32, rough: f32) 
     return (kd * albedo / PI + spec) * n_l;
 }
 
-fn cascade_shadow(world: vec3f, n: vec3f, k: u32, prev: bool) -> f32 {
+// Shadow-map coordinate of `world` in cascade k: (u, v, depth, 1) or w = 0 outside the map.
+// No texture access here: it may be called from several places (see shadow_factor).
+// p0 / n0: position and normal in cascade 0's light space (current set).
+fn cascade_coord(world: vec3f, n: vec3f, p0: vec3f, n0: vec3f, k: u32, prev: bool) -> vec4f {
     // normal offset scaled by the cascade's texel size (no acne on near cascades, no peter-panning far)
-    let biased = world + n * g.cascade_texel[k] * 1.5;
-    // multiply in the branch: copying a dynamically indexed mat4 into a variable cost ~2.5 ms of
-    // the opaque pass at 4K on an RDNA3 iGPU (spilled matrix)
-    var lp: vec4f;
-    if (prev) { lp = g.cascades_prev[k] * vec4f(biased, 1.0); } else { lp = g.cascades[k] * vec4f(biased, 1.0); }
-    let ndc = lp.xyz / lp.w;
+    let bias = g.cascade_texel[k] * 1.5;
+    var ndc: vec3f;
+    if (prev) {
+        // previous direction while cross-fading: its own matrices (rare, a few hundred ms)
+        let lp = g.cascades_prev[k] * vec4f(world + n * bias, 1.0);
+        ndc = lp.xyz / lp.w;
+    } else {
+        // cascade k = cascade 0 scaled + offset (ortho, same rotation): no dynamically indexed
+        // mat4 per pixel (that cost ~2 ms of the opaque pass at 2400x1350 on an RDNA3 iGPU)
+        ndc = (p0 + n0 * bias) * g.cascade_scale[k].xyz + g.cascade_offset[k].xyz;
+    }
     let uv = ndc.xy * vec2f(0.5, -0.5) + vec2f(0.5);
-    if (any(uv < vec2f(0.0)) || any(uv > vec2f(1.0)) || ndc.z > 1.0) { return 1.0; }
-    // 3x3 PCF of bilinear comparison taps = a 4x4 texel footprint with the separable weights
-    // (1-f, 1, 1, f). Two bilinear taps per axis reproduce exactly that (weights 2-f and 1+f, each
-    // placed between its two texels), so 4 taps give the same result as the 9 they replace.
-    let size = vec2f(textureDimensions(shadow_map));
+    if (any(uv < vec2f(0.0)) || any(uv > vec2f(1.0)) || ndc.z > 1.0) { return vec4f(0.0); }
+    return vec4f(uv, ndc.z - 0.0008, 1.0);
+}
+
+// 3x3 PCF of bilinear comparison taps = a 4x4 texel footprint with the separable weights
+// (1-f, 1, 1, f). Two bilinear taps per axis reproduce exactly that (weights 2-f and 1+f, each
+// placed between its two texels), so 4 taps give the same result as the 9 they replace.
+// Returns (ua, ub) tap positions; weights via pcf_weights.
+fn pcf_taps(uv: vec2f, size: vec2f) -> vec4f {
     let st = uv * size - 0.5;
     let base = floor(st);
     let f = st - base;
-    let wa = 2.0 - f;
-    let wb = 1.0 + f;
-    let ua = (base - 0.5 + 1.0 / wa) / size;
-    let ub = (base + 1.5 + f / wb) / size;
-    let z = ndc.z - 0.0008;
-    let layer = i32(k) + i32(select(g.shadow_sets.x, g.shadow_sets.y, prev));
-    var sum = wa.x * wa.y * textureSampleCompareLevel(shadow_map, shadow_sampler, ua, layer, z);
-    sum += wb.x * wa.y * textureSampleCompareLevel(shadow_map, shadow_sampler, vec2f(ub.x, ua.y), layer, z);
-    sum += wa.x * wb.y * textureSampleCompareLevel(shadow_map, shadow_sampler, vec2f(ua.x, ub.y), layer, z);
-    sum += wb.x * wb.y * textureSampleCompareLevel(shadow_map, shadow_sampler, ub, layer, z);
-    return sum / 9.0;
+    let ua = (base - 0.5 + 1.0 / (2.0 - f)) / size;
+    let ub = (base + 1.5 + f / (1.0 + f)) / size;
+    return vec4f(ua, ub);
 }
 
-// Cascaded shadow maps: cascade by view depth, faded out at the shadow distance. Over the last 15%
-// of a cascade the next one takes over, and while a stepped sun cross-fades the previous
-// direction's set comes in (weight shadow_sets.z): both transitions are dithered per pixel
-// (interleaved gradient noise), so every pixel samples ONE cascade through ONE call site.
-// Sampling two cascades and blending them (a loop around the call) cost 3.5 ms of the opaque pass
-// at 4K on an RDNA3 iGPU, and PowerVR's Vulkan driver fails to build the pipeline (VK_ERROR_UNKNOWN)
-// when a sampling helper is called from several places.
+fn pcf_weights(uv: vec2f, size: vec2f) -> vec4f {
+    let f = fract(uv * size - 0.5);
+    return vec4f(2.0 - f, 1.0 + f) / 3.0;
+}
+
+// Cascaded shadow maps: cascade by view depth, blended into the next cascade over the last 15%
+// and faded out at the shadow distance. The texture taps are written out here, inside ONE
+// function with ONE call site per entry point: PowerVR's Vulkan driver fails to build the
+// pipeline (VK_ERROR_UNKNOWN) when a helper that samples is called from several places (the
+// coordinate helpers above do not sample). No loop around the taps, no dynamically indexed mat4
+// copied into a variable: both cost 2.5-3.5 ms of the opaque pass at 4K on an RDNA3 iGPU.
+// While a stepped sun cross-fades, the previous direction's set comes in dithered per pixel
+// (weight shadow_sets.z, a few hundred milliseconds).
 fn shadow_factor(world: vec3f, n: vec3f, frag: vec2f) -> f32 {
     let vz = -(g.view * vec4f(world, 1.0)).z;
     let count = g.counts.w;
@@ -201,11 +213,41 @@ fn shadow_factor(world: vec3f, n: vec3f, frag: vec2f) -> f32 {
     let end = g.cascade_splits[k];
     let band = mix(start, end, 0.85);
     let t = clamp((vz - band) / max(end - band, 1e-3), 0.0, 1.0);
-    let r = fract(52.9829189 * fract(dot(floor(frag), vec2f(0.06711056, 0.00583715))));
-    let kk = k + select(0u, 1u, r < t);
-    if (kk >= count) { return 1.0; } // beyond the last cascade: lit
-    let prev = fract(r + 0.6180339) < g.shadow_sets.z;
-    return cascade_shadow(world, n, kk, prev);
+    let prev = fract(52.9829189 * fract(dot(floor(frag), vec2f(0.06711056, 0.00583715)))) < g.shadow_sets.z;
+    let layer_base = i32(select(g.shadow_sets.x, g.shadow_sets.y, prev));
+
+    let size = vec2f(textureDimensions(shadow_map));
+    let p0 = (g.cascades[0] * vec4f(world, 1.0)).xyz;
+    let n0 = (g.cascades[0] * vec4f(n, 0.0)).xyz;
+    var s = 1.0;
+    let ca = cascade_coord(world, n, p0, n0, k, prev);
+    if (ca.w > 0.0) {
+        let tp = pcf_taps(ca.xy, size);
+        let w = pcf_weights(ca.xy, size);
+        let l = i32(k) + layer_base;
+        s = w.x * w.y * textureSampleCompareLevel(shadow_map, shadow_sampler, tp.xy, l, ca.z)
+          + w.z * w.y * textureSampleCompareLevel(shadow_map, shadow_sampler, vec2f(tp.z, tp.y), l, ca.z)
+          + w.x * w.w * textureSampleCompareLevel(shadow_map, shadow_sampler, vec2f(tp.x, tp.w), l, ca.z)
+          + w.z * w.w * textureSampleCompareLevel(shadow_map, shadow_sampler, tp.zw, l, ca.z);
+    }
+    if (t > 0.0) {
+        // blend band: the next cascade (beyond the last one: lit)
+        var s2 = 1.0;
+        if (k + 1u < count) {
+            let cb = cascade_coord(world, n, p0, n0, k + 1u, prev);
+            if (cb.w > 0.0) {
+                let tp = pcf_taps(cb.xy, size);
+                let w = pcf_weights(cb.xy, size);
+                let l = i32(k + 1u) + layer_base;
+                s2 = w.x * w.y * textureSampleCompareLevel(shadow_map, shadow_sampler, tp.xy, l, cb.z)
+                   + w.z * w.y * textureSampleCompareLevel(shadow_map, shadow_sampler, vec2f(tp.z, tp.y), l, cb.z)
+                   + w.x * w.w * textureSampleCompareLevel(shadow_map, shadow_sampler, vec2f(tp.x, tp.w), l, cb.z)
+                   + w.z * w.w * textureSampleCompareLevel(shadow_map, shadow_sampler, tp.zw, l, cb.z);
+            }
+        }
+        s = mix(s, s2, t);
+    }
+    return s;
 }
 
 // Clustered point + spot lights: only the lights assigned to this pixel's froxel.
@@ -419,6 +461,12 @@ fn debug_extra(i: VsOut) -> vec4f {
 }
 
 // Opaque + alpha-tested geometry.
+// Depth prepass (render.depth_prepass): same vertex shader, no colour written.
+@fragment
+fn fs_depth() -> @location(0) vec4f {
+    return vec4f(0.0);
+}
+
 @fragment
 fn fs_main(i: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4f {
     let d = derivs(i);

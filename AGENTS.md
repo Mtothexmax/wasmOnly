@@ -159,6 +159,13 @@ normal `cargo` output above it.
   instances, LOD levels); test `games/demo/tests/gpuscene.txt`. `material_mut` with unchanged values costs nothing
   (content compared with a snapshot). Render textures and `render {gpu_culling:false}` use the CPU path (same
   records via the shared `classify`); `bridge flicker` uses it too.
+- **Depth prepass** (`render {depth_prepass}`, default on, GPU path): opaque groups first write depth only, then shade
+  with depth-equal (positions are `@invariant`), so each visible pixel runs the PBR shader once. Overdraw in foliage
+  made the opaque pass 2.5x more expensive (Brickhollow 2400x1350: 4.9 -> 1.9 ms). Alpha-tested groups are not in the prepass.
+- **Where the cost is:** `call gpu_scene` -> `top_groups` (mesh, members, triangles per draw group, LOD-0 candidates) and
+  `gpu.triangles` / `gpu.shadow_triangles` (what the GPU really drew after culling + LOD; `stats.render.gpu_triangles`).
+  To split the opaque cost into geometry and shading, compare against a trivial fragment shader: in Brickhollow it was
+  1.0 ms of 4.9, the rest was shading x overdraw.
 - **Culling/LOD:** `stats.render` has `gpu_culling`, `gpu_frustum_culled`, `gpu_occluded`, `gpu_visible`
   (async readback, 1-3 frames old) and `lod_levels`. On the GPU path `visible` = main-view candidates, `triangles` =
   LOD-0 upper bound. `render {gpu_culling:false}` switches to the CPU path.

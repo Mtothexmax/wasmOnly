@@ -44,6 +44,10 @@ struct Globals {
     scene_max: vec4f,
     cascades_prev: array<mat4x4f, 4>, // previous shadow direction while cross-fading (stepped sun)
     shadow_sets: vec4f,               // x = first layer of the current set, y = of the previous set, z = previous weight
+    // All cascades of a set share the light rotation, so cascade k's coordinate is cascade 0's
+    // scaled and offset per axis: one fixed matrix per pixel instead of a dynamically indexed one.
+    cascade_scale: array<vec4f, 4>,
+    cascade_offset: array<vec4f, 4>,
 }
 
 struct Instance {

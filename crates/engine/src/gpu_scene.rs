@@ -816,6 +816,27 @@ impl GpuScene {
         v
     }
 
+    /// Main draw groups: (pipeline, texture key, mesh, members).
+    pub fn group_members(&self) -> Vec<(u8, u32, u32, u32)> {
+        self.main.keys.iter().zip(&self.main.members).map(|(k, &m)| (k.0, k.1, k.2, m)).collect()
+    }
+
+    /// Per shadow group: has a dynamic caster (the dynamic overlay of a split pass draws only these).
+    pub fn dynamic_shadow_groups(&self) -> Vec<bool> {
+        let mut v = vec![false; self.shadow.keys.len()];
+        for &i in &self.dyn_slots {
+            let inf = &self.infos[i as usize];
+            if inf.active && inf.obj.info[1] & 6 == 6 {
+                for &g in &inf.obj.sgroups {
+                    if let Some(f) = v.get_mut(g as usize) {
+                        *f = true;
+                    }
+                }
+            }
+        }
+        v
+    }
+
     /// Can a member of shadow group `g` touch this cascade's light box? (same test as cull.wgsl)
     pub fn shadow_group_in_box(&self, g: u32, lv: &Mat4, half: f32, depth: f32) -> bool {
         let (c, r) = self.shadow.sphere(g as usize);
