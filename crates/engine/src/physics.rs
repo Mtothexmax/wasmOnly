@@ -225,9 +225,19 @@ impl Physics {
 
     /// First solid collider a sphere of `radius` hits moving from `origin` along `dir` (thick ray).
     pub fn sphere_cast(&self, origin: Vec3, dir: Vec3, radius: f32, max_dist: f32) -> Option<RayHit> {
+        self.sphere_cast_excluding(origin, dir, radius, max_dist, &[])
+    }
+
+    /// [`Physics::sphere_cast`] that ignores the colliders of `exclude` (the caster itself).
+    pub fn sphere_cast_excluding(&self, origin: Vec3, dir: Vec3, radius: f32, max_dist: f32, exclude: &[Entity]) -> Option<RayHit> {
         let dir = dir.normalize_or_zero();
         let opts = rapier3d::parry::query::ShapeCastOptions::with_max_time_of_impact(max_dist);
-        let (h, hit) = self.world.cast_shape(&Pose::from_parts(origin, Quat::IDENTITY), dir, &Ball::new(radius), opts, QueryFilter::default().exclude_sensors())?;
+        let pred = |_: ColliderHandle, c: &Collider| Entity::from_bits(c.user_data as u64).is_none_or(|e| !exclude.contains(&e));
+        let mut filter = QueryFilter::default().exclude_sensors();
+        if !exclude.is_empty() {
+            filter.predicate = Some(&pred);
+        }
+        let (h, hit) = self.world.cast_shape(&Pose::from_parts(origin, Quat::IDENTITY), dir, &Ball::new(radius), opts, filter)?;
         let toi = hit.time_of_impact;
         Some(RayHit { entity: self.entity_of_collider(h), distance: toi, point: origin + dir * toi, normal: hit.normal2 })
     }
@@ -349,11 +359,20 @@ impl Physics {
     }
 
     pub fn raycast(&self, origin: Vec3, dir: Vec3, max_dist: f32) -> Option<RayHit> {
+        self.raycast_excluding(origin, dir, max_dist, &[])
+    }
+
+    /// [`Physics::raycast`] that ignores the colliders of `exclude`: a ray from inside or next to
+    /// the hero's capsule does not hit the hero at distance 0.
+    pub fn raycast_excluding(&self, origin: Vec3, dir: Vec3, max_dist: f32, exclude: &[Entity]) -> Option<RayHit> {
         let dir = dir.normalize_or_zero();
         let ray = Ray::new(origin, dir);
-        let (h, hit) =
-            self.world
-                .cast_ray_and_get_normal(&ray, max_dist, true, QueryFilter::default())?;
+        let pred = |_: ColliderHandle, c: &Collider| Entity::from_bits(c.user_data as u64).is_none_or(|e| !exclude.contains(&e));
+        let mut filter = QueryFilter::default();
+        if !exclude.is_empty() {
+            filter.predicate = Some(&pred);
+        }
+        let (h, hit) = self.world.cast_ray_and_get_normal(&ray, max_dist, true, filter)?;
         Some(RayHit {
             entity: self.entity_of_collider(h),
             distance: hit.time_of_impact,

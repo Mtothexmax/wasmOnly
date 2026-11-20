@@ -228,6 +228,9 @@ struct Voice {
     ended: Rc<Cell<bool>>,
     /// Output bus of the voice graph; disconnected when the voice (and its effect tail) is done.
     out: GainNode,
+    /// Voice volume (before the effect sends): `set_voice_volume` ramps it.
+    level: GainNode,
+    volume: f32,
     tail: f64,
     ended_at: Option<f64>,
     fx: Fx,
@@ -670,6 +673,7 @@ impl Audio {
         head.connect_with_audio_node(&gain).ok()?;
         let out = ctx.create_gain().ok()?;
         gain.connect_with_audio_node(&out).ok()?;
+        let gain_level = gain.clone();
         if let Some((delay, feedback, mix)) = fx.echo {
             let d = ctx.create_delay_with_max_delay_time(5.0).ok()?;
             d.delay_time().set_value(delay.clamp(0.01, 5.0));
@@ -751,6 +755,8 @@ impl Audio {
             pos: p.at,
             ended,
             out,
+            level: gain_level,
+            volume: p.volume.max(0.0),
             tail: fx.tail(),
             ended_at: None,
             fx,
@@ -776,6 +782,42 @@ impl Audio {
     pub fn stop(&mut self, v: VoiceId) {
         if let Some(voice) = self.voices.iter().find(|x| x.id == v) {
             let _ = web_sys::AudioScheduledSourceNode::stop(&voice.src);
+        }
+    }
+
+    /// Changes a playing voice's volume, ramping linearly over `fade` seconds (0 = at once): a rain
+    /// loop that swells, an engine that fades. Returns false when the voice is gone.
+    pub fn set_voice_volume(&mut self, v: VoiceId, volume: f32, fade: f32) -> bool {
+        let Some(ctx) = self.ctx.as_ref() else { return false };
+        let now = ctx.current_time();
+        let Some(voice) = self.voices.iter_mut().find(|x| x.id == v && !x.ended.get()) else { return false };
+        let g = voice.level.gain();
+        let target = volume.max(0.0);
+        let _ = g.cancel_scheduled_values(now);
+        if fade > 0.0 {
+            let _ = g.set_value_at_time(g.value(), now);
+            let _ = g.linear_ramp_to_value_at_time(target, now + fade as f64);
+        } else {
+            g.set_value(target);
+        }
+        voice.volume = target;
+        true
+    }
+
+    /// Current (target) volume of a playing voice.
+    pub fn voice_volume(&self, v: VoiceId) -> Option<f32> {
+        self.voices.iter().find(|x| x.id == v && !x.ended.get()).map(|x| x.volume)
+    }
+
+    /// Fades a voice out over `fade` seconds, then stops it (0 = stop now).
+    pub fn fade_out(&mut self, v: VoiceId, fade: f32) {
+        if fade <= 0.0 || !self.set_voice_volume(v, 0.0, fade) {
+            self.stop(v);
+            return;
+        }
+        let at = self.ctx.as_ref().map(|c| c.current_time()).unwrap_or(0.0) + fade as f64;
+        if let Some(voice) = self.voices.iter().find(|x| x.id == v) {
+            let _ = web_sys::AudioScheduledSourceNode::stop_with_when(&voice.src, at);
         }
     }
 
@@ -859,7 +901,7 @@ impl Audio {
                 "id": v.id.0, "sound": self.sounds.get(v.sound.0 as usize).map(|s| s.name.clone()),
                 "pos": v.pos.map(|p| [p.x, p.y, p.z]),
                 "distance": v.pos.map(|p| p.distance(self.listener)),
-                "fx": v.fx, "ended": v.ended.get(), "bus": v.bus,
+                "fx": v.fx, "ended": v.ended.get(), "bus": v.bus, "volume": v.volume,
             })).collect::<Vec<_>>(),
             "presets": synth::SfxPreset::ALL.iter().map(|p| p.name()).collect::<Vec<_>>(),
             "plays_total": self.plays_total,

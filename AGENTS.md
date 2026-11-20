@@ -112,6 +112,8 @@ normal `cargo` output above it.
   RigidBodyBuilder::kinematic_position_based(), capsule)`, root entity) block characters and push a standing
   character out sideways when they walk into it (`characters[].pushed`; one fixed step behind the obstacle).
   `cc.colliders` / log warnings also name static colliders without an entity ("static collider Cuboid at (x,y,z)").
+  `raycast_excluding(origin, dir, max, &[hero])` / `sphere_cast_excluding` skip the caster's own collider (a ray from
+  inside the capsule otherwise hits it at distance 0); API `raycast {.., exclude: id|name|[..]}`.
   AI API: `collisions {since?, entity?: id|name}` (events + `started`/`stopped` counts), `{touching}`, `{inside}`,
   `overlap {pos, radius | half}`, `trigger {pos, half, name}`, `spawn {.., body: "kinematic"}`.
   Test: `games/demo/tests/collisions.txt`.
@@ -168,7 +170,9 @@ normal `cargo` output above it.
   `curl -X POST "http://localhost:8080/__throttle?kbps=48&match=assets/music"` (`kbps=0` = off).
 - **Audio:** `call audio` -> context state, sounds, live voices (with fx, bus), bus volumes, last 32 plays with sim `step`.
   Game code: `audio.is_ready(id)` / `sound_state(id)` (a sound from `ctx.load_sound` is `Loading` first; `play` before
-  that returns `None` and warns once per sound), `is_playing(voice)`, `playing_count(id)`. Mixer buses `Bus::{Sfx,
+  that returns `None` and warns once per sound), `is_playing(voice)`, `playing_count(id)`, `set_voice_volume(voice, v, fade_s)` (linear ramp on a playing voice, e.g. a looped rain that
+  swells), `voice_volume(voice)`, `fade_out(voice, fade_s)` (ramp to 0, then stop); API `audio_voice {voice, volume, fade}`,
+  `audio_stop {voice, fade}`. Mixer buses `Bus::{Sfx,
   Voice, Ambience, Ui}`: `Play::new().bus(Bus::Voice)`, `set_bus_volume(Bus::Voice, v)`; API `audio_set {voice_volume}`,
   `audio_play {bus}`.
 - **Procedural assets:** `call texgen {preset, apply_to}` and `call sfx {preset, overrides}` iterate on

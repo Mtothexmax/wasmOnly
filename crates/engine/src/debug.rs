@@ -73,7 +73,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("render", "Get/set any render setting by name (call without args to list them): shadows, debug_view 0|1|2, sun_dir, sun_intensity, sky, sky_zenith, sky_horizon, fog_density, fog_height_falloff, fog_start, fog_max, fog_color ([r,g,b] or null), exposure, bloom, bloom_intensity, bloom_threshold, depth_darkening, vignette, saturation, particles, gpu_culling, occlusion_culling, camera_jitter, depth_jitter, reverse_draw_order, freeze_time, ... Result includes gpu_culling_supported."),
     ("cameras", "Every Camera entity: id, name, main (renders the canvas), marked_main, render_texture, layers."),
     ("camera", "Main camera pose + projection (the one with MainCamera, else the first Camera); args {pos?, look_at?} moves it, {layers: mask} sets its layer mask, {main: id|name} makes another Camera entity the main one; `cameras` lists all."),
-    ("raycast", "Physics ray cast. args: {origin, dir, max?: 1000}"),
+    ("raycast", "Physics ray cast. args: {origin, dir, max?: 1000, exclude?: id|name|[...] (ignore these bodies, e.g. the caster)}"),
     ("pick", "Entity under a canvas point (CSS px). args: {x, y, mesh?: true = test rendered meshes instead of physics colliders; also returns depth_ties (z-fighting partners)}"),
     ("ui", "HUD slot contents."),
     ("bend", "Pushers that bend Material::bend geometry and GPU grass. args: {pushers?: [[x,y,z,radius], ...] (replaces; [] = none), material?: id, bend?: value (sets Material::bend)}. Returns pushers and every material with bend > 0."),
@@ -82,7 +82,8 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("audio", "Audio state: context state, sounds (ready/loading/failed, plays), active voices with 3D position, last 32 plays with sim step."),
     ("audio_play", "Play a sound by name. args: {sound, volume?: 1, pitch?: 1, pos?: [x,y,z], loop?, lowpass?: hz, highpass?: hz, bandpass?: [hz,q], echo?: [delay_s, feedback, mix?], reverb?: secs | [secs, mix], distort?: drive, pan?: -1..1, detune?: cents, bus?: sfx|voice|ambience|ui}. Returns the voice id."),
     ("music", "Streamed music. args: {} = state | {play: url, fade?: 1.5, volume?: 1, loop?: true} | {stop: true, fade?} | {prefetch: url}. State per track: buffering/playing/paused/blocked/error, time, duration, buffered_s/pct."),
-    ("audio_stop", "Stop a voice (or all). args: {voice?}"),
+    ("audio_stop", "Stop a voice (or all). args: {voice?, fade?: seconds (fade out, then stop)}"),
+    ("audio_voice", "Change a playing voice. args: {voice, volume, fade?: seconds (linear ramp)}. Returns the voice's volume."),
     ("sfx", "Synthesize a sound from a preset and register it. args: {preset, name?: preset, seed?: 0 (0 = exact preset, else a mutation), overrides?: {wave, freq, freq_end, duty, attack, decay, sustain, sustain_time, release, vibrato_depth, vibrato_rate, arp_mult, arp_time, partials, noise_mix, lowpass, highpass, bitcrush, volume}}. Returns duration, peak, rms and the full recipe. args {} lists presets."),
     ("texgen", "Generate a seamless procedural texture. args: {preset, size?: 256, seed?: 1, scale?: 1, colors?: ['#dark','#light'], apply_to?: entity id (sets that entity's material texture), normal?: strength (also generates + applies a normal map), parallax?: uv depth (applies the height map as parallax)}. args {} lists presets."),
     ("audio_set", "Master audio. args: {volume?, music_volume?, sfx_volume?, voice_volume?, ambience_volume?, ui_volume?, muted?, pause_on_blur?: bool (suspend while the tab is unfocused, default true)}"),
@@ -801,7 +802,11 @@ pub(crate) fn handle<G: Game>(
             let o = a.get("origin").and_then(v3).ok_or("missing 'origin'")?;
             let d = a.get("dir").and_then(v3).ok_or("missing 'dir'")?;
             let max = a.get("max").and_then(|v| v.as_f64()).unwrap_or(1000.0) as f32;
-            Ok(match ctx.physics.raycast(o, d, max) {
+            let exclude = match a.get("exclude") {
+                Some(v) => entity_set(ctx, v)?,
+                None => vec![],
+            };
+            Ok(match ctx.physics.raycast_excluding(o, d, max, &exclude) {
                 Some(h) => {
                     json!({"hit": true, "id": h.entity.map(|e| e.id()), "distance": h.distance, "point": arr(h.point), "normal": arr(h.normal)})
                 }
@@ -990,9 +995,19 @@ pub(crate) fn handle<G: Game>(
             }
             Ok(ctx.audio.describe_music())
         }
+        "audio_voice" => {
+            let v = crate::audio::VoiceId(a.get("voice").and_then(|v| v.as_u64()).ok_or("missing 'voice'")? as u32);
+            let fade = a.get("fade").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+            if let Some(vol) = a.get("volume").and_then(|v| v.as_f64()) {
+                if !ctx.audio.set_voice_volume(v, vol as f32, fade) {
+                    return Err(format!("voice {} is not playing", v.0));
+                }
+            }
+            Ok(json!({"voice": v.0, "volume": ctx.audio.voice_volume(v)}))
+        }
         "audio_stop" => {
             match a.get("voice").and_then(|v| v.as_u64()) {
-                Some(v) => ctx.audio.stop(crate::audio::VoiceId(v as u32)),
+                Some(v) => ctx.audio.fade_out(crate::audio::VoiceId(v as u32), a.get("fade").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32),
                 None => ctx.audio.stop_all(),
             }
             Ok(json!({"stopped": a.get("voice").cloned().unwrap_or(json!("all"))}))
