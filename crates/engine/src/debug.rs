@@ -21,6 +21,20 @@ use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
+/// `name` is an engine command (a game command with this name is never called).
+pub fn is_engine_command(name: &str) -> bool {
+    COMMANDS.iter().any(|(n, _)| *n == name)
+}
+
+/// Logs a warning for every game command that an engine command of the same name shadows.
+pub(crate) fn warn_shadowed(game_cmds: &[(&'static str, &'static str)]) {
+    for (n, _) in game_cmds {
+        if is_engine_command(n) {
+            crate::log_warn!("game command '{n}' is shadowed by the engine command of the same name and will never be called; rename it");
+        }
+    }
+}
+
 pub const COMMANDS: &[(&str, &str)] = &[
     ("help", "List commands."),
     ("trace", "Record the drawn position of an entity every rendered frame (smoothness check). args: {id, frames?: 120} starts; {} returns {done, samples: [[frame_ms, fixed_steps, x, y, z]], speed_jitter_pct} (mean frame-to-frame change of the drawn speed relative to the mean speed, in %; a few % = smooth, a hitch or a 0/2-step frame shows as a jump)."),
@@ -64,12 +78,12 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("zfight", "args: {radius?: m around the camera (use in big worlds)}. Find z-fighting: coplanar, same-facing, overlapping triangles of different entities (opaque/masked). args: {eps?: 0.002 plane distance, tolerance?: 0.002 overlap, limit?: 50}. Returns pair count and the worst pairs with entities, world point and screen position."),
     ("debug_mode", "Debug mode (also the ` key): logs every key/mouse press and the camera pose once per second to logs/debug-*.log via the dev server, shows a badge. args: {on?: bool}. Returns file, line counts, last camera, last error."),
     ("audio", "Audio state: context state, sounds (ready/loading/failed, plays), active voices with 3D position, last 32 plays with sim step."),
-    ("audio_play", "Play a sound by name. args: {sound, volume?: 1, pitch?: 1, pos?: [x,y,z], loop?, lowpass?: hz, highpass?: hz, bandpass?: [hz,q], echo?: [delay_s, feedback, mix?], reverb?: secs | [secs, mix], distort?: drive, pan?: -1..1, detune?: cents}. Returns the voice id."),
+    ("audio_play", "Play a sound by name. args: {sound, volume?: 1, pitch?: 1, pos?: [x,y,z], loop?, lowpass?: hz, highpass?: hz, bandpass?: [hz,q], echo?: [delay_s, feedback, mix?], reverb?: secs | [secs, mix], distort?: drive, pan?: -1..1, detune?: cents, bus?: sfx|voice|ambience|ui}. Returns the voice id."),
     ("music", "Streamed music. args: {} = state | {play: url, fade?: 1.5, volume?: 1, loop?: true} | {stop: true, fade?} | {prefetch: url}. State per track: buffering/playing/paused/blocked/error, time, duration, buffered_s/pct."),
     ("audio_stop", "Stop a voice (or all). args: {voice?}"),
     ("sfx", "Synthesize a sound from a preset and register it. args: {preset, name?: preset, seed?: 0 (0 = exact preset, else a mutation), overrides?: {wave, freq, freq_end, duty, attack, decay, sustain, sustain_time, release, vibrato_depth, vibrato_rate, arp_mult, arp_time, partials, noise_mix, lowpass, highpass, bitcrush, volume}}. Returns duration, peak, rms and the full recipe. args {} lists presets."),
     ("texgen", "Generate a seamless procedural texture. args: {preset, size?: 256, seed?: 1, scale?: 1, colors?: ['#dark','#light'], apply_to?: entity id (sets that entity's material texture), normal?: strength (also generates + applies a normal map), parallax?: uv depth (applies the height map as parallax)}. args {} lists presets."),
-    ("audio_set", "Master audio. args: {volume?, music_volume?, sfx_volume?, muted?, pause_on_blur?: bool (suspend while the tab is unfocused, default true)}"),
+    ("audio_set", "Master audio. args: {volume?, music_volume?, sfx_volume?, voice_volume?, ambience_volume?, ui_volume?, muted?, pause_on_blur?: bool (suspend while the tab is unfocused, default true)}"),
     ("panels", "World panels (clickable 3D UI): widgets with rects, on-screen centres (CSS px), hover, click history."),
     ("panel_click", "Click a world panel through the engine path. args: {id, widget?: name} | {id, x, y: panel px}. Returns the action or null."),
     ("assets", "Loaded meshes/materials/textures and model load status."),
@@ -384,7 +398,12 @@ pub(crate) fn handle<G: Game>(
                 .map(|(n, d)| json!({"name": n, "desc": d}))
                 .collect();
             for (n, d) in game.debug_commands() {
-                cmds.push(json!({"name": n, "desc": d, "game": true}));
+                if is_engine_command(n) {
+                    // the engine command wins: the game's handler is never reached
+                    cmds.push(json!({"name": n, "desc": d, "game": true, "shadowed_by_engine": true}));
+                } else {
+                    cmds.push(json!({"name": n, "desc": d, "game": true}));
+                }
             }
             Ok(json!({"usage": "engine.call(name, args)", "commands": cmds}))
         }
@@ -1003,6 +1022,9 @@ pub(crate) fn handle<G: Game>(
             if let Some(v) = f("detune") {
                 p = p.detune(v);
             }
+            if let Some(b) = a.get("bus").and_then(|v| v.as_str()) {
+                p = p.bus(crate::audio::Bus::from_name(b).ok_or(format!("unknown bus '{b}' (sfx, voice, ambience, ui)"))?);
+            }
             let id = ctx
                 .audio
                 .find(name)
@@ -1016,8 +1038,10 @@ pub(crate) fn handle<G: Game>(
             if let Some(v) = a.get("music_volume").and_then(|v| v.as_f64()) {
                 ctx.audio.set_music_volume(v as f32);
             }
-            if let Some(v) = a.get("sfx_volume").and_then(|v| v.as_f64()) {
-                ctx.audio.set_sfx_volume(v as f32);
+            for b in crate::audio::Bus::ALL {
+                if let Some(v) = a.get(format!("{}_volume", b.name())).and_then(|v| v.as_f64()) {
+                    ctx.audio.set_bus_volume(b, v as f32);
+                }
             }
             if let Some(v) = a.get("pause_on_blur").and_then(|v| v.as_bool()) {
                 ctx.audio.set_pause_on_blur(v);
@@ -1026,7 +1050,7 @@ pub(crate) fn handle<G: Game>(
                 ctx.audio.set_muted(m);
             }
             Ok(
-                json!({"volume": ctx.audio.volume(), "muted": ctx.audio.muted(), "state": ctx.audio.state(), "focused": ctx.audio.focused(), "pause_on_blur": ctx.audio.pause_on_blur()}),
+                json!({"volume": ctx.audio.volume(), "muted": ctx.audio.muted(), "state": ctx.audio.state(), "focused": ctx.audio.focused(), "pause_on_blur": ctx.audio.pause_on_blur(), "music_volume": ctx.audio.music_volume(), "buses": crate::audio::Bus::ALL.iter().map(|b| (b.name().to_string(), json!(ctx.audio.bus_volume(*b)))).collect::<serde_json::Map<_, _>>()}),
             )
         }
         "panels" => {

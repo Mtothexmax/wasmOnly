@@ -45,7 +45,7 @@ pub mod water;
 pub mod zfight;
 
 pub use app::{run, run_with, Ctx, Game, Time};
-pub use renderer::RenderConfig;
+pub use renderer::{msaa_pref, set_msaa_pref, RenderConfig};
 pub use glam;
 pub use hecs;
 pub use serde_json;
@@ -59,7 +59,7 @@ pub mod prelude {
     pub use crate::geom::{MeshBuilder, Opening};
     pub use crate::gltf_loader::GltfOpts;
     pub use crate::audio::synth::{self, Sfx, SfxPreset, Wave};
-    pub use crate::audio::{Fx, MusicOpts, Play, SoundId, VoiceId};
+    pub use crate::audio::{Bus, Fx, MusicOpts, Play, SoundId, SoundState, VoiceId};
     pub use crate::character::{CharacterController, ThirdPersonCamera};
     pub use crate::input::{Input, MouseButton};
     pub use crate::lights::SpotLight;

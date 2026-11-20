@@ -44,6 +44,39 @@ struct Sound {
     buffer: Option<AudioBuffer>,
     state: SoundState,
     plays: u32,
+    /// "not ready" was already logged for this sound (logged once, not per play).
+    warned: bool,
+}
+
+/// Mixer bus a voice plays on; each has its own volume (`set_bus_volume`) and goes to the master.
+/// Music has its own bus (`set_music_volume`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Bus {
+    /// Sound effects (default).
+    #[default]
+    Sfx,
+    /// Dialogue / voice lines.
+    Voice,
+    /// Ambience loops (wind, rain, crowd).
+    Ambience,
+    /// UI clicks and menu sounds.
+    Ui,
+}
+
+impl Bus {
+    pub const ALL: [Bus; 4] = [Bus::Sfx, Bus::Voice, Bus::Ambience, Bus::Ui];
+    pub fn name(self) -> &'static str {
+        match self {
+            Bus::Sfx => "sfx",
+            Bus::Voice => "voice",
+            Bus::Ambience => "ambience",
+            Bus::Ui => "ui",
+        }
+    }
+    pub fn from_name(n: &str) -> Option<Bus> {
+        Bus::ALL.into_iter().find(|b| b.name() == n)
+    }
 }
 
 /// Playback-time effects, built from Web Audio nodes per voice:
@@ -94,6 +127,8 @@ pub struct Play {
     pub follow: Option<Entity>,
     /// Distance (world units) at which a 3D sound starts to attenuate.
     pub ref_distance: f32,
+    /// Mixer bus (default `Bus::Sfx`).
+    pub bus: Bus,
 }
 
 impl Play {
@@ -106,7 +141,13 @@ impl Play {
             follow: None,
             ref_distance: 3.0,
             fx: Fx::default(),
+            bus: Bus::Sfx,
         }
+    }
+    /// Plays on another mixer bus (e.g. `Bus::Voice` for dialogue with its own volume).
+    pub fn bus(mut self, b: Bus) -> Self {
+        self.bus = b;
+        self
     }
     pub fn volume(mut self, v: f32) -> Self {
         self.volume = v;
@@ -190,6 +231,7 @@ struct Voice {
     tail: f64,
     ended_at: Option<f64>,
     fx: Fx,
+    bus: Bus,
     _on_end: Closure<dyn FnMut()>,
 }
 
@@ -212,10 +254,10 @@ pub struct PlayEvent {
 pub struct Audio {
     ctx: Option<AudioContext>,
     master: Option<GainNode>,
-    /// Sound effects bus (all `play` voices) and music bus (streamed tracks), both -> master.
-    sfx_bus: Option<GainNode>,
+    /// Voice buses (indexed by `Bus as usize`) and the music bus (streamed tracks), all -> master.
+    buses: [Option<GainNode>; 4],
+    bus_volume: [f32; 4],
     music_bus: Option<GainNode>,
-    sfx_volume: f32,
     music_volume: f32,
     music: music::Music,
     sounds: Vec<Sound>,
@@ -255,14 +297,14 @@ impl Default for Audio {
             g.connect_with_audio_node(master.as_ref()?).ok()?;
             Some(g)
         };
-        let sfx_bus = ctx.as_ref().and_then(bus);
+        let buses = std::array::from_fn(|_| ctx.as_ref().and_then(bus));
         let music_bus = ctx.as_ref().and_then(bus);
         let a = Self {
             ctx,
             master,
-            sfx_bus,
+            buses,
+            bus_volume: [1.0; 4],
             music_bus,
-            sfx_volume: 1.0,
             music_volume: 1.0,
             music: music::Music::new(),
             sounds: vec![],
@@ -355,13 +397,20 @@ impl Audio {
         self.music_volume
     }
     pub fn set_sfx_volume(&mut self, v: f32) {
-        self.sfx_volume = v.max(0.0);
-        if let Some(g) = &self.sfx_bus {
-            g.gain().set_value(self.sfx_volume);
-        }
+        self.set_bus_volume(Bus::Sfx, v);
     }
     pub fn sfx_volume(&self) -> f32 {
-        self.sfx_volume
+        self.bus_volume(Bus::Sfx)
+    }
+    /// Volume of one mixer bus (`Bus::Voice` for dialogue, ...); voices already playing follow.
+    pub fn set_bus_volume(&mut self, b: Bus, v: f32) {
+        self.bus_volume[b as usize] = v.max(0.0);
+        if let Some(g) = &self.buses[b as usize] {
+            g.gain().set_value(self.bus_volume[b as usize]);
+        }
+    }
+    pub fn bus_volume(&self, b: Bus) -> f32 {
+        self.bus_volume[b as usize]
     }
 
     /// AI snapshot of the music player.
@@ -445,6 +494,37 @@ impl Audio {
         self.by_name.get(name).copied()
     }
 
+    /// Load state of a sound (`Loading` right after `ctx.load_sound`, then `Ready` or `Failed`).
+    pub fn sound_state(&self, id: SoundId) -> Option<SoundState> {
+        self.sounds.get(id.0 as usize).map(|s| s.state.clone())
+    }
+    /// The sound is decoded and `play` will start it.
+    pub fn is_ready(&self, id: SoundId) -> bool {
+        self.sounds
+            .get(id.0 as usize)
+            .is_some_and(|s| s.buffer.is_some())
+    }
+    /// Duration in seconds once loaded.
+    pub fn sound_duration(&self, id: SoundId) -> Option<f32> {
+        self.sounds
+            .get(id.0 as usize)?
+            .buffer
+            .as_ref()
+            .map(|b| b.duration() as f32)
+    }
+    /// The voice's source is still playing (false once it ended, was stopped, or never existed).
+    /// The effect tail (echo/reverb) may still ring for a moment afterwards.
+    pub fn is_playing(&self, v: VoiceId) -> bool {
+        self.voices.iter().any(|x| x.id == v && !x.ended.get())
+    }
+    /// Voices currently playing a sound.
+    pub fn playing_count(&self, id: SoundId) -> usize {
+        self.voices
+            .iter()
+            .filter(|x| x.sound == id && !x.ended.get())
+            .count()
+    }
+
     fn register(&mut self, name: &str, state: SoundState, buffer: Option<AudioBuffer>) -> SoundId {
         if let Some(id) = self.find(name) {
             let s = &mut self.sounds[id.0 as usize];
@@ -457,6 +537,7 @@ impl Audio {
             buffer,
             state,
             plays: 0,
+            warned: false,
         });
         let id = SoundId(self.sounds.len() as u32 - 1);
         self.by_name.insert(name.into(), id);
@@ -519,15 +600,20 @@ impl Audio {
         Some(b)
     }
 
-    /// Plays a sound. Returns `None` if it is not loaded (yet) or audio is unavailable.
+    /// Plays a sound. Returns `None` if it is not loaded (yet) or audio is unavailable
+    /// (check with `is_ready`; "not ready" is logged once per sound).
     pub fn play(&mut self, id: SoundId, p: Play) -> Option<VoiceId> {
         let ctx = self.ctx.clone()?;
-        let master = self.sfx_bus.clone()?; // voices go to the sfx bus
-        let sound = self.sounds.get(id.0 as usize)?;
+        let master = self.buses[p.bus as usize].clone()?;
+        let sound = self.sounds.get_mut(id.0 as usize)?;
         let Some(buffer) = sound.buffer.clone() else {
-            log_warn!("sound '{}' not ready ({:?})", sound.name, sound.state);
+            if !sound.warned {
+                sound.warned = true;
+                log_warn!("sound '{}' not ready ({:?}); plays before it loads are dropped (check audio.is_ready)", sound.name, sound.state);
+            }
             return None;
         };
+        let sound = &self.sounds[id.0 as usize];
         // Unfocused tab: drop one-shots instead of queueing them in the suspended context (they
         // would all fire at once on refocus). Loops still start and continue on refocus.
         if self.pause_on_blur && !self.focused && !p.looped {
@@ -668,6 +754,7 @@ impl Audio {
             tail: fx.tail(),
             ended_at: None,
             fx,
+            bus: p.bus,
             _on_end: on_end,
         });
         Some(vid)
@@ -772,11 +859,12 @@ impl Audio {
                 "id": v.id.0, "sound": self.sounds.get(v.sound.0 as usize).map(|s| s.name.clone()),
                 "pos": v.pos.map(|p| [p.x, p.y, p.z]),
                 "distance": v.pos.map(|p| p.distance(self.listener)),
-                "fx": v.fx, "ended": v.ended.get(),
+                "fx": v.fx, "ended": v.ended.get(), "bus": v.bus,
             })).collect::<Vec<_>>(),
             "presets": synth::SfxPreset::ALL.iter().map(|p| p.name()).collect::<Vec<_>>(),
             "plays_total": self.plays_total,
-            "sfx_volume": self.sfx_volume,
+            "sfx_volume": self.bus_volume(Bus::Sfx),
+            "buses": Bus::ALL.iter().map(|b| (b.name().to_string(), serde_json::json!(self.bus_volume(*b)))).collect::<serde_json::Map<_, _>>(),
             "music_volume": self.music_volume,
             "music": self.music.describe(),
             "history": self.history,

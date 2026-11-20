@@ -30,6 +30,44 @@ impl Default for RenderConfig {
     }
 }
 
+const MSAA_PREF_KEY: &str = "wasmonly.msaa";
+
+fn local_storage() -> Option<web_sys::Storage> {
+    web_sys::window()?.local_storage().ok()?
+}
+
+/// The player's stored MSAA choice (graphics menu), used at startup instead of the game's
+/// `RenderConfig`. The URL `?msaa=` still wins.
+pub fn msaa_pref() -> Option<u32> {
+    local_storage()?
+        .get_item(MSAA_PREF_KEY)
+        .ok()??
+        .parse()
+        .ok()
+}
+
+/// Stores an MSAA choice for the next start (`None` = back to the game's default). The sample
+/// count is baked into every pipeline and render target, so it takes effect on a page reload:
+/// `reload: true` reloads right away (the game should save first).
+pub fn set_msaa_pref(msaa: Option<u32>, reload: bool) {
+    if let Some(s) = local_storage() {
+        let _ = match msaa {
+            Some(m) => s.set_item(MSAA_PREF_KEY, &if m >= 4 { 4 } else { 1 }.to_string()),
+            None => s.remove_item(MSAA_PREF_KEY),
+        };
+    }
+    if reload {
+        if let Some(w) = web_sys::window() {
+            // web-sys Location feature is not enabled: call location.reload() through JS
+            if let Ok(loc) = js_sys::Reflect::get(&w, &"location".into()) {
+                if let Ok(f) = js_sys::Reflect::get(&loc, &"reload".into()) {
+                    let _ = js_sys::Function::from(f).call0(&loc);
+                }
+            }
+        }
+    }
+}
+
 /// Shader source for `samples` per pixel: the scene depth is a plain depth texture without MSAA.
 pub(crate) fn ms_src(src: &str, samples: u32) -> String {
     if samples > 1 {

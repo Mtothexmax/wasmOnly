@@ -46,11 +46,14 @@ export function parseScript(src) {
   const t = String(src).trim();
   if (t.startsWith('[')) return parseScript(JSON.parse(t));
   const out = [];
-  for (let line of t.split(/\r?\n|;(?![^{]*})/)) {
-    line = line.replace(/(^|\s)#.*$/, '').trim();
-    if (!line) continue;
-    const m = line.match(/^(\S+)\s*(.*)$/);
-    out.push({ verb: m[1].toLowerCase(), arg: m[2].trim(), src: line });
+  // comments are stripped per line first, so a ';' inside a comment does not start a command
+  for (const raw of t.split(/\r?\n/)) {
+    for (let line of raw.replace(/(^|\s)#.*$/, '').split(/;(?![^{]*})/)) {
+      line = line.trim();
+      if (!line) continue;
+      const m = line.match(/^(\S+)\s*(.*)$/);
+      out.push({ verb: m[1].toLowerCase(), arg: m[2].trim(), src: line });
+    }
   }
   return out;
 }

@@ -521,7 +521,8 @@ pub fn run<G: Game>(game: G) {
     run_with(game, crate::renderer::RenderConfig::default());
 }
 
-/// Like [`run`] with startup render options (MSAA). The page URL overrides them: `?msaa=1|4`.
+/// Like [`run`] with startup render options (MSAA). A stored player choice
+/// ([`crate::renderer::set_msaa_pref`]) overrides them, the page URL `?msaa=1|4` overrides both.
 pub fn run_with<G: Game>(game: G, config: crate::renderer::RenderConfig) {
     debug::install_panic_hook();
     wasm_bindgen_futures::spawn_local(async move {
@@ -559,6 +560,9 @@ async fn start<G: Game>(game: G, mut config: crate::renderer::RenderConfig) -> R
         }
         Ok(_) => {}
         Err(e) => crate::log_warn!("job system: thread pool failed, running serial: {e}"),
+    }
+    if let Some(m) = crate::renderer::msaa_pref() {
+        config.msaa = m;
     }
     let query = js_sys::Reflect::get(&window, &"location".into()).and_then(|l| js_sys::Reflect::get(&l, &"search".into())).ok().and_then(|s| s.as_string()).unwrap_or_default();
     if let Some(m) = query.trim_start_matches('?').split('&').find_map(|kv| kv.strip_prefix("msaa=")).and_then(|v| v.parse::<u32>().ok()) {
@@ -616,6 +620,7 @@ async fn start<G: Game>(game: G, mut config: crate::renderer::RenderConfig) -> R
 
     let game = Rc::new(RefCell::new(game));
     game.borrow_mut().init(&mut ctx.borrow_mut());
+    crate::debug::warn_shadowed(&game.borrow().debug_commands());
     debug::install_api(ctx.clone(), game.clone());
 
     // requestAnimationFrame loop

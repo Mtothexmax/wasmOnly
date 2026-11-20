@@ -110,7 +110,9 @@ normal `cargo` output above it.
 - **Anti-aliasing:** 4x MSAA by default; `engine::run_with(game, RenderConfig { msaa: 1 })` (or the page URL
   `?msaa=1|4`, for A/B without a rebuild) renders without MSAA and runs FXAA in the composite: far less bandwidth on
   integrated/mobile GPUs (Brickhollow at 2400x1350 on a Radeon 780M: 74 -> 97 fps uncapped). The log says
-  `render config: 1x MSAA (FXAA)`.
+  `render config: 1x MSAA (FXAA)`. Graphics menu: `engine::set_msaa_pref(Some(1), reload)` stores the player's choice
+  (localStorage, used at the next start over the game's `RenderConfig`; the URL still wins); the sample count is baked
+  into pipelines and targets, so it applies on reload.
 - **Resolution:** `render {render_scale}` (0.25..1; the canvas backing store has the scene size too, the browser scales it), `auto_resolution` (default on) adapts it to
   `frame_budget_ms` of whole-frame GPU time (`gpu_ms.frame`); every change reallocates the targets (a 20-35 ms
   hitch at 4K), so it jumps once to a scale that fits and changes at most every 4 s; `stats.render` has `width/height` (scene) and `canvas`.
@@ -139,7 +141,11 @@ normal `cargo` output above it.
 - **Music:** `call music` -> tracks with `state` (buffering/playing/paused/blocked/error), `time`, `duration`,
   `buffered_pct`; transitions are logged. Simulate a slow network for one path only:
   `curl -X POST "http://localhost:8080/__throttle?kbps=48&match=assets/music"` (`kbps=0` = off).
-- **Audio:** `call audio` -> context state, sounds, live voices (with fx), last 32 plays with sim `step`.
+- **Audio:** `call audio` -> context state, sounds, live voices (with fx, bus), bus volumes, last 32 plays with sim `step`.
+  Game code: `audio.is_ready(id)` / `sound_state(id)` (a sound from `ctx.load_sound` is `Loading` first; `play` before
+  that returns `None` and warns once per sound), `is_playing(voice)`, `playing_count(id)`. Mixer buses `Bus::{Sfx,
+  Voice, Ambience, Ui}`: `Play::new().bus(Bus::Voice)`, `set_bus_volume(Bus::Voice, v)`; API `audio_set {voice_volume}`,
+  `audio_play {bus}`.
 - **Procedural assets:** `call texgen {preset, apply_to}` and `call sfx {preset, overrides}` iterate on
   textures/sounds without a rebuild (see `.claude/skills/procedural-assets`).
 - **Touch:** `call input '{"touch":{"id":1,"x":200,"y":600,"phase":"start"}}'` (then `move`/`end`) uses the same
@@ -279,7 +285,8 @@ normal `cargo` output above it.
 - Bump a pinned toolchain only on purpose, together with a full build of both variants.
 - One way per task: WGSL only, `.glb` only at runtime (convert others with `asset-cook`), hecs, rapier.
 - Adding an engine command: add it to `COMMANDS` and the `match` in `debug.rs`.
-  Game-specific commands go in `Game::debug_command` + `debug_commands`.
+  Game-specific commands go in `Game::debug_command` + `debug_commands`. Engine commands win on a name clash: the
+  game's is never called (startup warning, `help` marks it `shadowed_by_engine`).
 - `wasm-bindgen` in `Cargo.toml` is pinned to the installed CLI version (`wasm-bindgen --version`).
 - Input: `input.key` = held; `key_pressed` = edge — in `update` per frame, in `fixed_update` latched since the last
   fixed step (short taps and taps while paused are never lost). Jump/fire-style actions: `key_down_or_pressed`.
