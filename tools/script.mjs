@@ -227,7 +227,7 @@ export async function runScript(s, script, opts = {}) {
             const touch = mode === 'touch' || mode === 'mobile';
             if (!(Number(w) > 0 && Number(h) > 0)) throw new Error('viewport <width> <height> [dpr] [touch] | off');
             await s.send('Emulation.setDeviceMetricsOverride', { width: Number(w), height: Number(h), deviceScaleFactor: Number(dpr || 1), mobile: touch });
-            await s.send('Emulation.setTouchEmulationEnabled', { enabled: touch, maxTouchPoints: touch ? 5 : 0 });
+            await s.send('Emulation.setTouchEmulationEnabled', touch ? { enabled: true, maxTouchPoints: 5 } : { enabled: false });
           }
           await frames(s, 3);
           st.value = await s.eval('({w: innerWidth, h: innerHeight, dpr: devicePixelRatio, touch: navigator.maxTouchPoints})');

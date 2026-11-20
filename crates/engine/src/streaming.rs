@@ -119,12 +119,7 @@ impl Ctx {
 
     /// Absolute camera position (main camera).
     pub fn camera_absolute(&self) -> Option<DVec3> {
-        self.world
-            .query::<(&crate::scene::Camera, &crate::scene::GlobalTransform)>()
-            .without::<&crate::render_texture::RenderTextureCamera>()
-            .iter()
-            .next()
-            .map(|(_, g)| self.origin + g.translation().as_dvec3())
+        crate::scene::main_camera_pose(&self.world).map(|g| self.origin + g.w_axis.truncate().as_dvec3())
     }
 
     /// Per frame: floating origin, then streaming layers.

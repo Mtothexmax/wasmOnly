@@ -628,13 +628,7 @@ impl Ctx {
             self.renderer.grass.terrain = None;
             return;
         };
-        let cam = self
-            .world
-            .query::<(&crate::scene::Camera, &crate::scene::GlobalTransform)>()
-            .without::<&crate::render_texture::RenderTextureCamera>()
-            .iter()
-            .next()
-            .map(|(_, g)| g.translation());
+        let cam = crate::scene::main_camera_pose(&self.world).map(|g| g.w_axis.truncate());
         let Some(cam) = cam else { return };
         let cam_abs = self.to_absolute(cam);
         let cs = t.chunk_size();

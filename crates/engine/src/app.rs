@@ -265,6 +265,16 @@ impl Ctx {
         }
     }
 
+    /// Makes `e` (an entity with `Camera`) the camera the canvas renders from: moves the
+    /// [`scene::MainCamera`] marker to it. The other cameras keep existing (and keep their state).
+    pub fn set_main_camera(&mut self, e: Entity) {
+        let others: Vec<Entity> = self.world.query::<(Entity, &scene::MainCamera)>().iter().map(|(o, _)| o).filter(|&o| o != e).collect();
+        for o in others {
+            let _ = self.world.remove_one::<scene::MainCamera>(o);
+        }
+        let _ = self.world.insert_one(e, scene::MainCamera);
+    }
+
     /// Puts `e` and all its descendants on render layer `layer` (also glTF nodes loaded later).
     pub fn set_layer(&mut self, e: Entity, layer: u8) {
         let _ = self.world.insert_one(e, scene::RenderLayer(layer));
@@ -786,13 +796,7 @@ fn frame<G: Game>(c: &mut Ctx, game: &mut G, dt: f32) {
         zcheck.tick(world, renderer, pending, log::now_ms(), cam);
     }
     {
-        let cam = c
-            .world
-            .query::<(&scene::Camera, &scene::GlobalTransform)>()
-            .without::<&crate::render_texture::RenderTextureCamera>()
-            .iter()
-            .next()
-            .map(|(_, g)| g.0);
+        let cam = scene::main_camera_pose(&c.world);
         let (now, step, frame) = (log::now_ms(), c.time.step, c.time.frame);
         c.debug_mode.tick(now, step, frame, cam);
         let snap = || {
@@ -829,13 +833,7 @@ fn frame<G: Game>(c: &mut Ctx, game: &mut G, dt: f32) {
     }
     c.audio.step = c.time.step;
     c.audio.frame = c.time.frame;
-    let cam = c
-        .world
-        .query::<(&scene::Camera, &scene::GlobalTransform)>()
-        .without::<&crate::render_texture::RenderTextureCamera>()
-        .iter()
-        .next()
-        .map(|(_, g)| g.0);
+    let cam = scene::main_camera_pose(&c.world);
     c.audio.update(&c.world, cam);
 
     let t_engine = log::now_ms();

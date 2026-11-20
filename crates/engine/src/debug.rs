@@ -61,17 +61,18 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("entities", "List entities. args: {name?: substring, limit?: 200, with?: 'mesh'|'body'|'light'|'label'|'camera'}"),
     ("entity", "Full detail of one entity. args: {id}"),
     ("set", "Modify an entity. args: {id, pos?: [x,y,z], rot?: [deg x,y,z], scale?: [x,y,z], vel?: [x,y,z], color?: '#rrggbb', opacity?: 0..1 (this entity and its children; keeps its shadow)}"),
-    ("spawn", "Spawn a primitive or a glTF model. args: {shape: 'cube'|'sphere', pos, size?: 1, color?: '#rrggbb', body?: 'dynamic'|'fixed'|'kinematic'|'none', name?} or {gltf: 'assets/x.glb', pos, size?: scale, auto_lod?: bool}"),
+    ("spawn", "Spawn a primitive or a glTF model. args: {shape: 'cube'|'sphere', pos, size?: 1, color?: '#rrggbb', body?: 'dynamic'|'fixed'|'kinematic'|'none', name?} or {gltf: 'assets/x.glb', pos, size?: scale, auto_lod?: bool} or {camera: true, pos?, look_at?, fov?, name?, main?: bool}"),
     ("despawn", "Remove entity and children. args: {id}"),
     ("pause", "Pause simulation (rendering continues)."),
     ("resume", "Resume simulation."),
     ("step", "Run N fixed steps immediately (works while paused). args: {n?: 1}"),
     ("time_scale", "Set simulation speed. args: {value}"),
     ("seed", "Reseed the engine RNG (ctx.rng). args: {value}"),
-    ("input", "Inject input. args: {key?: 'KeyW', down?: bool} | {button?: 0|1|2, down?} | {x?, y?: pointer position, CSS px} | {dx?, dy?} | {action?: 'ui-action'} | {touch: {id, x, y, phase: 'start'|'move'|'end'}} | {release_all: true}. Returns keys, buttons and touch gestures"),
+    ("input", "Inject input. args: {key?: 'KeyW', down?: bool} | {button?: 0|1|2, down?} | {x?, y?: pointer position, CSS px} | {dx?, dy?} | {action?: 'ui-action'} | {touch: {id, x, y, phase: 'start'|'move'|'end'}} | {release_all: true} | {stick: bool} (virtual joystick on/off). Returns keys, buttons and touch gestures"),
     ("logs", "Structured log entries. args: {since?: seq, level?: 'debug'|'info'|'warn'|'error', limit?: 100}"),
     ("render", "Get/set any render setting by name (call without args to list them): shadows, debug_view 0|1|2, sun_dir, sun_intensity, sky, sky_zenith, sky_horizon, fog_density, fog_height_falloff, fog_start, fog_max, fog_color ([r,g,b] or null), exposure, bloom, bloom_intensity, bloom_threshold, depth_darkening, vignette, saturation, particles, gpu_culling, occlusion_culling, camera_jitter, depth_jitter, reverse_draw_order, freeze_time, ... Result includes gpu_culling_supported."),
-    ("camera", "Camera pose + projection; args {pos?, look_at?} moves it."),
+    ("cameras", "Every Camera entity: id, name, main (renders the canvas), marked_main, render_texture, layers."),
+    ("camera", "Main camera pose + projection (the one with MainCamera, else the first Camera); args {pos?, look_at?} moves it, {layers: mask} sets its layer mask, {main: id|name} makes another Camera entity the main one; `cameras` lists all."),
     ("raycast", "Physics ray cast. args: {origin, dir, max?: 1000}"),
     ("pick", "Entity under a canvas point (CSS px). args: {x, y, mesh?: true = test rendered meshes instead of physics colliders; also returns depth_ties (z-fighting partners)}"),
     ("ui", "HUD slot contents."),
@@ -313,6 +314,14 @@ fn entity_arg(ctx: &Ctx, args: &Value) -> Result<Entity, String> {
         .ok_or(format!("no entity with id {id}"))
 }
 
+/// A bare id or name (`{main: 12}` / `{main: "battle-cam"}`).
+fn resolve_entity(ctx: &Ctx, v: &Value) -> Result<Entity, String> {
+    match v {
+        Value::String(n) => entity_arg(ctx, &json!({ "name": n })),
+        _ => entity_arg(ctx, &json!({ "id": v })),
+    }
+}
+
 fn entity_summary(ctx: &Ctx, e: Entity) -> Value {
     let w = &ctx.world;
     let mut tags = vec![];
@@ -514,6 +523,23 @@ pub(crate) fn handle<G: Game>(
             Ok(entity_detail(ctx, e))
         }
         "spawn" => {
+            if a.get("camera").and_then(|v| v.as_bool()) == Some(true) {
+                let pos = a.get("pos").and_then(v3).unwrap_or(Vec3::new(0.0, 2.0, 6.0));
+                let mut t = Transform::from_translation(pos);
+                if let Some(target) = a.get("look_at").and_then(v3) {
+                    t = t.looking_at(target, Vec3::Y);
+                }
+                let mut cam = Camera::default();
+                if let Some(f) = a.get("fov").and_then(|v| v.as_f64()) {
+                    cam.fov_y_deg = f as f32;
+                }
+                let name = a.get("name").and_then(|v| v.as_str()).unwrap_or("camera").to_string();
+                let e = ctx.world.spawn((t, crate::scene::GlobalTransform::default(), cam, crate::scene::Name(name)));
+                if a.get("main").and_then(|v| v.as_bool()) == Some(true) {
+                    ctx.set_main_camera(e);
+                }
+                return Ok(json!({"id": e.id(), "main": crate::scene::main_camera(&ctx.world).map(|m| m.id())}));
+            }
             if let Some(url) = a.get("gltf").and_then(|v| v.as_str()) {
                 let pos = a.get("pos").and_then(v3).unwrap_or(Vec3::ZERO);
                 let scale = a.get("size").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
@@ -607,6 +633,9 @@ pub(crate) fn handle<G: Game>(
             Ok(json!({"seed": v}))
         }
         "input" => {
+            if let Some(on) = a.get("stick").and_then(|v| v.as_bool()) {
+                ctx.input.touch.set_stick_enabled(on);
+            }
             if a.get("release_all")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false)
@@ -679,14 +708,19 @@ pub(crate) fn handle<G: Game>(
             Ok(out)
         }
         "camera" => {
-            let cam = ctx
-                .world
-                .query::<(Entity, &Camera)>()
-                .without::<&crate::render_texture::RenderTextureCamera>()
-                .iter()
-                .next()
-                .map(|(e, _)| e)
-                .ok_or("no camera")?;
+            if let Some(id) = a.get("main") {
+                let e = resolve_entity(ctx, id)?;
+                if ctx.world.get::<&Camera>(e).is_err() || ctx.world.get::<&crate::render_texture::RenderTextureCamera>(e).is_ok() {
+                    return Err(format!("entity {} is not a canvas camera (no Camera, or a render-texture camera)", e.id()));
+                }
+                ctx.set_main_camera(e);
+            }
+            let cam = crate::scene::main_camera(&ctx.world).ok_or("no camera")?;
+            if let Some(m) = a.get("layers").and_then(|v| v.as_u64()) {
+                if let Ok(mut c) = ctx.world.get::<&mut Camera>(cam) {
+                    c.layers = m as u32;
+                }
+            }
             if let Ok(mut t) = ctx.world.get::<&mut Transform>(cam) {
                 if let Some(p) = a.get("pos").and_then(v3) {
                     t.translation = p;
@@ -697,6 +731,21 @@ pub(crate) fn handle<G: Game>(
             }
             crate::scene::propagate_transforms(&mut ctx.world);
             Ok(entity_detail(ctx, cam))
+        }
+        "cameras" => {
+            let main = crate::scene::main_camera(&ctx.world);
+            let list: Vec<Value> = ctx
+                .world
+                .query::<(Entity, &Camera, Option<&crate::scene::Name>)>()
+                .iter()
+                .map(|(e, c, n)| {
+                    json!({"id": e.id(), "name": n.map(|n| n.0.clone()), "main": Some(e) == main,
+                        "marked_main": ctx.world.get::<&crate::scene::MainCamera>(e).is_ok(),
+                        "render_texture": ctx.world.get::<&crate::render_texture::RenderTextureCamera>(e).is_ok(),
+                        "fov_y_deg": c.fov_y_deg, "layers": c.layers})
+                })
+                .collect();
+            Ok(json!({"main": main.map(|e| e.id()), "cameras": list}))
         }
         "raycast" => {
             let o = a.get("origin").and_then(v3).ok_or("missing 'origin'")?;
@@ -830,7 +879,7 @@ pub(crate) fn handle<G: Game>(
             let css = Vec2::new(ctx.canvas.client_width() as f32, ctx.canvas.client_height() as f32);
             // radius: only instances near the camera (big worlds: a full check takes seconds)
             let near = a.get("radius").and_then(|v| v.as_f64()).and_then(|r| {
-                let cam = ctx.world.query::<(&Camera, &crate::scene::GlobalTransform)>().without::<&crate::render_texture::RenderTextureCamera>().iter().next().map(|(_, g)| g.translation())?;
+                let cam = crate::scene::main_camera_pose(&ctx.world)?.w_axis.truncate();
                 Some((cam, r as f32))
             });
             Ok(crate::zfight::find_near(&ctx.world, &ctx.renderer, eps, tol, limit, ctx.renderer.last_view_proj, css, near))

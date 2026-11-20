@@ -269,6 +269,8 @@ pub(super) struct GpuScene {
     changed: Vec<(u32, &'static str)>,
     /// Triangles (LOD 0) and count of the main-view objects.
     pub main_tris: u64,
+    /// `main_tris` split by render layer (a camera's `layers` mask selects which count).
+    main_tris_layer: [u64; 32],
     pub main_count: u32,
     epoch: u32,
     shadows_on: Option<bool>,
@@ -309,6 +311,14 @@ fn mesh_version(meshes: &[GpuMesh], mr: &MeshRenderer, lod: Option<&Lod>) -> u64
 }
 
 impl GpuScene {
+    /// LOD-0 triangles of the main-view objects on the layers in `mask` (a camera's `layers`).
+    pub fn main_tris_for(&self, mask: u32) -> u64 {
+        if mask == u32::MAX {
+            return self.main_tris;
+        }
+        (0..32).filter(|l| mask & (1u32 << l) != 0).map(|l| self.main_tris_layer[l]).sum()
+    }
+
     pub fn group_count(&self) -> (u32, u32) {
         (self.main.keys.len() as u32, self.shadow.keys.len() as u32)
     }
@@ -405,6 +415,7 @@ impl GpuScene {
         inf.obj.sgroups = [NONE; LEVELS];
         inf.obj.info[1] = 0;
         self.main_tris -= inf.tris;
+        self.main_tris_layer[(inf.layer & 31) as usize] -= inf.tris;
         self.main_count -= inf.main as u32;
         inf.tris = 0;
         inf.main = false;
@@ -734,6 +745,7 @@ impl GpuScene {
             self.blend_slots.push(s as u32);
         }
         self.main_tris += tris;
+        self.main_tris_layer[(mr.layer & 31) as usize] += tris;
         self.main_count += main as u32;
         if main {
             self.bounds.0 = self.bounds.0.min(Vec3::new(sphere[0], sphere[1], sphere[2]) - sphere[3]);

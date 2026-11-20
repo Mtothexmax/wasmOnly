@@ -70,7 +70,7 @@ pub mod prelude {
     pub use crate::render_texture::{RenderTextureCamera, RenderTextureId, RenderTextureOpts};
     pub use crate::renderer::{AlphaMode, Lod, Material, MaterialId, MeshId, TextureId};
     pub use crate::scene::{
-        Camera, GlobalTransform, MeshRenderer, Name, Parent, PointLight, RenderLayer, Transform, WorldLabel,
+        Camera, GlobalTransform, MainCamera, MeshRenderer, Name, Parent, PointLight, RenderLayer, Transform, WorldLabel,
     };
     pub use crate::screens::{SceneTag, Screen, ScreenStack, Trans};
     pub use crate::terrain::{NoiseParams, ScatterRule, SplatRules, Terrain, TerrainDesc};

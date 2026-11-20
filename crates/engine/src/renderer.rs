@@ -2621,14 +2621,13 @@ impl Renderer {
         Ok(())
     }
 
-    /// Camera (view, proj, position) of the first entity with `Camera` + `GlobalTransform`.
+    /// Camera (view, proj, position) of the main camera (`scene::main_camera`).
     pub fn camera_matrices(&self, world: &World) -> Option<(Mat4, Mat4, Vec3)> {
         let aspect = self.size.0 as f32 / self.size.1.max(1) as f32;
-        world
-            .query::<(&Camera, &GlobalTransform)>()
-            .without::<&crate::render_texture::RenderTextureCamera>()
-            .iter()
-            .next()
+        let e = crate::scene::main_camera(world)?;
+        let c = *world.get::<&Camera>(e).ok()?;
+        let g = *world.get::<&GlobalTransform>(e).ok()?;
+        Some((c, g))
             .map(|(c, g)| {
                 let view = (Mat4::from_translation(self.settings.camera_jitter) * g.0).inverse();
                 let proj = Mat4::perspective_rh(c.fov_y_deg.to_radians(), aspect, c.near * (1.0 + self.settings.depth_jitter), c.far);
@@ -2640,7 +2639,7 @@ impl Renderer {
     fn view_setup(&self, world: &World, rtt: Option<usize>) -> Option<(Mat4, Mat4, Vec3, f32, f32, u32)> {
         let (cam, aspect) = match rtt {
             None => {
-                let e = world.query::<(hecs::Entity, &Camera)>().without::<&crate::render_texture::RenderTextureCamera>().iter().next().map(|(e, _)| e)?;
+                let e = crate::scene::main_camera(world)?;
                 (e, self.size.0 as f32 / self.size.1.max(1) as f32)
             }
             Some(i) => {
@@ -3279,7 +3278,7 @@ impl Renderer {
             draw_order.reverse();
         }
         // Hi-Z occlusion culling pays off only with enough geometry behind the occluders.
-        let candidate_tris: u64 = if gpu { self.scene.main_tris } else { batches.iter().map(|b| (self.meshes[b.2 as usize].index_count / 3) as u64 * b.4 as u64).sum() };
+        let candidate_tris: u64 = if gpu { self.scene.main_tris_for(layers) } else { batches.iter().map(|b| (self.meshes[b.2 as usize].index_count / 3) as u64 * b.4 as u64).sum() };
         let mut use_hiz = gpu && self.settings.occlusion_culling && candidate_tris >= self.settings.occlusion_min_triangles as u64;
         if main {
             self.hiz_auto.0 += 1;
@@ -3837,7 +3836,7 @@ impl Renderer {
                     stats.draw_calls += 1;
                 }
                 // upper bound (LOD 0 of every candidate); the exact count lives on the GPU
-                stats.triangles += self.scene.main_tris;
+                stats.triangles += self.scene.main_tris_for(layers);
             }
             for &b in &draw_order {
                 let (two_sided, tex, mesh_id, first, count) = batches[b as usize];

@@ -17,7 +17,7 @@
 use crate::app::Ctx;
 use crate::mesh::{MeshData, Vertex};
 use crate::renderer::{MaterialId, MeshId};
-use crate::scene::{Camera, Transform};
+use crate::scene::Transform;
 use glam::{Vec2, Vec3};
 use hecs::Entity;
 
@@ -94,13 +94,7 @@ impl Ctx {
 
 /// Moves every [`Ocean`] under the main camera (called each frame before transforms propagate).
 pub fn follow_camera(ctx: &mut Ctx) {
-    let cam = ctx
-        .world
-        .query::<(&Camera, &Transform)>()
-        .without::<&crate::render_texture::RenderTextureCamera>()
-        .iter()
-        .next()
-        .map(|(_, t)| t.translation);
+    let cam = crate::scene::main_camera(&ctx.world).and_then(|e| ctx.world.get::<&Transform>(e).ok().map(|t| t.translation));
     let Some(c) = cam else { return };
     for (o, t) in ctx.world.query_mut::<(&Ocean, &mut Transform)>() {
         let s = o.snap.max(0.01);

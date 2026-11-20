@@ -108,6 +108,31 @@ impl MeshRenderer {
 #[derive(Clone, Copy, Debug)]
 pub struct RenderLayer(pub u8);
 
+/// Marks the camera the canvas renders from when several `Camera`s exist (a battle screen over
+/// the village). Without it the first camera wins. Set with `ctx.set_main_camera(e)`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MainCamera;
+
+/// The camera the canvas renders from (also audio listener, streaming, terrain, debug tools): the
+/// first `Camera` with [`MainCamera`], else the first `Camera`; render-texture cameras never.
+pub fn main_camera(world: &hecs::World) -> Option<hecs::Entity> {
+    let mut q = world.query::<(hecs::Entity, &Camera, Option<&MainCamera>)>().without::<&crate::render_texture::RenderTextureCamera>();
+    let mut first = None;
+    for (e, _, main) in q.iter() {
+        if main.is_some() {
+            return Some(e);
+        }
+        first.get_or_insert(e);
+    }
+    first
+}
+
+/// Pose of the main camera.
+pub fn main_camera_pose(world: &hecs::World) -> Option<glam::Mat4> {
+    let e = main_camera(world)?;
+    world.get::<&GlobalTransform>(e).ok().map(|g| g.0)
+}
+
 /// Perspective camera. The entity's `GlobalTransform` is the camera pose (looks down -Z).
 #[derive(Clone, Copy, Debug)]
 pub struct Camera {

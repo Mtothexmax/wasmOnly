@@ -76,16 +76,36 @@ pub struct Gestures {
     pub swipes: Vec<Swipe>,
     /// A touch was ever seen (show touch HUD, hide mouse hints).
     pub touch_device: bool,
+    /// Virtual joystick switched off (`set_stick_enabled(false)`: card tables, menus): every
+    /// finger is a look/tap finger and no ring is drawn.
+    pub stick_disabled: bool,
     #[serde(skip)]
     pinch_dist: Option<f32>,
 }
 
 impl Gestures {
+    /// Turns the virtual joystick on/off (default on). Off: a finger on the left no longer
+    /// claims the stick, a finger holding it becomes a look finger, `axis` is zero, no ring.
+    pub fn set_stick_enabled(&mut self, on: bool) {
+        self.stick_disabled = !on;
+        if !on {
+            for t in &mut self.touches {
+                if t.role == TouchRole::Joystick {
+                    t.role = TouchRole::Look;
+                }
+            }
+            self.axis = Vec2::ZERO;
+        }
+    }
+    pub fn stick_enabled(&self) -> bool {
+        !self.stick_disabled
+    }
+
     pub(crate) fn start(&mut self, id: i32, pos: Vec2, now: f64, canvas_w: f32) {
         self.touch_device = true;
         self.touches.retain(|t| t.id != id);
         let has_stick = self.touches.iter().any(|t| t.role == TouchRole::Joystick);
-        let role = if !has_stick && pos.x < canvas_w * 0.4 { TouchRole::Joystick } else { TouchRole::Look };
+        let role = if !self.stick_disabled && !has_stick && pos.x < canvas_w * 0.4 { TouchRole::Joystick } else { TouchRole::Look };
         self.touches.push(Touch { id, pos, start: pos, start_ms: now, travel: 0.0, role, held: false });
         self.pinch_dist = None;
     }

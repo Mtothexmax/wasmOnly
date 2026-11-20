@@ -73,6 +73,10 @@ normal `cargo` output above it.
   (skinned, joints, morph weights); `{id, play, fade?, speed?, looped?}`, `{id, morph, weight}`.
 - **Particles:** `call particles` = emitters + live counts; `{preset, pos, burst?}` spawns one.
 - **Render textures:** `call render_texture` = size, camera, renders, export url; `{id, render:true}`, `{id, export:true}`.
+- **Several cameras:** the canvas renders from the camera with `MainCamera` (`ctx.set_main_camera(e)`), else the first
+  `Camera`; audio listener, streaming, terrain, ocean and debug tools follow it (`scene::main_camera(world)`). `call
+  cameras` lists them; `camera {main: id|name}` switches, `{layers: mask}` sets the mask; `spawn {camera: true, pos,
+  look_at, main}`. `stats.render.triangles` (GPU path, LOD-0 upper bound) counts only the main camera's layers.
 - **Open world:** `call world` = floating origin (`origin`, `shifts`), streaming layers (loaded cells, loads/unloads,
   build ms), entity + mesh counts; `{shift:[x,y,z]}`, `{origin_shift_distance}`, `{layer, radius, enabled}`.
   `call terrain` = size, chunks loaded/built/unloaded, height range; `{height_at:[x,z]}` (absolute), `{flatten|raise|paint}`.
@@ -157,6 +161,8 @@ normal `cargo` output above it.
 - **Touch:** `call input '{"touch":{"id":1,"x":200,"y":600,"phase":"start"}}'` (then `move`/`end`) uses the same
   path as real fingers; the result's `touch` shows fingers, joystick `axis`, `look_delta`, `pinch`, `taps`,
   `swipes`. Real DOM touch can be simulated with `new PointerEvent('pointerdown', {pointerType:'touch', ...})`.
+  Screens without walking (card table, menu): `ctx.input.touch.set_stick_enabled(false)` (API `input {stick:false}`)
+  makes every finger a look/tap finger and hides the joystick ring.
 - **Debug Chrome is muted** (`--mute-audio`): audio state/API checks work, nothing is audible. Use
   `launch --sound` only when the user wants to listen.
 - **GPU-driven scene (main view):** every drawn or shadow-casting entity keeps a persistent object record (bounding
