@@ -469,7 +469,7 @@ pub struct RenderSettings {
     /// Frames the GPU may lag behind (submitted, not finished). When reached, the frame is not
     /// rendered (simulation and input still run), so a GPU-bound device shows a recent frame
     /// instead of one from a long queue (input lag). One extra frame is allowed while the measured
-    /// latency (`stats.render.gpu_latency_ms`) stays under 40 ms. 0 = no limit.
+    /// latency (`stats.render.gpu_latency_ms`) stays under 6 frame intervals (min 150 ms); 6 more frames are the hard cap. 0 = no limit.
     pub max_frames_in_flight: u32,
     /// World-space offset added to the camera position (flicker detection: tiny shifts between
     /// screenshots reveal z-fighting and shimmering).
@@ -951,6 +951,8 @@ pub struct Renderer {
     /// Frame pacing: (frames in flight, smoothed submit -> done latency in ms).
     in_flight: Rc<Cell<(u32, f32)>>,
     frames_skipped: u64,
+    /// Smoothed rAF interval (ms), the yardstick for a GPU backlog.
+    frame_interval_ms: f32,
     /// When frames started being skipped (a promise that never resolves must not stop rendering).
     skip_since: Option<f64>,
     /// `copyExternalImageToTexture` works on this device (PowerVR B-Series writes zeros); if not,
@@ -1478,6 +1480,7 @@ impl Renderer {
             timing_strikes: 0,
             in_flight: Rc::new(Cell::new((0, 0.0))),
             frames_skipped: 0,
+            frame_interval_ms: 0.0,
             skip_since: None,
             external_copy_ok,
             meshes: vec![],
@@ -2263,6 +2266,10 @@ impl Renderer {
     ///   under 85 % of the budget for 3 windows in a row (no up/down oscillation);
     /// * at least 4 s between changes, except when more than 30 % over budget.
     pub fn adapt_resolution(&mut self, frame_dt: f32) {
+        if frame_dt > 0.0 {
+            let ms = frame_dt * 1000.0;
+            self.frame_interval_ms = if self.frame_interval_ms == 0.0 { ms } else { self.frame_interval_ms * 0.95 + ms * 0.05 };
+        }
         if !self.settings.auto_resolution {
             self.adapt = (0.0, 0.0, 0);
             return;
@@ -2440,9 +2447,11 @@ impl Renderer {
     pub fn render(&mut self, world: &World) -> Result<(), String> {
         let (fl, lat) = self.in_flight.get();
         let max = self.settings.max_frames_in_flight;
-        // a GPU that keeps up resolves its promise about one vsync late: allow one extra frame
-        // until the latency shows a real backlog (no dropped frames on a fast desktop)
-        if max > 0 && (fl > max || (fl >= max && lat > 40.0)) {
+        // Chrome resolves the promise one or two vsyncs after the GPU is done, so a GPU that keeps
+        // up still shows up to 5 frames in flight and 30-90 ms of latency on a desktop. Only a real backlog
+        // (latency well above the frame interval) skips, otherwise a smooth desktop drops frames.
+        let backlog = lat > 150.0f32.max(6.0 * self.frame_interval_ms);
+        if max > 0 && (fl >= max + 6 || (fl >= max && backlog)) {
             let now = crate::log::now_ms();
             let since = *self.skip_since.get_or_insert(now);
             if now - since < 1000.0 {
