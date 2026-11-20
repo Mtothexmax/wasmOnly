@@ -716,6 +716,9 @@ pub struct FrameStats {
     pub shadow_static_rendered: u32,
     /// Shadow-map texels restored from the static copies this frame (dirty rects of moving casters).
     pub shadow_restored_texels: u32,
+    /// Why static copies were re-rendered (totals): [no copy yet, sun direction, static caster
+    /// changed, cascade re-fitted (camera left the margin), copy not kept].
+    pub shadow_static_why: [u32; 5],
     /// Main-view frames submitted but not finished by the GPU (`onSubmittedWorkDone`).
     pub frames_in_flight: u32,
     /// Submit -> GPU done of the main view, smoothed (ms). Large = the GPU runs behind (input lag).
@@ -975,6 +978,10 @@ pub struct Renderer {
     shadow_cur_set: u32,
     shadow_fade: Option<(Vec3, f64)>,
     shadow_step_count: u32,
+    /// `shadow_frame` of the last sun step: the new set's cascades k > 0 are rendered one per frame
+    /// after it (spread over k frames instead of all at once).
+    shadow_step_frame: u64,
+    static_why: [u32; 5],
     /// Per shadow-map layer: what it currently holds (see `RenderSettings::shadow_cache`).
     shadow_cache: [ShadowLayer; 2 * MAX_CASCADES],
     shadow_frame: u64,
@@ -1543,6 +1550,8 @@ impl Renderer {
             shadow_cur_set: 0,
             shadow_fade: None,
             shadow_step_count: 0,
+            shadow_step_frame: 0,
+            static_why: [0; 5],
             shadow_cache: Default::default(),
             shadow_frame: 0,
             hiz_auto: (0, 0, 0, 0, 0),
@@ -2705,6 +2714,7 @@ impl Renderer {
                         if fade_ms > 0.0 && self.ensure_two_shadow_sets() {
                             self.shadow_fade = Some((d, now));
                             self.shadow_cur_set ^= 1;
+                            self.shadow_step_frame = self.shadow_frame + 1;
                         }
                         self.shadow_dir = Some(light);
                     }
@@ -3114,7 +3124,11 @@ impl Renderer {
             let (dir, (center, radius, need)) = pass_fit[p];
             let mat = pass_mats[p];
             let c = &mut self.shadow_cache[layer as usize];
-            let reuse = cache_on && c.valid && c.dir == dir && {
+            // right after a sun step the new set has almost no weight in the cross-fade: its cascades
+            // k > 0 keep their old content (and matrix) for k more frames, so the step re-renders one
+            // cascade per frame instead of all of them in one frame
+            let staggered = cache_on && fading.is_some() && p < n_casc && k > 0 && c.valid && self.shadow_frame < self.shadow_step_frame + k as u64;
+            let reuse = staggered || cache_on && c.valid && c.dir == dir && {
                 let same = c.mat == mat;
                 let covers = (k > 0 || split_on) && (center - c.center).length() + need <= c.radius;
                 let age = self.shadow_frame.saturating_sub(c.frame);
@@ -3144,6 +3158,10 @@ impl Renderer {
                 let (lv, half, depth) = cascade_boxes[p];
                 let keep_static = split_on && c.valid && c.static_ok && !c.static_dirty && c.mat == mat && c.dir == dir;
                 need_static[p] = !keep_static;
+                if split_on && render_pass[p] {
+                    let why = if !c.valid || !c.static_ok { 0 } else if c.dir != dir { 1 } else if c.static_dirty { 2 } else if c.mat != mat { 3 } else { 4 };
+                    self.static_why[why] += 1;
+                }
                 *c = ShadowLayer { valid: true, mat, texel: tx, dir, center, radius, content, frame: self.shadow_frame, lv, half, depth, dirty: false, near, static_ok: split_on, static_dirty: false, dyn_rect: None };
             }
         }
@@ -3515,6 +3533,7 @@ impl Renderer {
             let shadow_groups = if gpu && !todo.is_empty() { self.scene.shadow_groups(cam_pos, lod_bias) } else { vec![] };
             let dyn_groups = if split_on && !todo.is_empty() { self.scene.dynamic_shadow_groups() } else { vec![] };
             stats.shadow_passes_rendered = todo.len() as u32;
+            stats.shadow_static_why = self.static_why;
             stats.shadow_passes_cached = (shadow_passes.len() - todo.len()) as u32;
             stats.shadow_cascades_rendered = render_pass.iter().take(n_casc).copied().collect();
             // render passes: (pass, target view, clear, id list) and a copy of the static layer

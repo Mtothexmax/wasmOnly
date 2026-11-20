@@ -262,7 +262,9 @@ pub(super) struct GpuScene {
     /// Casters currently flagged dynamic (info.y bit 2), checked for expiry every frame.
     dyn_slots: Vec<u32>,
     /// Slots whose change touched the static shadow copies this frame (`gpu_scene` shows them).
-    static_change_slots: Vec<u32>,
+    static_change_slots: Vec<(u32, &'static str)>,
+    /// What the current note_shadow calls belong to (for `static_changes`).
+    note_why: &'static str,
     /// Slots changed this frame and why (for `gpu_scene`: what keeps uploads / shadows busy).
     changed: Vec<(u32, &'static str)>,
     /// Triangles (LOD 0) and count of the main-view objects.
@@ -361,7 +363,7 @@ impl GpuScene {
             self.shadow_changes.push(o.sphere);
             if o.info[1] & 4 == 0 {
                 self.shadow_static_changes.push(o.sphere);
-                self.static_change_slots.push(i as u32);
+                self.static_change_slots.push((i as u32, self.note_why));
             }
         }
     }
@@ -467,6 +469,7 @@ impl GpuScene {
                         }
                         if mesh_changed {
                             self.changed.push((s, "mesh deformed"));
+                            self.note_why = "mesh deformed";
                             // deformed mesh (skinning, morphs): same draw, new shadow
                             self.infos[i].mesh_ver = mv;
                             for k in [i as u32, ss] {
@@ -481,12 +484,14 @@ impl GpuScene {
                     }
                     if same_inputs {
                         self.changed.push((s, "moved"));
+                        self.note_why = "moved";
                         // moved only: new record + sphere, same groups
                         self.moved(ek, i, &g.0, mr, mv, pool, materials, meshes, shadows_on, frame);
                         continue;
                     }
                 }
             }
+            self.note_why = "rebuilt";
             self.rebuild(ek, &g.0, mr, lod, mv, mat_v, pool, materials, meshes, shadows_on, frame);
             if let Some(&s) = pool.slot_of.get(&(ek, false)) {
                 self.changed.push((s, "rebuilt"));
@@ -501,6 +506,7 @@ impl GpuScene {
             if !inf.active || inf.obj.info[1] & 4 == 0 {
                 self.dyn_slots.swap_remove(k);
             } else if frame.saturating_sub(inf.changed_frame) > DYN_FRAMES {
+                self.note_why = "expired";
                 self.infos[i].obj.info[1] &= !4;
                 self.note_shadow(i);
                 self.dirty.push(i as u32);
@@ -513,6 +519,7 @@ impl GpuScene {
         for i in 0..self.infos.len() {
             if self.infos[i].active && self.infos[i].seen != frame {
                 self.changed.push((i as u32, "removed"));
+                self.note_why = "removed";
                 self.deactivate(i);
             }
         }
@@ -908,9 +915,8 @@ impl GpuScene {
             "changed": changed,
             "shadow_changes": self.shadow_changes.len(),
             "dynamic_casters": self.dyn_slots.len(),
-            "static_changes": self.static_change_slots.iter().take(24).map(|&s| {
+            "static_changes": self.static_change_slots.iter().take(24).map(|&(s, why)| {
                 let id = owner.get(s as usize).and_then(|o| hecs::Entity::from_bits(o.0)).map(|e| e.id());
-                let why = self.changed.iter().find(|c| c.0 == s).map(|c| c.1).unwrap_or("expired");
                 serde_json::json!({"slot": s, "entity": id, "why": why})
             }).collect::<Vec<_>>(),
             "slots": self.infos.len(),

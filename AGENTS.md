@@ -207,7 +207,9 @@ normal `cargo` output above it.
   the static casters; when only dynamic casters changed, the cascade keeps its matrix (cascade 0 gets the
   `shadow_margin` too), restores the texel rect where dynamic casters were and are (scissored frag_depth draw from the
   copy, not a full copy: WebGPU copies depth only whole) and draws just the dynamic casters. `stats.render`:
-  `shadow_static_rendered`, `shadow_restored_texels`. Brickhollow walking at 2400x1350: shadow 3.5-5 ms -> 0.8-1.5 ms.
+  `shadow_static_rendered`, `shadow_restored_texels`, `shadow_static_why` (totals: [no copy, sun direction, static caster
+  changed, cascade re-fitted, other]); `call gpu_scene` -> `dynamic_casters`, `static_changes` (slot, entity, why). A sun
+  step re-renders the new set's cascades one per frame (cascade k after k frames). Brickhollow walking at 2400x1350: shadow 3.5-5 ms -> 0.8-1.5 ms.
 - **Blend pass skip:** with no transparent draws, particles or water the opaque pass resolves straight into the HDR
   target (saves a load + store of the 4x MSAA target).
 - **Instance upload:** every drawn or shadow-casting entity owns a stable slot in the instance buffer (`InstancePool`
