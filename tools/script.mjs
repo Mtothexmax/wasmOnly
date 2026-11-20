@@ -2,7 +2,8 @@
 // against the running game through the CDP session — one command instead of a chain of
 // `bridge call` / `bridge screenshot` invocations. Used by `bridge run` and the MCP tool `run_script`.
 //
-// Text form (one command per line or separated by ";", `#` starts a comment):
+// Text form (one command per line or separated by ";"; `#` at the line start, or ` # ` after a command,
+// starts a comment, so `expect ui contains #id` keeps its `#id`):
 //
 //   reload                              reload the page, wait for engine-ready (+ assets)
 //   pause | resume                      simulation
@@ -20,6 +21,8 @@
 //   wait_for game_state.grounded == true 3000   poll until true (timeout ms, default 5000)
 //   expect game_state.score >= 1        assertion (ops: == != < <= > >= ~= (abs diff < 0.01), contains)
 //   screenshot shots/after-jump.png     PNG (directory created)
+//   viewport 390 844 3 touch            emulate a phone page: CSS width height [dpr=1] [touch] (mobile + touch
+//                                       events); `viewport off` restores. Lasts until the run ends.
 //   log some text                       note in the report
 //
 // Paths: `<command>.<field>.<index>...`, e.g. `entity{"id":5}.pos.1` passes args in braces.
@@ -48,7 +51,7 @@ export function parseScript(src) {
   const out = [];
   // comments are stripped per line first, so a ';' inside a comment does not start a command
   for (const raw of t.split(/\r?\n/)) {
-    for (let line of raw.replace(/(^|\s)#.*$/, '').split(/;(?![^{]*})/)) {
+    for (let line of raw.replace(/^\s*#.*$|\s#(\s.*)?$/, '').split(/;(?![^{]*})/)) {
       line = line.trim();
       if (!line) continue;
       const m = line.match(/^(\S+)\s*(.*)$/);
@@ -214,7 +217,23 @@ export async function runScript(s, script, opts = {}) {
           break;
         }
         case 'log': st.value = arg; break;
-        default: throw new Error(`unknown command '${verb}' (reload pause resume step frames wait key down up hold mouse click action screen call expect wait_for screenshot log)`);
+        case 'viewport': {
+          // CDP device emulation: belongs to this session, so it ends with the run
+          if (arg === 'off' || arg === '') {
+            await s.send('Emulation.clearDeviceMetricsOverride');
+            await s.send('Emulation.setTouchEmulationEnabled', { enabled: false });
+          } else {
+            const [w, h, dpr, mode] = arg.split(/\s+/);
+            const touch = mode === 'touch' || mode === 'mobile';
+            if (!(Number(w) > 0 && Number(h) > 0)) throw new Error('viewport <width> <height> [dpr] [touch] | off');
+            await s.send('Emulation.setDeviceMetricsOverride', { width: Number(w), height: Number(h), deviceScaleFactor: Number(dpr || 1), mobile: touch });
+            await s.send('Emulation.setTouchEmulationEnabled', { enabled: touch, maxTouchPoints: touch ? 5 : 0 });
+          }
+          await frames(s, 3);
+          st.value = await s.eval('({w: innerWidth, h: innerHeight, dpr: devicePixelRatio, touch: navigator.maxTouchPoints})');
+          break;
+        }
+        default: throw new Error(`unknown command '${verb}' (reload pause resume step frames wait key down up hold mouse click action screen call expect wait_for screenshot log viewport)`);
       }
     } catch (e) {
       st.ok = false;

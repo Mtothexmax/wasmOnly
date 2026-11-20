@@ -43,6 +43,11 @@ pub trait Game: 'static {
     fn debug_commands(&self) -> Vec<(&'static str, &'static str)> {
         vec![]
     }
+    /// (name, description, owner) of commands that exist but are not callable right now (a
+    /// `ScreenStack` lists the commands of screens that are not on top) — shown by `help`.
+    fn inactive_debug_commands(&self) -> Vec<(&'static str, &'static str, &'static str)> {
+        vec![]
+    }
     /// Game state snapshot for AI inspection (`engine.call("game_state")`).
     fn debug_state(&self, _ctx: &Ctx) -> Value {
         Value::Null
@@ -620,7 +625,14 @@ async fn start<G: Game>(game: G, mut config: crate::renderer::RenderConfig) -> R
 
     let game = Rc::new(RefCell::new(game));
     game.borrow_mut().init(&mut ctx.borrow_mut());
-    crate::debug::warn_shadowed(&game.borrow().debug_commands());
+    {
+        let g = game.borrow();
+        let mut cmds = g.debug_commands();
+        cmds.extend(g.inactive_debug_commands().into_iter().map(|(n, d, _)| (n, d)));
+        cmds.sort();
+        cmds.dedup_by_key(|c| c.0);
+        crate::debug::warn_shadowed(&cmds);
+    }
     debug::install_api(ctx.clone(), game.clone());
 
     // requestAnimationFrame loop

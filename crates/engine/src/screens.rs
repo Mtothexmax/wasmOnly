@@ -348,6 +348,22 @@ impl<D: 'static> Game for ScreenStack<D> {
         v
     }
 
+    fn inactive_debug_commands(&self) -> Vec<(&'static str, &'static str, &'static str)> {
+        // registered screens other than the top one (constructors only build the struct;
+        // nothing happens until on_enter)
+        let top = self.top_name();
+        let mut v = vec![];
+        for (n, f) in &self.registry {
+            if Some(*n) == top {
+                continue;
+            }
+            for (c, d) in f().debug_commands() {
+                v.push((c, d, *n));
+            }
+        }
+        v
+    }
+
     fn debug_command(&mut self, ctx: &mut Ctx, name: &str, a: &Value) -> Option<Result<Value, String>> {
         if name == "screens" {
             let r = (|| -> Result<Value, String> {

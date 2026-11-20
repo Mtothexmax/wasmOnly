@@ -397,6 +397,12 @@ pub(crate) fn handle<G: Game>(
                 .iter()
                 .map(|(n, d)| json!({"name": n, "desc": d}))
                 .collect();
+            let active: Vec<&str> = game.debug_commands().iter().map(|c| c.0).collect();
+            for (n, d, screen) in game.inactive_debug_commands() {
+                if !active.contains(&n) && !cmds.iter().any(|c| c["name"] == n && c["screen"] == screen) {
+                    cmds.push(json!({"name": n, "desc": d, "game": true, "screen": screen, "active": false}));
+                }
+            }
             for (n, d) in game.debug_commands() {
                 if is_engine_command(n) {
                     // the engine command wins: the game's handler is never reached
@@ -1104,9 +1110,10 @@ pub(crate) fn handle<G: Game>(
         "game_state" => Ok(game.debug_state(ctx)),
         other => match game.debug_command(ctx, other, a) {
             Some(r) => r,
-            None => Err(format!(
-                "unknown command '{other}' — try engine.call('help')"
-            )),
+            None => match game.inactive_debug_commands().iter().find(|c| c.0 == other) {
+                Some((_, _, screen)) => Err(format!("command '{other}' belongs to screen '{screen}', which is not on top (screens {{switch: \"{screen}\"}})")),
+                None => Err(format!("unknown command '{other}' — try engine.call('help')")),
+            },
         },
     }
 }

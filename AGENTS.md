@@ -62,6 +62,8 @@ normal `cargo` output above it.
   call, wait_for, expect, screenshot) and returns a pass/fail report per step plus new engine warnings; exit 1
   on failure. MCP: `run_script`. Syntax in the header of `tools/script.mjs`; example `games/demo/tests/smoke.txt`.
   Test scripts live in `games/<g>/tests/` (the watcher ignores that folder, so screenshots don't trigger reloads).
+  Phone layouts: `viewport 390 844 3 touch` in a script emulates the page size, DPR and touch (CDP device metrics;
+  `viewport off`, ends with the run). `#` comments: at the line start or ` # ` after a command (`#id` stays text).
 - **Screens / scenes:** `call screens` = stack, history, scenes; `screens {switch|push|reset: name}`, `{pop:true}`.
   `call scenes` = entity count per scene, `{unload: name}`. `game_state` of a `ScreenStack` game is
   `{screen, stack, state}` (the top screen's `debug_state` is in `state`).
@@ -290,7 +292,8 @@ normal `cargo` output above it.
 - One way per task: WGSL only, `.glb` only at runtime (convert others with `asset-cook`), hecs, rapier.
 - Adding an engine command: add it to `COMMANDS` and the `match` in `debug.rs`.
   Game-specific commands go in `Game::debug_command` + `debug_commands`. Engine commands win on a name clash: the
-  game's is never called (startup warning, `help` marks it `shadowed_by_engine`).
+  game's is never called (startup warning, `help` marks it `shadowed_by_engine`). `help` also lists the commands of
+  `ScreenStack` screens that are not on top (`"screen"`, `"active": false`); calling one names the screen to switch to.
 - `wasm-bindgen` in `Cargo.toml` is pinned to the installed CLI version (`wasm-bindgen --version`).
 - Input: `input.key` = held; `key_pressed` = edge — in `update` per frame, in `fixed_update` latched since the last
   fixed step (short taps and taps while paused are never lost). Jump/fire-style actions: `key_down_or_pressed`.
