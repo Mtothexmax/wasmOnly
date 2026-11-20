@@ -210,7 +210,7 @@ export async function perf(s, opts = {}) {
     cpu_phases: phases,
     gpu_ms: gpu,
     canvas: [sample.st.render.width, sample.st.render.height], dpr: sample.dpr, css: sample.css,
-    draw_calls: sample.st.render.draw_calls, triangles: sample.st.render.triangles,
+    draw_calls: sample.st.render.draw_calls, triangles: sample.st.render.triangles, candidate_triangles: sample.st.render.candidate_triangles,
     focus: sample.focus, visibility: sample.visible,
   };
   // verdict. Display interval = the most common short interval (rounded to 0.5 ms); averages hide

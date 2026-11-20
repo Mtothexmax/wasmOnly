@@ -782,7 +782,12 @@ pub struct FrameStats {
     pub instance_upload_bytes: u64,
     pub visible: u32,
     pub culled: u32,
+    /// Triangles drawn in the main view this frame (GPU path: after frustum/Hi-Z culling and LOD, from
+    /// the async readback, plus the CPU-drawn blended geometry).
     pub triangles: u64,
+    /// LOD-0 triangles of every main-view candidate (all objects on the camera's layers, before culling):
+    /// the work the cull pass starts from; decides whether Hi-Z runs.
+    pub candidate_triangles: u64,
     /// Instances with a `Lod` component drawn at level 0, 1, 2, 3+.
     pub lod_levels: [u32; 4],
     /// Alpha-blended instances drawn this frame (sorted back to front) and their draw calls.
@@ -797,7 +802,7 @@ pub struct FrameStats {
     pub gpu_occluded: u32,
     pub gpu_visible: u32,
     /// Triangles the GPU path actually drew in the main view / all shadow passes (after culling and
-    /// LOD; async readback). `triangles` is the LOD-0 upper bound of the candidates.
+    /// LOD; async readback). `candidate_triangles` is the LOD-0 upper bound before culling.
     pub gpu_triangles: u32,
     pub gpu_shadow_triangles: u32,
     pub width: u32,
@@ -3835,8 +3840,9 @@ impl Renderer {
                     pass.draw_indexed_indirect_with_u32(&args, g * 20);
                     stats.draw_calls += 1;
                 }
-                // upper bound (LOD 0 of every candidate); the exact count lives on the GPU
-                stats.triangles += self.scene.main_tris_for(layers);
+                // drawn = the cull pass's count (readback); candidates = LOD-0 upper bound
+                stats.candidate_triangles += self.scene.main_tris_for(layers);
+                stats.triangles += stats.gpu_triangles as u64;
             }
             for &b in &draw_order {
                 let (two_sided, tex, mesh_id, first, count) = batches[b as usize];
@@ -3858,7 +3864,9 @@ impl Renderer {
                 pass.draw_indexed_with_instance_count_and_first_index_and_base_vertex_and_first_instance(mesh.index_count, count, 0, 0, first);
                 stats.draw_calls += 1;
                 // GPU path: upper bound (candidates); the exact count lives on the GPU.
-                stats.triangles += (mesh.index_count / 3) as u64 * count as u64;
+                let tris = (mesh.index_count / 3) as u64 * count as u64;
+                stats.triangles += tris;
+                stats.candidate_triangles += tris;
             }
             if grass_blades > 0 {
                 let mg = self.material_group((0, u32::MAX, u32::MAX));
@@ -3925,7 +3933,9 @@ impl Renderer {
                 pass.draw_indexed_with_instance_count_and_first_index_and_base_vertex_and_first_instance(mesh.index_count, count, 0, 0, first);
                 stats.draw_calls += 1;
                 stats.transparent_draw_calls += 1;
-                stats.triangles += (mesh.index_count / 3) as u64 * count as u64;
+                let tris = (mesh.index_count / 3) as u64 * count as u64;
+                stats.triangles += tris;
+                stats.candidate_triangles += tris;
             }
             // particles: additive first (order-independent), then alpha-blended far -> near
             if n_add + n_alpha > 0 {

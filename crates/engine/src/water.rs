@@ -6,7 +6,8 @@
 //! provides meshes dense enough for the waves:
 //!
 //! * [`Ctx::spawn_water`] — a bounded surface (pond, lake, pool): a grid whose vertex spacing
-//!   matches the material's `water_vertex_spacing` (capped at 256x256 cells).
+//!   matches the material's `water_vertex_spacing` along each axis (at most 65536 cells, so a
+//!   long strip gets a long grid, not a square one).
 //! * [`Ctx::spawn_ocean`] — an endless sea: a radial mesh (dense in the centre, cells growing with
 //!   distance, ~5 km radius) that follows the camera ([`Ocean`]), so detail is always where you look.
 //!
@@ -69,13 +70,32 @@ pub fn ocean_mesh(radius: f32, inner: f32, segments: u32) -> MeshData {
     MeshData { vertices, indices }
 }
 
+/// Cells (x, z) of a bounded water grid: `spacing` per axis, at most 65536 cells in total.
+pub(crate) fn water_cells(size: Vec2, spacing: f32) -> (u32, u32) {
+    const MAX_CELLS: f32 = 65536.0;
+    let mut s = spacing.max(0.05);
+    let cells = |s: f32| ((size.x / s).ceil().max(1.0), (size.y / s).ceil().max(1.0));
+    let (x, z) = cells(s);
+    if x * z > MAX_CELLS {
+        s *= (x * z / MAX_CELLS).sqrt();
+        let (mut x, mut z) = cells(s);
+        while x * z > MAX_CELLS {
+            s *= 1.01;
+            (x, z) = cells(s);
+        }
+        return (x as u32, z as u32);
+    }
+    (x as u32, z as u32)
+}
+
 impl Ctx {
     /// Bounded water surface of `size` (x, z) metres centred on `t`, tessellated to the material's
-    /// `water_vertex_spacing` (max 256x256 cells). Uses the material as given (see `Material::water`).
+    /// `water_vertex_spacing` along each axis (at most 65536 cells; beyond that the spacing grows evenly).
+    /// Uses the material as given (see `Material::water`).
     pub fn spawn_water(&mut self, name: &str, material: MaterialId, size: Vec2, t: Transform) -> Entity {
         let spacing = self.renderer.material(material).map(|m| m.water_vertex_spacing).unwrap_or(0.25).max(0.05);
-        let n = ((size.max_element() / spacing).ceil() as u32).clamp(1, 256);
-        let mesh = self.renderer.add_mesh(name, &MeshData::grid(1.0, n, 1.0));
+        let (nx, nz) = water_cells(size, spacing);
+        let mesh = self.renderer.add_mesh(name, &MeshData::grid_rect(1.0, 1.0, nx, nz, 1.0));
         let t = t.with_scale(t.scale * Vec3::new(size.x, 1.0, size.y));
         self.spawn_mesh(name, mesh, material, t)
     }

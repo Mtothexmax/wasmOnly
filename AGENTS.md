@@ -76,7 +76,7 @@ normal `cargo` output above it.
 - **Several cameras:** the canvas renders from the camera with `MainCamera` (`ctx.set_main_camera(e)`), else the first
   `Camera`; audio listener, streaming, terrain, ocean and debug tools follow it (`scene::main_camera(world)`). `call
   cameras` lists them; `camera {main: id|name}` switches, `{layers: mask}` sets the mask; `spawn {camera: true, pos,
-  look_at, main}`. `stats.render.triangles` (GPU path, LOD-0 upper bound) counts only the main camera's layers.
+  look_at, main}`. `stats.render.triangles` (drawn) and `candidate_triangles` count only the main camera's layers.
 - **Open world:** `call world` = floating origin (`origin`, `shifts`), streaming layers (loaded cells, loads/unloads,
   build ms), entity + mesh counts; `{shift:[x,y,z]}`, `{origin_shift_distance}`, `{layer, radius, enabled}`.
   `call terrain` = size, chunks loaded/built/unloaded, height range; `{height_at:[x,z]}` (absolute), `{flatten|raise|paint}`.
@@ -104,7 +104,9 @@ normal `cargo` output above it.
   AI API: `collisions {since?, entity?: id|name}` (events + `started`/`stopped` counts), `{touching}`, `{inside}`,
   `overlap {pos, radius | half}`, `trigger {pos, half, name}`, `spawn {.., body: "kinematic"}`.
   Test: `games/demo/tests/collisions.txt`.
-- **LOD:** glTF primitives with ≥ 256 triangles get vertex-clustered LODs (first switch at 40x their radius).
+- **LOD:** glTF primitives with ≥ 256 triangles get vertex-clustered LODs (first switch at 40x their radius, i.e.
+  when the object is ~30 px in radius at 60° FOV and 1350 px height: close cameras never switch). For a close
+  camera (top-down at ~16 m) set it once per game: `ctx.gltf_defaults.lod_distance = 0.2` before loading.
   Per load: `ctx.load_gltf_with(url, t, GltfOpts { auto_lod: false, .. })` or `lod_distance`; for all loads:
   `ctx.gltf_defaults`; globally: `render {lod_bias: 2}` (far cameras). `stats.render.lod_levels` shows the mix.
 - **Input in tests:** keys/buttons held through the API (`input {key, down:true}`) survive window blur; only
@@ -147,7 +149,9 @@ normal `cargo` output above it.
   Lens flare: `render {lens_flare: 0..}` (0 = off); test `games/demo/tests/flare.txt` (visible / hidden behind the tower).
 - **Water:** `Material::water` + `ctx.spawn_water(name, mat, size, t)` / `ctx.spawn_ocean(mat, y)`; tune `wave_height`,
   `wave_scale`, `water_chop`, `water_clarity`, `water_foam`, `water_vertex_spacing`; `render {water_ssr, water_refraction,
-  water_caustics}`. `render {debug_view:1}` shows the water normals. Test: `games/demo/tests/sky.txt`.
+  water_caustics}`. `render {debug_view:1}` shows the water normals.
+  `spawn_water` tessellates each axis to the spacing (a 38.8x1.5 m strip at 0.1 m = 388x15 cells; at most 65536 cells,
+  beyond that the spacing grows). API: `spawn {water: [x, z], pos, spacing}`. Test: `games/demo/tests/sky.txt`.
 - **Music:** `call music` -> tracks with `state` (buffering/playing/paused/blocked/error), `time`, `duration`,
   `buffered_pct`; transitions are logged. Simulate a slow network for one path only:
   `curl -X POST "http://localhost:8080/__throttle?kbps=48&match=assets/music"` (`kbps=0` = off).
@@ -185,8 +189,9 @@ normal `cargo` output above it.
   To split the opaque cost into geometry and shading, compare against a trivial fragment shader: in Brickhollow it was
   1.0 ms of 4.9, the rest was shading x overdraw.
 - **Culling/LOD:** `stats.render` has `gpu_culling`, `gpu_frustum_culled`, `gpu_occluded`, `gpu_visible`
-  (async readback, 1-3 frames old) and `lod_levels`. On the GPU path `visible` = main-view candidates, `triangles` =
-  LOD-0 upper bound. `render {gpu_culling:false}` switches to the CPU path.
+  (async readback, 1-3 frames old) and `lod_levels`. On the GPU path `visible` = main-view candidates; `triangles` = drawn in
+  the main view (after culling + LOD, readback, plus blended draws), `candidate_triangles` = LOD-0 upper bound of
+  everything on the camera's layers before culling. `render {gpu_culling:false}` switches to the CPU path.
 - **Frame rate / stutter:** `node tools/bridge.mjs perf [--ms 3000] [--profile]` measures real rAF intervals and
   returns `frame_ms` p50/p95/p99, `missed_frames_pct`, `cpu_phases` (game_fixed, physics, update, engine, render),
   `gpu_ms` per pass (cull, shadow, opaque, blend, hiz, post; WebGPU timestamp queries) and a `verdict`

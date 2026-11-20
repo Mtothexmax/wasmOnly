@@ -61,7 +61,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("entities", "List entities. args: {name?: substring, limit?: 200, with?: 'mesh'|'body'|'light'|'label'|'camera'}"),
     ("entity", "Full detail of one entity. args: {id}"),
     ("set", "Modify an entity. args: {id, pos?: [x,y,z], rot?: [deg x,y,z], scale?: [x,y,z], vel?: [x,y,z], color?: '#rrggbb', opacity?: 0..1 (this entity and its children; keeps its shadow)}"),
-    ("spawn", "Spawn a primitive or a glTF model. args: {shape: 'cube'|'sphere', pos, size?: 1, color?: '#rrggbb', body?: 'dynamic'|'fixed'|'kinematic'|'none', name?} or {gltf: 'assets/x.glb', pos, size?: scale, auto_lod?: bool} or {camera: true, pos?, look_at?, fov?, name?, main?: bool}"),
+    ("spawn", "Spawn a primitive or a glTF model. args: {shape: 'cube'|'sphere', pos, size?: 1, color?: '#rrggbb', body?: 'dynamic'|'fixed'|'kinematic'|'none', name?} or {gltf: 'assets/x.glb', pos, size?: scale, auto_lod?: bool} or {camera: true, pos?, look_at?, fov?, name?, main?: bool} or {water: [x, z], pos, spacing?: 0.25, name?} (bounded water surface)"),
     ("despawn", "Remove entity and children. args: {id}"),
     ("pause", "Pause simulation (rendering continues)."),
     ("resume", "Resume simulation."),
@@ -539,6 +539,19 @@ pub(crate) fn handle<G: Game>(
                     ctx.set_main_camera(e);
                 }
                 return Ok(json!({"id": e.id(), "main": crate::scene::main_camera(&ctx.world).map(|m| m.id())}));
+            }
+            if let Some(size) = a.get("water").and_then(|v| v.as_array()) {
+                let f = |i: usize| size.get(i).and_then(|v| v.as_f64()).unwrap_or(4.0) as f32;
+                let pos = a.get("pos").and_then(v3).unwrap_or(Vec3::ZERO);
+                let mut m = crate::renderer::Material::water(0x0a3d5c, 0x2a9d8f);
+                if let Some(sp) = a.get("spacing").and_then(|v| v.as_f64()) {
+                    m.water_vertex_spacing = sp as f32;
+                }
+                let mat = ctx.renderer.add_material(m);
+                let name = a.get("name").and_then(|v| v.as_str()).unwrap_or("water").to_string();
+                let e = ctx.spawn_water(&name, mat, glam::Vec2::new(f(0), f(1)), Transform::from_translation(pos));
+                crate::scene::propagate_transforms(&mut ctx.world);
+                return Ok(entity_detail(ctx, e));
             }
             if let Some(url) = a.get("gltf").and_then(|v| v.as_str()) {
                 let pos = a.get("pos").and_then(v3).unwrap_or(Vec3::ZERO);

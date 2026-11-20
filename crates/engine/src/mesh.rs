@@ -135,20 +135,26 @@ impl MeshData {
     /// Flat grid in the XZ plane facing +Y, `size` wide, `segments` x `segments` quads, UVs 0..uv_scale.
     /// Use it for displacement-mapped surfaces and water (vertices to move).
     pub fn grid(size: f32, segments: u32, uv_scale: f32) -> Self {
-        let n = segments.max(1);
-        let h = size * 0.5;
-        let mut vertices = Vec::with_capacity(((n + 1) * (n + 1)) as usize);
-        for z in 0..=n {
-            for x in 0..=n {
-                let (u, v) = (x as f32 / n as f32, z as f32 / n as f32);
-                vertices.push(Vertex { pos: [-h + u * size, 0.0, -h + v * size], normal: [0.0, 1.0, 0.0], uv: [u * uv_scale, v * uv_scale] });
+        Self::grid_rect(size, size, segments, segments, uv_scale)
+    }
+
+    /// Rectangular grid in the XZ plane facing +Y: `size_x` x `size_z`, `nx` x `nz` quads, UVs 0..uv_scale
+    /// along each axis (long thin water strips, rivers, displaced paths).
+    pub fn grid_rect(size_x: f32, size_z: f32, nx: u32, nz: u32, uv_scale: f32) -> Self {
+        let (nx, nz) = (nx.max(1), nz.max(1));
+        let (hx, hz) = (size_x * 0.5, size_z * 0.5);
+        let mut vertices = Vec::with_capacity(((nx + 1) * (nz + 1)) as usize);
+        for z in 0..=nz {
+            for x in 0..=nx {
+                let (u, v) = (x as f32 / nx as f32, z as f32 / nz as f32);
+                vertices.push(Vertex { pos: [-hx + u * size_x, 0.0, -hz + v * size_z], normal: [0.0, 1.0, 0.0], uv: [u * uv_scale, v * uv_scale] });
             }
         }
-        let mut indices = Vec::with_capacity((n * n * 6) as usize);
-        for z in 0..n {
-            for x in 0..n {
-                let i = z * (n + 1) + x;
-                indices.extend([i, i + n + 1, i + 1, i + 1, i + n + 1, i + n + 2]);
+        let mut indices = Vec::with_capacity((nx * nz * 6) as usize);
+        for z in 0..nz {
+            for x in 0..nx {
+                let i = z * (nx + 1) + x;
+                indices.extend([i, i + nx + 1, i + 1, i + 1, i + nx + 1, i + nx + 2]);
             }
         }
         MeshData { vertices, indices }
