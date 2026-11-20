@@ -44,7 +44,8 @@ pub mod vegetation;
 pub mod water;
 pub mod zfight;
 
-pub use app::{run, Ctx, Game, Time};
+pub use app::{run, run_with, Ctx, Game, Time};
+pub use renderer::RenderConfig;
 pub use glam;
 pub use hecs;
 pub use serde_json;
@@ -52,7 +53,8 @@ pub use serde_json;
 /// Everything a game usually needs.
 pub mod prelude {
     pub use crate::animation::{Animator, PlayOpts};
-    pub use crate::app::{run, Ctx, Game, Time};
+    pub use crate::app::{run, run_with, Ctx, Game, Time};
+    pub use crate::renderer::RenderConfig;
     pub use crate::batch::Motion;
     pub use crate::geom::{MeshBuilder, Opening};
     pub use crate::gltf_loader::GltfOpts;

@@ -478,7 +478,7 @@ pub struct RenderSettings {
     /// only casters moved, they refresh every `shadow_refresh` frames (cascade 0 every frame).
     pub shadow_cache: bool,
     /// Static shadow cache (GPU-driven path, with `shadow_cache`): each cascade keeps a copy with
-    /// only the static casters. When only dynamic casters (moved or deformed in the last 2 s:
+    /// only the static casters. When only dynamic casters (moved or deformed in the last 10 s:
     /// heroes, NPCs, physics bodies) changed, the cascade is that copy plus the dynamic casters drawn
     /// on top, instead of every caster again (a walking hero in a forest: thousands of trees).
     pub shadow_static_cache: bool,
@@ -507,7 +507,8 @@ pub struct RenderSettings {
     /// Frames the GPU may lag behind (submitted, not finished). When reached, the frame is not
     /// rendered (simulation and input still run), so a GPU-bound device shows a recent frame
     /// instead of one from a long queue (input lag). One extra frame is allowed while the measured
-    /// latency (`stats.render.gpu_latency_ms`) stays under 6 frame intervals (min 150 ms); 6 more frames are the hard cap. 0 = no limit.
+    /// latency (`stats.render.gpu_latency_ms`) stays under 6 frame intervals (min 150 ms); 64 frames are the hard cap (an uncapped desktop keeps
+    /// many cheap frames in flight without a real backlog). 0 = no limit.
     pub max_frames_in_flight: u32,
     /// World-space offset added to the camera position (flicker detection: tiny shifts between
     /// screenshots reveal z-fighting and shimmering).
@@ -2444,11 +2445,12 @@ impl Renderer {
         let render_interval = self.adapt.1 / std::mem::take(&mut self.adapt_rendered).max(1) as f32;
         self.adapt = (0.0, 0.0, 0);
         // The GPU cannot spend much more time per frame than one frame interval (frames would pile
-        // up). Some drivers (PowerVR B-Series) return timestamps that grow without bound: after two
+        // up). Some drivers (PowerVR B-Series) return timestamps that grow without bound: after four
         // such windows they are switched off and the frame interval is used instead.
-        if gpu.is_some() && avg_gpu > render_interval * 2.0 + 5.0 {
+        // (four windows in a row: loading spikes - shader compiles, uploads - are not a broken driver)
+        if gpu.is_some() && avg_gpu > render_interval * 3.0 + 10.0 {
             self.timing_strikes += 1;
-            if self.timing_strikes >= 2 {
+            if self.timing_strikes >= 4 {
                 self.timing = None;
                 self.stats.gpu_ms = None;
                 crate::log_warn!("GPU timestamps unreliable on this device (gpu frame {avg_gpu:.0} ms vs rendered-frame interval {render_interval:.0} ms): timing off, adaptive resolution uses the frame interval");
@@ -2492,18 +2494,25 @@ impl Renderer {
                     best.min(1.0)
                 }
             }
-            // no timestamp queries: frame interval (vsync-bound, coarse)
+            // no timestamp queries: interval between *rendered* frames (vsync-bound, coarse; frames the
+            // limiter skipped do not count as cheap ones)
             None => {
                 if since < 4000.0 {
                     return;
                 }
-                if avg_frame > 18.5 { snap(s * 0.85) } else if avg_frame < 17.2 && s < 1.0 { snap(s + 0.05) } else { s }
+                if render_interval > (budget * 1.1).max(18.5) {
+                    snap(s * (budget.max(16.7) * 0.9 / render_interval).sqrt().min(0.85))
+                } else if render_interval < 17.2 && s < 1.0 {
+                    snap(s + 0.05)
+                } else {
+                    s
+                }
             }
         };
         if (next - s).abs() > 0.004 {
             self.settings.render_scale = next;
             self.adapt_last_change = now;
-            crate::log_info!("adaptive resolution: scale {:.2} -> {:.2} (gpu frame {:.1} ms, interval {:.1} ms, budget {:.1} ms)", s, next, avg_gpu, avg_frame, budget);
+            crate::log_info!("adaptive resolution: scale {:.2} -> {:.2} (gpu frame {:.1} ms, interval {:.1} ms, rendered every {:.1} ms, budget {:.1} ms)", s, next, avg_gpu, avg_frame, render_interval, budget);
         }
     }
 
@@ -2610,7 +2619,7 @@ impl Renderer {
         // up still shows up to 5 frames in flight and 30-90 ms of latency on a desktop. Only a real backlog
         // (latency well above the frame interval) skips, otherwise a smooth desktop drops frames.
         let backlog = lat > 150.0f32.max(6.0 * self.frame_interval_ms);
-        if max > 0 && (fl >= max + 6 || (fl >= max && backlog)) {
+        if max > 0 && (fl >= 64 || (fl >= max && backlog)) {
             let now = crate::log::now_ms();
             let since = *self.skip_since.get_or_insert(now);
             if now - since < 1000.0 {
@@ -2762,7 +2771,9 @@ impl Renderer {
                     center += *c / 8.0;
                 }
                 let need = corners.iter().map(|c| c.distance(center)).fold(0.0f32, f32::max);
-                let margin = if (k > 0 || split_on) && cache_on { 1.0 + shadow_margin } else { 1.0 };
+                // cascade 0 with the static cache: a wider margin, so walking re-fits it (and re-renders
+                // its static copy) less often
+                let margin = if k == 0 && split_on { 1.0 + (shadow_margin * 2.0).min(0.25) } else if k > 0 && cache_on { 1.0 + shadow_margin } else { 1.0 };
                 let r = (need * margin * 16.0).ceil() / 16.0;
                 let texel = 2.0 * r / shadow_size;
                 let mut c_ls = rot.transform_point3(center);

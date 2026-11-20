@@ -178,7 +178,7 @@ normal `cargo` output above it.
 - **Input lag on a GPU-bound device:** without a limit Chrome queues frames and the screen shows one that is
   up to a second old (desktop repro: 320vw canvas, 7 frames in flight, 1 s latency). `render {max_frames_in_flight}`
   (default 2) skips rendering a frame (simulation and input still run) while `gpu_latency_ms` > 6 frame intervals (min
-  150 ms) or `frames_in_flight` >= max + 6. Desktop Chrome resolves `onSubmittedWorkDone` late (up to 5 in flight,
+  150 ms) or `frames_in_flight` >= 64. Desktop Chrome resolves `onSubmittedWorkDone` late (up to 5 in flight,
   30-110 ms without any backlog), so tighter rules drop frames on a smooth desktop. It skips until
   the GPU catches up. `stats.render`: `frames_in_flight`, `gpu_latency_ms` (submit -> GPU done, about in-flight x GPU
   frame time), `frames_skipped`.
@@ -203,7 +203,7 @@ normal `cargo` output above it.
   / removed). `render {shadow_cache:false}` = old behaviour (A/B, debugging); render textures invalidate it.
   Test: `games/demo/tests/shadowcache.txt`.
   **Static shadow cache** (`render {shadow_static_cache}`, default on, GPU path): casters that moved or deformed in the
-  last 2 s are *dynamic* (cull.wgsl writes them into a second id list per pass). Each cascade keeps a copy with only
+  last 10 s are *dynamic* (cull.wgsl writes them into a second id list per pass). Each cascade keeps a copy with only
   the static casters; when only dynamic casters changed, the cascade keeps its matrix (cascade 0 gets the
   `shadow_margin` too), restores the texel rect where dynamic casters were and are (scissored frag_depth draw from the
   copy, not a full copy: WebGPU copies depth only whole) and draws just the dynamic casters. `stats.render`:

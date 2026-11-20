@@ -12,7 +12,8 @@ use wasm_bindgen::JsCast;
 use web_sys::*;
 
 pub(crate) const HDR_FORMAT: GpuTextureFormat = GpuTextureFormat::Rgba16float;
-const MAX_BLOOM_MIPS: u32 = 6;
+/// 5 mips from quarter resolution: the glow reaches far enough; every mip is two render passes.
+const MAX_BLOOM_MIPS: u32 = 5;
 /// Uniform slot stride (minUniformBufferOffsetAlignment).
 const SLOT: u32 = 256;
 

@@ -30,8 +30,9 @@ pub(super) const PASSES: usize = 2 * MAX_CASCADES;
 /// Shadow id lists: per pass q the static (or all) casters in list q, the dynamic ones in q + PASSES
 /// (static shadow cache: see `RenderSettings::shadow_static_cache`).
 pub(super) const SHADOW_LISTS: usize = 2 * PASSES;
-/// Frames without a change after which a dynamic caster counts as static again (2 s).
-const DYN_FRAMES: u64 = 120;
+/// Frames without a change after which a dynamic caster counts as static again (10 s: a hero or NPC
+/// that pauses briefly must not move into the static copy and out again, two full re-renders).
+const DYN_FRAMES: u64 = 600;
 const N_COUNTERS: usize = 12;
 
 #[repr(C)]
@@ -260,6 +261,8 @@ pub(super) struct GpuScene {
     pub shadow_reset: bool,
     /// Casters currently flagged dynamic (info.y bit 2), checked for expiry every frame.
     dyn_slots: Vec<u32>,
+    /// Slots whose change touched the static shadow copies this frame (`gpu_scene` shows them).
+    static_change_slots: Vec<u32>,
     /// Slots changed this frame and why (for `gpu_scene`: what keeps uploads / shadows busy).
     changed: Vec<(u32, &'static str)>,
     /// Triangles (LOD 0) and count of the main-view objects.
@@ -358,6 +361,7 @@ impl GpuScene {
             self.shadow_changes.push(o.sphere);
             if o.info[1] & 4 == 0 {
                 self.shadow_static_changes.push(o.sphere);
+                self.static_change_slots.push(i as u32);
             }
         }
     }
@@ -367,15 +371,18 @@ impl GpuScene {
         self.dyn_slots.iter().map(|&i| &self.infos[i as usize]).filter(|f| f.active && f.obj.info[1] & 6 == 6).map(|f| f.obj.sphere)
     }
 
-    /// A caster moved or deformed: it renders into the dynamic shadow list from now on (until it
-    /// stays still for `DYN_FRAMES`). Call after noting its old shape, so the static cache drops it.
+    /// A caster moved or deformed. Moved again within half a second, it renders into the dynamic
+    /// shadow list from now on (until it stays still for `DYN_FRAMES`); a single move (placement,
+    /// teleport) just updates the static copy. Call after noting its old shape, so the static cache
+    /// drops it.
     fn make_dynamic(&mut self, i: usize, frame: u64) {
         let inf = &mut self.infos[i];
         if inf.obj.info[1] & 2 == 0 {
             return;
         }
+        let recent = inf.changed_frame != 0 && frame.saturating_sub(inf.changed_frame) <= 30;
         inf.changed_frame = frame;
-        if inf.obj.info[1] & 4 == 0 {
+        if recent && inf.obj.info[1] & 4 == 0 {
             inf.obj.info[1] |= 4;
             self.dyn_slots.push(i as u32);
             self.dirty.push(i as u32);
@@ -427,6 +434,7 @@ impl GpuScene {
         let frame = pool.frame;
         self.shadow_changes.clear();
         self.shadow_static_changes.clear();
+        self.static_change_slots.clear();
         self.changed.clear();
         if self.shadows_on != Some(shadows_on) {
             self.shadows_on = Some(shadows_on);
@@ -484,8 +492,9 @@ impl GpuScene {
                 self.changed.push((s, "rebuilt"));
             }
         }
-        // dynamic casters that stayed still long enough go back into the static shadow cache
-        let mut k = 0;
+        // dynamic casters that stayed still long enough go back into the static shadow cache, in
+        // batches (every 30 frames: one re-render of the static copies instead of one per caster)
+        let mut k = if frame % 30 == 0 { 0 } else { self.dyn_slots.len() };
         while k < self.dyn_slots.len() {
             let i = self.dyn_slots[k] as usize;
             let inf = &self.infos[i];
@@ -898,6 +907,12 @@ impl GpuScene {
             "changed_count": self.changed.len(),
             "changed": changed,
             "shadow_changes": self.shadow_changes.len(),
+            "dynamic_casters": self.dyn_slots.len(),
+            "static_changes": self.static_change_slots.iter().take(24).map(|&s| {
+                let id = owner.get(s as usize).and_then(|o| hecs::Entity::from_bits(o.0)).map(|e| e.id());
+                let why = self.changed.iter().find(|c| c.0 == s).map(|c| c.1).unwrap_or("expired");
+                serde_json::json!({"slot": s, "entity": id, "why": why})
+            }).collect::<Vec<_>>(),
             "slots": self.infos.len(),
             "active": self.infos.iter().filter(|f| f.active).count(),
             "main_objects": self.main_count,
