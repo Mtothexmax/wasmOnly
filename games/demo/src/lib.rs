@@ -858,7 +858,7 @@ impl Screen<Data> for PlayScreen {
             ("reset", "Rebuild the tower and respawn the player."),
             ("teleport", "Move the player. args: {pos: [x,y,z]}"),
             ("shoot_at", "Fire a shot from the camera towards a world point. args: {target: [x,y,z]}"),
-            ("step_lab", "Character step-up lab: a low plate (edge at z -7) and `lanes` characters walking onto it from start distances spread over `start_spread` m. args: {height?: 0.152, radius?: 0.32, half_height?: 0.62, step_height?: 0.3, speed?: 3.2, lanes?: 16, start_spread?: 0.08}. Then step and call characters."),
+            ("step_lab", "Character step-up lab: a low plate (edge at z -7), or a flight of `steps` stairs `depth` m deep, and `lanes` characters walking onto it from start distances spread over `start_spread` m. args: {height?: 0.152, steps?: 1, depth?: 4, radius?: 0.32, half_height?: 0.62, step_height?: 0.3, speed?: 3.2, lanes?: 16, start_spread?: 0.08}. Then step and call characters."),
             ("control", "Switch control between the physics ball and the character-controller walker. args: {walker: bool, pos?: [x,y,z] (place the walker, capsule centre)}"),
         ]
     }
@@ -904,8 +904,16 @@ impl Screen<Data> for PlayScreen {
                 let width = lanes as f32 * spacing;
                 // plate along x (west of the terminal), top at y = h, near edge at z = -7
                 let x0 = -12.5;
-                let plate = ctx.spawn_cube("lab-plate", Vec3::new(x0 + width * 0.5, h * 0.5, -9.0), Vec3::new(width, h, 4.0), 0x8d99ae);
-                ctx.physics.add(&mut ctx.world, plate, RigidBodyBuilder::fixed(), ColliderBuilder::cuboid(width * 0.5, h * 0.5, 2.0));
+                // stairs: `steps` plates, each `h` higher and `depth` further on (the last one 4 m deep)
+                let steps = args.get("steps").and_then(|v| v.as_u64()).unwrap_or(1).max(1) as usize;
+                let depth = f("depth", 4.0);
+                for s in 0..steps {
+                    let top = h * (s + 1) as f32;
+                    let d = if s + 1 == steps { 4.0 } else { depth };
+                    let z_near = -7.0 - depth * s as f32;
+                    let plate = ctx.spawn_cube("lab-plate", Vec3::new(x0 + width * 0.5, top * 0.5, z_near - d * 0.5), Vec3::new(width, top, d), 0x8d99ae);
+                    ctx.physics.add(&mut ctx.world, plate, RigidBodyBuilder::fixed(), ColliderBuilder::cuboid(width * 0.5, top * 0.5, d * 0.5));
+                }
                 let mut ids = vec![];
                 for i in 0..lanes {
                     let z = -5.5 + i as f32 / lanes.max(2) as f32 * dz;

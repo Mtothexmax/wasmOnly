@@ -303,18 +303,27 @@ pub(crate) fn step_characters(ctx: &mut Ctx, dt: f32) {
             // (walls stay walls, ledges higher than step_height are not climbed)
             if side_h.length() >= want_h.length() * 0.5 && side_h.length() > got_h.length() + 1e-4 {
                 let p2 = Pose::from_parts(p1.translation + side.translation, Quat::IDENTITY);
-                let mut down = kcc.clone();
-                down.autostep = None;
-                down.snap_to_ground = Some(CharacterLength::Absolute(cc.step_height + cc.snap_to_ground.max(0.05)));
-                let mut drop_hits = vec![];
-                let drop = down.move_shape(dt, &qp, &*shape, &p2, Vec3::NEG_Y * (lift.translation.y + 0.01), |c| drop_hits.push(c));
-                let climbed = lift.translation.y + drop.translation.y;
-                if drop.grounded && climbed <= cc.step_height + 0.01 {
-                    moved.translation = lift.translation + side.translation + drop.translation;
-                    moved.grounded = true;
-                    moved.is_sliding_down_slope = false;
-                    hits.extend(drop_hits);
-                    cc.step_ups += 1;
+                // Drop straight down with a shape cast, not the KCC: on stairs shallower than the
+                // capsule is wide the round bottom lands on the next step's edge, and the KCC slid it
+                // off that corner back down (counted as a step-up, net progress zero: a permanent
+                // stall at the second step). Resting on the edge is fine; the next move rolls over it.
+                let reach = lift.translation.y + cc.step_height.max(cc.snap_to_ground).max(0.05);
+                let mut opts = crate::physics::rapier::parry::query::ShapeCastOptions::with_max_time_of_impact(reach);
+                opts.target_distance = 0.02;
+                if let Some((_, hit)) = qp.cast_shape(&p2, Vec3::NEG_Y, &*shape, opts) {
+                    // the side move may itself ride up a ledge's corner (round bottom): count it too
+                    let climbed = lift.translation.y + side.translation.y - hit.time_of_impact;
+                    // Where it lands must be at most step_height above the feet: resting on a
+                    // corner leaves the capsule centre low, so `climbed` alone let a chain of
+                    // step-ups scale ledges up to ~step_height + radius.
+                    let contact_y = p2.translation.y - hit.time_of_impact + hit.witness2.y;
+                    let feet = t.translation.y - cc.half_height - cc.radius;
+                    if climbed <= cc.step_height + 0.01 && climbed >= -cc.step_height && contact_y - feet <= cc.step_height + 0.01 {
+                        moved.translation = lift.translation + side.translation + Vec3::NEG_Y * hit.time_of_impact;
+                        moved.grounded = true;
+                        moved.is_sliding_down_slope = false;
+                        cc.step_ups += 1;
+                    }
                 }
             }
         }

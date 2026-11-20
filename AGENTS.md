@@ -81,8 +81,10 @@ normal `cargo` output above it.
 - **Characters:** `call characters` = every character controller (pos, grounded, velocity, jumps, held jump,
   wish, blocked time, touching entities); `{id, pos}` places one. "stuck"/"jump blocked" warnings in the log
   name the blocking entity. Low edges and seams between boxes (where rapier's autostep does not trigger) are
-  handled by a step-up retry (lift by `step_height`, move, drop); `step_ups` counts it. Step-up lab in the demo:
-  `step_lab {height, radius, half_height, step_height, speed, lanes, start_spread}` + `step` + `characters`.
+  handled by a step-up retry (lift by `step_height`, move, drop straight down with a shape cast, so on stairs shallower
+  than the capsule is wide it may rest on the next edge instead of sliding back); `step_ups` counts it. A landing more
+  than `step_height` above the feet is refused. Step-up lab in the demo: `step_lab {height, steps, depth, radius,
+  half_height, step_height, speed, lanes, start_spread}` + `step` + `characters` (stairs: `steps: 4, depth: 0.38`).
 - **Collision detection:** after every fixed step the touching collider pairs (solid contacts, sensor overlaps,
   character-controller touches from a probe a few cm around the capsule) are diffed against the last step:
   `ctx.physics.collision_events()` (this frame; `CollisionEvent {a, b, started, sensor, step}`), `entered(e)` /
@@ -125,6 +127,8 @@ normal `cargo` output above it.
   the scene, ambient; `sky {time: 18.5}` (turns the cycle on), `{cycle, day_length (min per day, 0 = still), mode:
   "atmosphere"|"gradient", clouds, stars, moon, skybox: url|null, skybox_blend, skybox_night_blend}`. The clock follows
   the simulation (`pause` + `step` are deterministic). Everything else via `render` (`sun_azimuth_deg`, ...).
+  The cycle overwrites `sun_intensity` and the ambient colours every frame; to dim the lighting indoors set
+  `render {sun_scale, ambient_scale}` (0..1, multiplied in after the cycle; the sky keeps its colours).
   Moving sun: shadows follow the light in `shadow_step_deg` steps (default 0.5) with a `shadow_fade_ms` cross-fade
   (default 400; a second shadow-map set is allocated on first use), so the texel grid does not re-snap every frame
   (shimmering edges). `shadow_step_deg: 0` = follow every frame.

@@ -53,6 +53,8 @@ auto_lod: false, ..Default::default() })`, `ctx.gltf_defaults.auto_lod = false`,
    `run tests/*.txt`. Put every check you will want again into a test script.
 2. **`debug_state`** returns everything a test needs (positions, flags, counters); game commands
    (`debug_command`) let tests set up situations (teleport, give item, open dialog).
+   A long `json!` in `debug_state` hits the macro recursion limit ("recursion limit reached while expanding"):
+   add `#![recursion_limit = "256"]` at the top of the game's `lib.rs`, or build it from smaller `json!` parts.
 3. **Input**: `input.key` = held; `input.key_pressed` = edge (inside `fixed_update` latched since the last
    step, so taps are never lost); actions like jump/fire: `input.key_down_or_pressed`. Every action gets a
    scripted short-tap test (`pause` → `key Space` → `step 12` → `expect ...`).

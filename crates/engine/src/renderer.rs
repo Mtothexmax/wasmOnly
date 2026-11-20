@@ -590,7 +590,8 @@ pub struct RenderSettings {
     /// Time of day in hours (0..24). With `day_cycle` it places sun + moon and drives the lighting.
     pub time_of_day: f32,
     /// Let `time_of_day` drive sun/moon direction, light colour and intensity, ambient and sky.
-    /// Overwrites `sun_dir`, `sun_color`, `sun_intensity`, `sky_color`, `ground_color`, `sky_zenith`, `sky_horizon`.
+    /// Overwrites `sun_dir`, `sun_color`, `sun_intensity`, `sky_color`, `ground_color`, `sky_zenith`, `sky_horizon`
+    /// (dim the lighting indoors with `sun_scale` / `ambient_scale`, which the cycle leaves alone).
     pub day_cycle: bool,
     /// Real-time minutes per 24 h of game time (0 = the clock stands still). Follows the simulation clock.
     pub day_length_minutes: f32,
@@ -603,6 +604,12 @@ pub struct RenderSettings {
     pub moon_intensity: f32,
     /// Brighten the image at night (exposure x up to 2.6).
     pub day_cycle_exposure: bool,
+    /// Multiplier on the directional light (sun or moon) as it reaches the shaders, applied after
+    /// the day cycle: dim it indoors (0..1) without touching the sky. Default 1.
+    pub sun_scale: f32,
+    /// Multiplier on the ambient light (`sky_color`, `ground_color`) as it reaches the shaders,
+    /// applied after the day cycle (indoors, caves). The sky itself keeps its colours. Default 1.
+    pub ambient_scale: f32,
     /// Lens flare when looking towards the sun (glow, starburst, coloured ghosts); 0 = off. Hidden
     /// by anything in front of the sun disk (objects, clouds).
     pub lens_flare: f32,
@@ -705,6 +712,8 @@ impl Default for RenderSettings {
             sun_azimuth_deg: 20.0,
             sun_max_elevation_deg: 60.0,
             daylight_intensity: 3.2,
+            sun_scale: 1.0,
+            ambient_scale: 1.0,
             moon_intensity: 1.0,
             day_cycle_exposure: true,
             lens_flare: 1.0,
@@ -2891,10 +2900,10 @@ impl Renderer {
             view_proj: view_proj.to_cols_array_2d(),
             cascades,
             camera_pos: cam_pos.extend(1.0).into(),
-            sun_dir: light.extend(s.sun_intensity).into(),
+            sun_dir: light.extend(s.sun_intensity * s.sun_scale.max(0.0)).into(),
             sun_color: s.sun_color.extend(1.0).into(),
-            sky_color: s.sky_color.extend(1.0).into(),
-            ground_color: s.ground_color.extend(1.0).into(),
+            sky_color: (s.sky_color * s.ambient_scale.max(0.0)).extend(1.0).into(),
+            ground_color: (s.ground_color * s.ambient_scale.max(0.0)).extend(1.0).into(),
             counts: [n_lights as u32, s.shadows as u32, s.debug_view, n_casc as u32],
             // near must match the projection (depth_jitter) or water depth would shift with it
             time: [shader_t, near * (1.0 + s.depth_jitter), far, 0.0],
