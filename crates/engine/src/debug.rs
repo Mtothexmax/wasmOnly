@@ -76,7 +76,8 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("raycast", "Physics ray cast. args: {origin, dir, max?: 1000}"),
     ("pick", "Entity under a canvas point (CSS px). args: {x, y, mesh?: true = test rendered meshes instead of physics colliders; also returns depth_ties (z-fighting partners)}"),
     ("ui", "HUD slot contents."),
-    ("zfight", "args: {radius?: m around the camera (use in big worlds)}. Find z-fighting: coplanar, same-facing, overlapping triangles of different entities (opaque/masked). args: {eps?: 0.002 plane distance, tolerance?: 0.002 overlap, limit?: 50}. Returns pair count and the worst pairs with entities, world point and screen position."),
+    ("bend", "Pushers that bend Material::bend geometry and GPU grass. args: {pushers?: [[x,y,z,radius], ...] (replaces; [] = none), material?: id, bend?: value (sets Material::bend)}. Returns pushers and every material with bend > 0."),
+    ("zfight", "args: {radius?: m around the camera or `center` (use in big worlds), center?: [x,y,z] (default radius 10), entity?: id|name|[...] (only pairs involving these and their children; a name matches every entity with it), exclude?: id|name|[...]}. Find z-fighting: coplanar, same-facing, overlapping triangles of different entities (opaque/masked). args: {eps?: 0.002 plane distance, tolerance?: 0.002 overlap, limit?: 50}. Returns pair count and the worst pairs with entities, world point and screen position."),
     ("debug_mode", "Debug mode (also the ` key): logs every key/mouse press and the camera pose once per second to logs/debug-*.log via the dev server, shows a badge. args: {on?: bool}. Returns file, line counts, last camera, last error."),
     ("audio", "Audio state: context state, sounds (ready/loading/failed, plays), active voices with 3D position, last 32 plays with sim step."),
     ("audio_play", "Play a sound by name. args: {sound, volume?: 1, pitch?: 1, pos?: [x,y,z], loop?, lowpass?: hz, highpass?: hz, bandpass?: [hz,q], echo?: [delay_s, feedback, mix?], reverb?: secs | [secs, mix], distort?: drive, pan?: -1..1, detune?: cents, bus?: sfx|voice|ambience|ui}. Returns the voice id."),
@@ -320,6 +321,41 @@ fn resolve_entity(ctx: &Ctx, v: &Value) -> Result<Entity, String> {
         Value::String(n) => entity_arg(ctx, &json!({ "name": n })),
         _ => entity_arg(ctx, &json!({ "id": v })),
     }
+}
+
+/// Entities named by `v` (id, name or an array of them; a name matches every entity with that
+/// name) plus all their descendants.
+fn entity_set(ctx: &Ctx, v: &Value) -> Result<Vec<Entity>, String> {
+    let items: Vec<&Value> = match v {
+        Value::Array(a) => a.iter().collect(),
+        _ => vec![v],
+    };
+    let mut roots = vec![];
+    for it in items {
+        match it {
+            Value::String(n) => {
+                let before = roots.len();
+                roots.extend(ctx.world.query::<(Entity, &crate::scene::Name)>().iter().filter(|(_, nm)| nm.0 == *n).map(|(e, _)| e));
+                if roots.len() == before {
+                    return Err(format!("no entity named '{n}'"));
+                }
+            }
+            _ => roots.push(resolve_entity(ctx, it)?),
+        }
+    }
+    let mut out = roots.clone();
+    for (e, _) in ctx.world.query::<(Entity, &crate::scene::Parent)>().iter() {
+        let mut cur = e;
+        for _ in 0..64 {
+            let Ok(p) = ctx.world.get::<&crate::scene::Parent>(cur).map(|p| p.0) else { break };
+            if roots.contains(&p) {
+                out.push(e);
+                break;
+            }
+            cur = p;
+        }
+    }
+    Ok(out)
 }
 
 fn entity_summary(ctx: &Ctx, e: Entity) -> Value {
@@ -643,6 +679,7 @@ pub(crate) fn handle<G: Game>(
                 .and_then(|v| v.as_u64())
                 .ok_or("missing 'value'")?;
             ctx.rng = crate::app::Rng(v.max(1));
+            ctx.particle_rng = crate::app::Rng((v ^ 0xD1B5_4A32_D192_ED03).max(1));
             Ok(json!({"seed": v}))
         }
         "input" => {
@@ -884,6 +921,26 @@ pub(crate) fn handle<G: Game>(
             }
             Ok(ctx.scenes.describe(&ctx.world))
         }
+        "bend" => {
+            if let Some(list) = a.get("pushers").and_then(|v| v.as_array()) {
+                let p: Vec<(Vec3, f32)> = list
+                    .iter()
+                    .filter_map(|q| {
+                        let q = q.as_array()?;
+                        let f = |i: usize| q.get(i).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                        Some((Vec3::new(f(0), f(1), f(2)), if q.len() > 3 { f(3) } else { 1.0 }))
+                    })
+                    .collect();
+                ctx.renderer.set_pushers(&p);
+            }
+            if let (Some(m), Some(b)) = (a.get("material").and_then(|v| v.as_u64()), a.get("bend").and_then(|v| v.as_f64())) {
+                ctx.renderer.material_mut(crate::renderer::MaterialId(m as u32)).ok_or("unknown material")?.bend = b as f32;
+            }
+            let mats: Vec<Value> = (0..ctx.renderer.material_count() as u32)
+                .filter_map(|i| ctx.renderer.material(crate::renderer::MaterialId(i)).filter(|m| m.bend > 0.0).map(|m| json!({"id": i, "name": m.name, "bend": m.bend})))
+                .collect();
+            Ok(json!({"pushers": ctx.renderer.pushers().iter().map(|(p, r)| json!([p.x, p.y, p.z, r])).collect::<Vec<_>>(), "max": crate::renderer::MAX_PUSHERS, "materials": mats}))
+        }
         "zfight" => {
             let eps = a.get("eps").and_then(|v| v.as_f64()).unwrap_or(0.002) as f32;
             let tol = a.get("tolerance").and_then(|v| v.as_f64()).unwrap_or(0.002) as f32;
@@ -891,11 +948,22 @@ pub(crate) fn handle<G: Game>(
             crate::scene::propagate_transforms(&mut ctx.world);
             let css = Vec2::new(ctx.canvas.client_width() as f32, ctx.canvas.client_height() as f32);
             // radius: only instances near the camera (big worlds: a full check takes seconds)
-            let near = a.get("radius").and_then(|v| v.as_f64()).and_then(|r| {
-                let cam = crate::scene::main_camera_pose(&ctx.world)?.w_axis.truncate();
-                Some((cam, r as f32))
-            });
-            Ok(crate::zfight::find_near(&ctx.world, &ctx.renderer, eps, tol, limit, ctx.renderer.last_view_proj, css, near))
+            let center = a.get("center").and_then(v3);
+            let radius = a.get("radius").and_then(|v| v.as_f64()).map(|r| r as f32);
+            let near = match (center, radius) {
+                (Some(c), r) => Some((c, r.unwrap_or(10.0))),
+                (None, Some(r)) => crate::scene::main_camera_pose(&ctx.world).map(|m| (m.w_axis.truncate(), r)),
+                (None, None) => None,
+            };
+            let involving = match a.get("entity") {
+                Some(v) => Some(entity_set(ctx, v)?),
+                None => None,
+            };
+            let exclude = match a.get("exclude") {
+                Some(v) => entity_set(ctx, v)?,
+                None => vec![],
+            };
+            Ok(crate::zfight::find_filtered(&ctx.world, &ctx.renderer, eps, tol, limit, ctx.renderer.last_view_proj, css, near, involving.as_deref(), &exclude))
         }
         "debug_mode" => {
             if let Some(on) = a.get("on").and_then(|v| v.as_bool()) {

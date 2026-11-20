@@ -145,11 +145,22 @@ pub fn find(world: &World, renderer: &Renderer, eps: f32, tolerance: f32, limit:
 /// Like [`find`], limited to instances whose bounds touch the sphere `near` (centre, radius).
 #[allow(clippy::too_many_arguments)]
 pub fn find_near(world: &World, renderer: &Renderer, eps: f32, tolerance: f32, limit: usize, view_proj: Mat4, css: Vec2, near: Option<(Vec3, f32)>) -> Value {
+    find_filtered(world, renderer, eps, tolerance, limit, view_proj, css, near, None, &[])
+}
+
+/// Like [`find_near`]; `involving`: report only pairs with at least one of these entities;
+/// `exclude`: leave these entities out of the check.
+#[allow(clippy::too_many_arguments)]
+pub fn find_filtered(world: &World, renderer: &Renderer, eps: f32, tolerance: f32, limit: usize, view_proj: Mat4, css: Vec2, near: Option<(Vec3, f32)>, involving: Option<&[Entity]>, exclude: &[Entity]) -> Value {
     let mut owners: Vec<Entity> = vec![];
     let mut tris: Vec<Tri> = vec![];
     let mut skipped: HashMap<&'static str, u32> = HashMap::new();
     for (e, g, mr) in world.query::<(Entity, &GlobalTransform, &MeshRenderer)>().iter() {
         let Some(mat) = renderer.material(mr.material) else { continue };
+        if exclude.contains(&e) {
+            *skipped.entry("excluded").or_default() += 1;
+            continue;
+        }
         if mat.alpha_mode == AlphaMode::Blend || mat.water {
             *skipped.entry("blended/water").or_default() += 1;
             continue;
@@ -210,6 +221,11 @@ pub fn find_near(world: &World, renderer: &Renderer, eps: f32, tolerance: f32, l
                 let v = ta.n.cross(u);
                 let to2 = |p: &[Vec3; 3]| p.map(|q| Vec2::new(q.dot(u), q.dot(v)));
                 if overlap_depth(&to2(&ta.p), &to2(&tb.p)) > tolerance {
+                    if let Some(inv) = involving {
+                        if !inv.contains(&owners[ta.owner as usize]) && !inv.contains(&owners[tb.owner as usize]) {
+                            continue;
+                        }
+                    }
                     let k = if ta.owner < tb.owner { (ta.owner, tb.owner) } else { (tb.owner, ta.owner) };
                     let centre = (ta.p[0] + ta.p[1] + ta.p[2] + tb.p[0] + tb.p[1] + tb.p[2]) / 6.0;
                     let entry = pairs.entry(k).or_insert((0, 0.0, Vec3::ZERO));

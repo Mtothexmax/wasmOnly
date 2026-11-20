@@ -149,6 +149,9 @@ pub struct Ctx {
     pub origin: glam::DVec3,
     pub time: Time,
     pub rng: Rng,
+    /// Seeds of particle emitters (`spawn_particles`), separate from `rng` so effects never shift
+    /// gameplay rolls. Reseeded together with `rng` by the `seed` command.
+    pub particle_rng: Rng,
     pub canvas: HtmlCanvasElement,
     pub(crate) models: ModelCache,
     pub(crate) me: Weak<RefCell<Ctx>>,
@@ -624,6 +627,7 @@ async fn start<G: Game>(game: G, mut config: crate::renderer::RenderConfig) -> R
             acc_physics: 0.0,
         },
         rng: Rng(0x9E37_79B9_7F4A_7C15),
+        particle_rng: Rng(0xD1B5_4A32_D192_ED03),
         canvas: canvas.clone(),
         models: ModelCache::default(),
         me: Weak::new(),

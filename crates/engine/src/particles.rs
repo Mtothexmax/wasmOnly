@@ -8,6 +8,12 @@
 //! ctx.spawn_particles("hit", point, burst);                 // despawns itself when done
 //! ```
 //!
+//! Seeds come from `ctx.particle_rng`, not `ctx.rng`: adding an emitter never shifts the game's
+//! random rolls. `spawn_particles_seeded` fixes the seed explicitly. `ParticleEmitter::layer` is the
+//! render layer (a camera draws it when bit `layer` is set in `Camera::layers`).
+//! One-shot presets (`Splash`) set `one_shot: true`; a continuous variant needs `one_shot: false`
+//! as well as a `rate`, or it despawns once its first particles die.
+//!
 //! AI API: `particles` lists emitters with live counts; `particles {preset, pos}` spawns one.
 
 use crate::app::{Ctx, Rng};
@@ -104,6 +110,8 @@ pub struct ParticleEmitter {
     pub one_shot: bool,
     /// Particles move with the emitter (true) or stay where they were emitted (false).
     pub local_space: bool,
+    /// Render layer 0..31 (like `MeshRenderer::layer`): drawn only by cameras with bit `layer` in `layers`.
+    pub layer: u8,
 }
 
 impl Default for ParticleEmitter {
@@ -137,6 +145,7 @@ impl ParticleEmitter {
             spin: 0.0,
             one_shot: false,
             local_space: false,
+            layer: 0,
         };
         match p {
             ParticlePreset::Fire => Self {
@@ -250,6 +259,7 @@ impl ParticleEmitter {
                 stretch: 0.12,
                 ..base
             },
+            // one-shot burst: `..preset(Splash)` with a rate also needs `one_shot: false`
             ParticlePreset::Splash => Self {
                 rate: 0.0,
                 burst: 40,
@@ -440,9 +450,12 @@ pub(crate) fn step_all(ctx: &mut Ctx, dt: f32) {
 }
 
 /// Instance data for drawing: (additive, alpha-blended sorted far -> near).
-pub(crate) fn collect(world: &World, cam: Vec3) -> (Vec<ParticleRaw>, Vec<ParticleRaw>) {
+pub(crate) fn collect(world: &World, cam: Vec3, layers: u32) -> (Vec<ParticleRaw>, Vec<ParticleRaw>) {
     let (mut add, mut alpha) = (vec![], vec![]);
     for ps in world.query::<&ParticleSystem>().iter() {
+        if layers & (1u32 << (ps.emitter.layer & 31)) == 0 {
+            continue;
+        }
         if ps.emitter.additive {
             ps.write(&mut add);
         } else {
@@ -456,8 +469,14 @@ pub(crate) fn collect(world: &World, cam: Vec3) -> (Vec<ParticleRaw>, Vec<Partic
 
 impl Ctx {
     /// Spawns a particle emitter at `pos`. Parent it (`Parent`) to make it follow an entity.
+    /// The seed comes from `ctx.particle_rng` (separate from `ctx.rng`, so game rolls stay put).
     pub fn spawn_particles(&mut self, name: &str, pos: Vec3, emitter: ParticleEmitter) -> Entity {
-        let seed = self.rng.next_u64();
+        let seed = self.particle_rng.next_u64();
+        self.spawn_particles_seeded(name, pos, emitter, seed)
+    }
+
+    /// [`Ctx::spawn_particles`] with an explicit seed (same seed = same particles).
+    pub fn spawn_particles_seeded(&mut self, name: &str, pos: Vec3, emitter: ParticleEmitter, seed: u64) -> Entity {
         self.world.spawn((Transform::from_translation(pos), Name(name.to_string()), ParticleSystem::new(emitter, seed)))
     }
 
@@ -471,7 +490,13 @@ impl Ctx {
             if let Some(b) = a["burst"].as_u64() {
                 em = em.burst(b as u32);
             }
-            let e = self.spawn_particles(name, pos, em);
+            if let Some(l) = a["layer"].as_u64() {
+                em.layer = l.min(31) as u8;
+            }
+            let e = match a["seed"].as_u64() {
+                Some(seed) => self.spawn_particles_seeded(name, pos, em, seed),
+                None => self.spawn_particles(name, pos, em),
+            };
             return Ok(json!({"id": e.id()}));
         }
         let list: Vec<serde_json::Value> = self

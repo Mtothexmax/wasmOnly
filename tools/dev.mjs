@@ -72,7 +72,16 @@ function copyDir(src, dst) {
   fs.mkdirSync(dst, { recursive: true });
   for (const e of fs.readdirSync(src, { withFileTypes: true })) {
     const s = path.join(src, e.name), d = path.join(dst, e.name);
-    e.isDirectory() ? copyDir(s, d) : fs.copyFileSync(s, d);
+    if (e.isDirectory()) { copyDir(s, d); continue; }
+    // unchanged files are skipped: a file being streamed (music) is locked on Windows (EBUSY)
+    const a = fs.statSync(s), b = fs.existsSync(d) ? fs.statSync(d) : null;
+    if (b && b.size === a.size && b.mtimeMs >= a.mtimeMs) continue;
+    try {
+      fs.copyFileSync(s, d);
+    } catch (err) {
+      if (err.code !== 'EBUSY' && err.code !== 'EPERM') throw err;
+      console.warn(`[dev] could not copy ${path.relative(PROJECT, s)} (${err.code}: in use); keeping the old copy`);
+    }
   }
 }
 

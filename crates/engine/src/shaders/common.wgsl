@@ -48,6 +48,29 @@ struct Globals {
     // scaled and offset per axis: one fixed matrix per pixel instead of a dynamically indexed one.
     cascade_scale: array<vec4f, 4>,
     cascade_offset: array<vec4f, 4>,
+    pushers: array<vec4f, 16>, // xyz = position, w = radius: bendable geometry leans away (`set_pushers`)
+    push: vec4f,               // x = pusher count
+}
+
+// Lean of a point `h` metres above its base `base` away from the pushers (xz offset grows with
+// h * strength, length kept: the point drops as it leans). Used by `Material::bend` and GPU grass.
+fn push_offset(base: vec3f, h: f32, strength: f32) -> vec3f {
+    var off = vec2f(0.0);
+    let n = min(u32(g.push.x), 16u);
+    for (var i = 0u; i < n; i++) {
+        let p = g.pushers[i];
+        let d = base.xz - p.xz;
+        let dist = length(d);
+        if (dist < p.w && abs(base.y - p.y) < p.w + h) {
+            let f = smoothstep(0.0, 1.0, 1.0 - dist / p.w);
+            off += select(vec2f(1.0, 0.0), d / max(dist, 1e-4), dist > 1e-4) * f;
+        }
+    }
+    let l = length(off);
+    if (l < 1e-4 || h <= 0.0) { return vec3f(0.0); }
+    let o = off / l * min(l, 1.0) * min(strength * h, 0.85 * h);
+    let drop = h - sqrt(max(h * h - dot(o, o), 0.0));
+    return vec3f(o.x, -drop, o.y);
 }
 
 struct Instance {

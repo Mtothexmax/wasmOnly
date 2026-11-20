@@ -105,6 +105,11 @@ fn vs_main(v: VsIn) -> VsOut {
     }
     var world = inst.model * vec4f(local, 1.0);
     var normal = (inst.normal * vec4f(v.normal, 0.0)).xyz;
+    // Material::bend: lean away from the pushers, growing with the height above the instance origin
+    if (inst.maps.w > 0.0 && inst.params.z >= 0.0 && inst.params.z < 2.5 && g.push.x > 0.0) {
+        let base = inst.model[3].xyz;
+        world = vec4f(world.xyz + push_offset(base, max(world.y - base.y, 0.0), inst.maps.w), 1.0);
+    }
     var uv = v.uv;
     if (inst.params.z > 2.5) { // water: Gerstner waves in world space; uv = undisplaced world xz
         uv = world.xz;
@@ -780,8 +785,15 @@ fn vs_grass(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) ->
     // wind + natural lean, growing with height²
     let time = grass.blade.w;
     let gust = sin(time * 1.7 + dot(p, vec2f(0.21, 0.17)) + r1 * 2.0) * 0.6 + sin(time * 3.1 + p.x * 0.5) * 0.25;
-    let bend = (grass.wind.xy * grass.wind.z * (0.5 + gust) + (vec2f(r1, r2) - 0.5) * 0.35) * t * t * h;
+    var bend = (grass.wind.xy * grass.wind.z * (0.5 + gust) + (vec2f(r1, r2) - 0.5) * 0.35) * t * t * h;
     let base = vec3f(p.x, terrain_h(p), p.y);
+    if (g.push.x > 0.0) { // pushers flatten blades around them
+        let pb = push_offset(base, h, 1.6).xz;
+        let lim = 0.85 * h;
+        bend = (bend + pb * t * t);
+        let bl = length(bend);
+        if (bl > lim) { bend = bend / bl * lim; }
+    }
     let world = base + across * side * width * 0.5 + vec3f(bend.x, h * t * (1.0 - 0.15 * length(bend) / max(h, 1e-3)), bend.y);
     o.clip = g.view_proj * vec4f(world, 1.0);
     o.world = world;

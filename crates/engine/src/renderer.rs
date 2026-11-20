@@ -229,7 +229,7 @@ fn classify(model: &Mat4, mr: &MeshRenderer, mat: &Material, shadows_on: bool) -
                 if mat.normal_texture.is_some() { mat.normal_scale } else { 0.0 },
                 if mat.height_texture.is_some() { mat.displacement } else { 0.0 },
                 if mat.height_texture.is_some() { mat.parallax } else { 0.0 },
-                0.0,
+                mat.bend.max(0.0),
             ]
         },
     };
@@ -348,6 +348,10 @@ pub struct Material {
     pub terrain_params: [f32; 4],
     /// Terrain: metres per texture tile for each layer.
     pub terrain_tiling: [f32; 4],
+    /// Lean away from the pushers (`Renderer::set_pushers`): horizontal offset per metre of height
+    /// above the instance origin at full push (1 = 45°, capped at 0.85). Tall grass, tufts, reeds,
+    /// bushes. Vertex shader only: no CPU upload per frame; shadows and culling bounds stay unbent.
+    pub bend: f32,
 }
 
 /// Transparency of a material (glTF semantics).
@@ -394,6 +398,7 @@ impl Default for Material {
             terrain: false,
             terrain_params: [0.0, 0.0, 1.0, 0.0],
             terrain_tiling: [6.0; 4],
+            bend: 0.0,
         }
     }
 }
@@ -871,7 +876,12 @@ struct Globals {
     /// Cascade k = cascade 0 scaled + offset per axis (same light rotation): xyz used.
     cascade_scale: [[f32; 4]; MAX_CASCADES],
     cascade_offset: [[f32; 4]; MAX_CASCADES],
+    pushers: [[f32; 4]; MAX_PUSHERS],
+    push: [f32; 4],
 }
+
+/// Pushers per frame (`Renderer::set_pushers`).
+pub const MAX_PUSHERS: usize = 16;
 
 /// Sky resources shared by every view: the atmosphere LUT (rendered per view), its sampler, the
 /// skybox image (1x1 dummy until `set_skybox`) and the LUT pipeline.
@@ -1104,6 +1114,8 @@ pub struct Renderer {
     pub builtin: Builtins,
     /// Matrices of the last rendered frame (for picking / world labels).
     pub last_view_proj: Mat4,
+    pushers: [[f32; 4]; MAX_PUSHERS],
+    push_count: u32,
 }
 
 fn js_err(e: JsValue) -> String {
@@ -1657,6 +1669,8 @@ impl Renderer {
                 default_material: MaterialId(0),
             },
             last_view_proj: Mat4::IDENTITY,
+            pushers: [[0.0; 4]; MAX_PUSHERS],
+            push_count: 0,
         };
         r.create_white_texture()?;
         r.flat_normal = Some(r.create_solid(GpuTextureFormat::Rgba8unorm, (0.5, 0.5, 1.0, 1.0), "flat-normal")?);
@@ -2391,6 +2405,11 @@ impl Renderer {
         MaterialId(self.materials.len() as u32 - 1)
     }
 
+    /// Number of materials (ids 0..count).
+    pub fn material_count(&self) -> usize {
+        self.materials.len()
+    }
+
     pub fn material(&self, id: MaterialId) -> Option<&Material> {
         self.materials.get(id.0 as usize)
     }
@@ -2627,6 +2646,21 @@ impl Renderer {
     }
 
     /// Camera (view, proj, position) of the main camera (`scene::main_camera`).
+    /// Positions that bend `Material::bend` geometry and GPU grass away from them this frame
+    /// (characters, a rolling ball): (world position, radius m). At most [`MAX_PUSHERS`]; the list
+    /// stays until set again, so call it every frame with the current positions (empty = none).
+    pub fn set_pushers(&mut self, pushers: &[(Vec3, f32)]) {
+        self.push_count = pushers.len().min(MAX_PUSHERS) as u32;
+        for (i, (p, r)) in pushers.iter().take(MAX_PUSHERS).enumerate() {
+            self.pushers[i] = [p.x, p.y, p.z, r.max(0.01)];
+        }
+    }
+
+    /// Current pushers (position, radius).
+    pub fn pushers(&self) -> Vec<(Vec3, f32)> {
+        self.pushers[..self.push_count as usize].iter().map(|p| (Vec3::new(p[0], p[1], p[2]), p[3])).collect()
+    }
+
     pub fn camera_matrices(&self, world: &World) -> Option<(Mat4, Mat4, Vec3)> {
         let aspect = self.size.0 as f32 / self.size.1.max(1) as f32;
         let e = crate::scene::main_camera(world)?;
@@ -2940,6 +2974,8 @@ impl Renderer {
             shadow_sets: [(cur_set * MAX_CASCADES as u32) as f32, ((cur_set ^ 1) * MAX_CASCADES as u32) as f32, prev_weight, 0.0],
             cascade_scale: [[1.0, 1.0, 1.0, 0.0]; MAX_CASCADES],
             cascade_offset: [[0.0; 4]; MAX_CASCADES],
+            pushers: self.pushers,
+            push: [self.push_count as f32, 0.0, 0.0, 0.0],
         };
 
         // --- Instances -------------------------------------------------------------------------
@@ -3456,7 +3492,7 @@ impl Renderer {
         stats.grass_blades = grass_blades;
         // particles: upload [additive ++ alpha-blended]
         let (n_add, n_alpha) = if self.settings.particles {
-            let (add, alpha) = crate::particles::collect(world, cam_pos);
+            let (add, alpha) = crate::particles::collect(world, cam_pos, layers);
             let n = (add.len() + alpha.len()) as u32;
             if n > 0 {
                 self.post.ensure_particles(&self.device, n)?;

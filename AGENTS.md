@@ -53,6 +53,8 @@ normal `cargo` output above it.
   1. debug builds run the z-fighting test automatically after scene changes and log a warning
      (shows up in `bridge reload` / `check`);
   2. `call zfight` — geometric test, names both entities, world point, screen position; must be `"pairs": 0`;
+     `{center:[x,y,z], radius}` checks around a point (top-down cameras), `{entity: id|name|[..]}` only pairs
+     involving those (a name matches every entity with it, children included), `{exclude}` leaves some out;
   3. `node tools/bridge.mjs flicker --out heat.png` — screenshots with flipped draw order and shifted depth
      mapping (pixels stay put), returns flickering regions + entity + `depth_ties` partner; catches what the
      geometric test skips (water, displaced meshes). `check --flicker` includes it.
@@ -71,7 +73,16 @@ normal `cargo` output above it.
   version + time), `{op:"set", slot, data}`, `{op:"delete", slot}`, `{op:"blobs"}`.
 - **Animation:** `call animation` lists animators; `{id}` = clips, playing clip + time, crossfade, deformers
   (skinned, joints, morph weights); `{id, play, fade?, speed?, looped?}`, `{id, morph, weight}`.
-- **Particles:** `call particles` = emitters + live counts; `{preset, pos, burst?}` spawns one.
+- **Particles:** `call particles` = emitters + live counts; `{preset, pos, burst?, layer?, seed?}` spawns one.
+  Seeds come from `ctx.particle_rng`, never `ctx.rng`, so adding an emitter does not shift game rolls;
+  `ctx.spawn_particles_seeded(.., seed)` fixes one. `ParticleEmitter::layer` = render layer (like
+  `MeshRenderer::layer`: a battle camera without that bit does not draw it). `Splash` is a one-shot burst:
+  `..preset(Splash)` with a `rate` also needs `one_shot: false`, or it despawns once the first drops die.
+- **Bending vegetation:** `Material::bend` (0 = off; ~0.5..1.5) makes instances lean away from *pushers* in the vertex
+  shader, growing with height above the instance origin (the mesh origin must be at its foot); GPU grass flattens
+  around them too. Per frame: `ctx.renderer.set_pushers(&[(player_pos, 0.8), ..])` (max 16, world position + radius).
+  No per-frame upload; shadows and culling bounds stay unbent; don't `batch_static` bendable props (the batch has one
+  origin). API: `bend {pushers: [[x,y,z,r],..], material, bend}`. Test: `games/demo/tests/vegetation.txt`.
 - **Render textures:** `call render_texture` = size, camera, renders, export url; `{id, render:true}`, `{id, export:true}`.
 - **Several cameras:** the canvas renders from the camera with `MainCamera` (`ctx.set_main_camera(e)`), else the first
   `Camera`; audio listener, streaming, terrain, ocean and debug tools follow it (`scene::main_camera(world)`). `call

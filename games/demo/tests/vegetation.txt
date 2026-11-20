@@ -1,0 +1,32 @@
+# Bend pushers, particle layers/seeds, filtered z-fighting checks.
+#   node tools/bridge.mjs run games/demo/tests/vegetation.txt
+
+reload
+screen play
+pause
+
+# bend: pushers are set and listed
+call bend {"pushers":[[0,0.3,0,1.2],[2,0.3,0,0.8]]}
+expect bend.pushers.length == 2
+call bend {"pushers":[]}
+expect bend.pushers.length == 0
+
+# particles: an emitter on layer 5 is not drawn by a camera without that layer
+call particles {"preset":"fire","pos":[0,2,0],"layer":5,"seed":42,"name":"layered"}
+step 30
+frames 2
+call camera {"layers":0}
+frames 3
+expect stats.render.particles == 0
+call camera {"layers":4294967295}
+frames 3
+expect stats.render.particles > 0
+
+# zfight: centre + entity filter
+call spawn {"shape":"cube","pos":[30,0.5,30],"name":"zA","body":"none"}
+call spawn {"shape":"cube","pos":[30.3,0.5,30],"name":"zB","body":"none"}
+step 1
+expect zfight{"center":[30,0.5,30],"radius":3}.pairs == 1
+expect zfight{"entity":"zA","exclude":"zB"}.pairs == 0
+call despawn {"name":"zA"}
+call despawn {"name":"zB"}
