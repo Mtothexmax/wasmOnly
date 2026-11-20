@@ -102,6 +102,44 @@ fn fs_up(i: VsOut) -> @location(0) vec4f {
 // Output encoding: true = write gamma-encoded values to a non-sRGB target (canvas); false = write
 // linear values into an sRGB target (render-to-texture), the hardware encodes.
 override GAMMA_OUT: bool = true;
+// Scene rendered without MSAA (RenderConfig::msaa = 1): FXAA on the HDR input.
+override FXAA: bool = false;
+
+// Luma for edge detection on HDR input: compressed so bright highlights do not dominate.
+fn aa_luma(c: vec3f) -> f32 {
+    return dot(c / (1.0 + c), vec3f(0.299, 0.587, 0.114));
+}
+
+fn tap(uv: vec2f) -> vec3f {
+    return textureSampleLevel(src, samp, uv, 0.0).rgb;
+}
+
+// FXAA (Lottes, the 'console' variant): 4 diagonal neighbours find edge contrast and direction,
+// then 2 or 4 taps along the edge. Pixels without contrast return the centre sample unchanged.
+fn fxaa(uv: vec2f, m: vec4f) -> vec4f {
+    let t = 1.0 / vec2f(textureDimensions(src));
+    let l_nw = aa_luma(tap(uv + vec2f(-t.x, -t.y)));
+    let l_ne = aa_luma(tap(uv + vec2f(t.x, -t.y)));
+    let l_sw = aa_luma(tap(uv + vec2f(-t.x, t.y)));
+    let l_se = aa_luma(tap(uv + vec2f(t.x, t.y)));
+    let l_m = aa_luma(m.rgb);
+    let l_min = min(l_m, min(min(l_nw, l_ne), min(l_sw, l_se)));
+    let l_max = max(l_m, max(max(l_nw, l_ne), max(l_sw, l_se)));
+    if (l_max - l_min < max(0.0312, l_max * 0.125)) {
+        return m;
+    }
+    var dir = vec2f(-((l_nw + l_ne) - (l_sw + l_se)), (l_nw + l_sw) - (l_ne + l_se));
+    let reduce = max((l_nw + l_ne + l_sw + l_se) * 0.03125, 1.0 / 128.0);
+    let rcp = 1.0 / (min(abs(dir.x), abs(dir.y)) + reduce);
+    dir = clamp(dir * rcp, vec2f(-8.0), vec2f(8.0)) * t;
+    let a = 0.5 * (tap(uv + dir * (1.0 / 3.0 - 0.5)) + tap(uv + dir * (2.0 / 3.0 - 0.5)));
+    let b = a * 0.5 + 0.25 * (tap(uv - dir * 0.5) + tap(uv + dir * 0.5));
+    let l_b = aa_luma(b);
+    if (l_b < l_min || l_b > l_max) {
+        return vec4f(a, m.a);
+    }
+    return vec4f(b, m.a);
+}
 
 fn aces(x: vec3f) -> vec3f {
     let a = 2.51; let b = 0.03; let c = 2.43; let d = 0.59; let e = 0.14;
@@ -218,7 +256,10 @@ const RING = array<vec2f, 8>(
 fn fs_composite(i: CompOut) -> @location(0) vec4f {
     // the scene may be rendered smaller than the canvas (render_scale): sample by UV, read depth at
     // the matching scene pixel
-    let raw = textureSampleLevel(src, samp, i.uv, 0.0);
+    var raw = textureSampleLevel(src, samp, i.uv, 0.0);
+    if (FXAA) {
+        raw = fxaa(i.uv, raw);
+    }
     let s = vec4f(sanitize(raw.rgb), select(0.0, raw.a, raw.a == raw.a));
     let px = vec2i(i.uv * vec2f(textureDimensions(depth_tex)));
     let mask = clamp(s.a, 0.0, 1.0);

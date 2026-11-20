@@ -32,6 +32,9 @@ pub(crate) struct PostTargets {
     pub msaa: GpuTextureView,
     pub depth: GpuTextureView,
     pub hdr_view: GpuTextureView,
+    /// Textures behind `hdr_view` / `scene_color` (copies without MSAA).
+    pub hdr_tex: GpuTexture,
+    pub scene_tex: GpuTexture,
     /// The resolved opaque scene for water refraction/reflection (resolve target of the opaque pass
     /// while water is visible; the blend pass samples it and resolves the final image into `hdr_view`).
     pub scene_color: GpuTextureView,
@@ -117,7 +120,7 @@ fn alpha_blend() -> GpuBlendState {
 
 impl Post {
     pub fn new(device: &GpuDevice, canvas_format: GpuTextureFormat, common: &str, bgl0: &GpuBindGroupLayout, bgl0_t: &GpuBindGroupLayout, depth_format: GpuTextureFormat, samples: u32) -> Result<Self, String> {
-        let module = device.create_shader_module(&GpuShaderModuleDescriptor::new(include_str!("shaders/post.wgsl")));
+        let module = device.create_shader_module(&GpuShaderModuleDescriptor::new(&crate::renderer::ms_src(include_str!("shaders/post.wgsl"), samples)));
         module.set_label("post.wgsl");
         crate::debug::report_shader_errors(&module, "post.wgsl");
 
@@ -152,7 +155,7 @@ impl Post {
         let depth_e = GpuBindGroupLayoutEntry::new(4, frag);
         let dt = GpuTextureBindingLayout::new();
         dt.set_sample_type(GpuTextureSampleType::Depth);
-        dt.set_multisampled(true);
+        dt.set_multisampled(samples > 1);
         depth_e.set_texture(&dt);
         let bgl_comp = device.create_bind_group_layout(&GpuBindGroupLayoutDescriptor::new(&[tex_v(0, both), samp_v(both), uni_v(both), tex(3), depth_e])).map_err(js_err)?;
         let layout_post = device.create_pipeline_layout(&GpuPipelineLayoutDescriptor::new(&[JsNullable::wrap(bgl_post.clone())]));
@@ -166,13 +169,15 @@ impl Post {
         let gamma = |on: bool| {
             let o = js_sys::Object::new();
             let _ = js_sys::Reflect::set(&o, &"GAMMA_OUT".into(), &(if on { 1.0 } else { 0.0 }).into());
+            // no MSAA: anti-aliasing in the composite
+            let _ = js_sys::Reflect::set(&o, &"FXAA".into(), &(if samples == 1 { 1.0 } else { 0.0 }).into());
             o
         };
         let composite_canvas = fullscreen(device, &module, &layout_comp, "vs_composite", "fs_composite", GpuColorTargetState::new(canvas_format), Some(&gamma(true)), "composite")?;
         let composite_srgb = fullscreen(device, &module, &layout_comp, "vs_composite", "fs_composite", GpuColorTargetState::new(GpuTextureFormat::Rgba8unormSrgb), Some(&gamma(false)), "composite-rtt")?;
 
         // --- sky (opaque pass, far plane, depth less-equal) ---
-        let sky_src = format!("{common}\n{}", include_str!("shaders/sky.wgsl"));
+        let sky_src = crate::renderer::ms_src(&format!("{common}\n{}", include_str!("shaders/sky.wgsl")), samples);
         let sky_module = device.create_shader_module(&GpuShaderModuleDescriptor::new(&sky_src));
         sky_module.set_label("sky.wgsl");
         crate::debug::report_shader_errors(&sky_module, "sky.wgsl");
@@ -194,7 +199,7 @@ impl Post {
         let sky_pipeline = device.create_render_pipeline(&d).map_err(js_err)?;
 
         // --- particles (blend pass) ---
-        let p_src = format!("{common}\n{}", include_str!("shaders/particles.wgsl"));
+        let p_src = crate::renderer::ms_src(&format!("{common}\n{}", include_str!("shaders/particles.wgsl")), samples);
         let p_module = device.create_shader_module(&GpuShaderModuleDescriptor::new(&p_src));
         p_module.set_label("particles.wgsl");
         crate::debug::report_shader_errors(&p_module, "particles.wgsl");
@@ -288,12 +293,17 @@ impl Post {
             device.create_texture(&d).map_err(js_err)
         };
         use gpu_texture_usage::{RENDER_ATTACHMENT as RA, TEXTURE_BINDING as TB};
-        let msaa = tex(HDR_FORMAT, (w, h), RA, samples, 1, "msaa-hdr")?.create_view().map_err(js_err)?;
+        use gpu_texture_usage::{COPY_DST as CD, COPY_SRC as CS};
         // TEXTURE_BINDING: Hi-Z, water and particles read this frame's depth
         let depth = tex(depth_format, (w, h), RA | TB, samples, 1, "msaa-depth")?.create_view().map_err(js_err)?;
-        let hdr_view = tex(HDR_FORMAT, (w, h), RA | TB, 1, 1, "hdr")?.create_view().map_err(js_err)?;
-        // resolve target of the opaque pass when water is visible (refraction + SSR read it)
-        let scene_color = tex(HDR_FORMAT, (w, h), RA | TB, 1, 1, "scene-color")?.create_view().map_err(js_err)?;
+        let hdr_tex = tex(HDR_FORMAT, (w, h), RA | TB | CD, 1, 1, "hdr")?;
+        let hdr_view = hdr_tex.create_view().map_err(js_err)?;
+        // without MSAA the scene is drawn straight into the HDR target
+        let msaa = if samples > 1 { tex(HDR_FORMAT, (w, h), RA, samples, 1, "msaa-hdr")?.create_view().map_err(js_err)? } else { hdr_view.clone() };
+        // resolve target of the opaque pass when water is visible (refraction + SSR read it); without
+        // MSAA the opaque pass draws into it and it is copied into the HDR target
+        let scene_tex = tex(HDR_FORMAT, (w, h), RA | TB | CS, 1, 1, "scene-color")?;
+        let scene_color = scene_tex.create_view().map_err(js_err)?;
         // bloom starts at quarter resolution (the glow is soft; half res costs ~4x for no visible gain)
         let (bw, bh) = ((w / 4).max(1), (h / 4).max(1));
         let mips = (32 - bw.min(bh).max(1).leading_zeros()).saturating_sub(2).clamp(1, MAX_BLOOM_MIPS);
@@ -337,7 +347,7 @@ impl Post {
             ],
             &self.bgl_comp,
         ));
-        Ok(PostTargets { size: (w, h), msaa, depth, hdr_view, scene_color, bloom_views, bloom_sizes, params, pre_group, down_groups, up_groups, comp_group })
+        Ok(PostTargets { size: (w, h), msaa, depth, hdr_view, hdr_tex, scene_tex, scene_color, bloom_views, bloom_sizes, params, pre_group, down_groups, up_groups, comp_group })
     }
 
     /// Bloom + composite into `output` (canvas texture or an sRGB render texture).

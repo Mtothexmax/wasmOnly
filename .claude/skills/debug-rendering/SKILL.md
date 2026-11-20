@@ -24,8 +24,10 @@ Works on desktop, nothing 3D on a phone, log says `CreateGraphicsPipelines faile
 the driver rejects the generated SPIR-V (not a WGSL error). Those pipelines are skipped (overlay names
 them). Bisect on the device with `node tools/gpu-probe.mjs <page.html>` (variants with stubbed functions).
 Known cause (PowerVR B-Series, Android 10): a WGSL helper that samples a texture (shadow taps, fog's sky
-LUT) called from *several* places in one entry point. Keep one call site per sampling helper (loop over the
-taps, compute the colour in branches and call `finish` once).
+LUT) called from *several* places in one entry point. Keep one call site per sampling helper (compute the
+colour in branches and call `finish` once; cascade blending is dithered so each pixel samples one cascade).
+Do not wrap the call in a loop and do not copy a dynamically indexed `mat4` into a `var`: both cost 2.5-3.5 ms
+of the opaque pass at 4K on an RDNA3 iGPU (measure shader variants with `render {shadows:false}` as the floor).
 
 Textures from images (glTF) black on a device, no error: `node tools/gpu-probe-tex.mjs <page.html>` uploads a known
 colour every way and reads each stage back. PowerVR B-Series: `copyExternalImageToTexture` writes zeros. The renderer

@@ -48,7 +48,7 @@ pub(crate) struct GpuCull {
 }
 
 impl GpuCull {
-    pub fn new(device: &GpuDevice) -> Result<Self, String> {
+    pub fn new(device: &GpuDevice, samples: u32) -> Result<Self, String> {
         let cs = gpu_shader_stage::COMPUTE;
         let tex_entry = |binding: u32, sample: GpuTextureSampleType, ms: bool| {
             let e = GpuBindGroupLayoutEntry::new(binding, cs);
@@ -71,7 +71,7 @@ impl GpuCull {
                 .map_err(js_err)
         };
         let init_bgl = bgl(&[
-            tex_entry(0, GpuTextureSampleType::Depth, true),
+            tex_entry(0, GpuTextureSampleType::Depth, samples > 1),
             storage_tex_entry(1),
         ])?;
         let down_bgl = bgl(&[
@@ -85,7 +85,9 @@ impl GpuCull {
             crate::debug::report_shader_errors(&m, label);
             m
         };
-        let hiz_mod = module(include_str!("shaders/hiz.wgsl"), "hiz.wgsl");
+        // without MSAA: plain depth texture, one sample per pixel
+        let hiz_src = if samples > 1 { include_str!("shaders/hiz.wgsl").to_string() } else { crate::renderer::ms_src(include_str!("shaders/hiz.wgsl"), 1).replace("s < 4;", "s < 1;") };
+        let hiz_mod = module(&hiz_src, "hiz.wgsl");
         let pipeline = |m: &GpuShaderModule, entry: &str, layout: &GpuBindGroupLayout| {
             let pl = device.create_pipeline_layout(&GpuPipelineLayoutDescriptor::new(&[
                 JsNullable::wrap(layout.clone()),

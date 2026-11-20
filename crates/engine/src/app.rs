@@ -518,15 +518,20 @@ pub(crate) fn fixed_step<G: Game>(ctx: &mut Ctx, game: &mut G) {
 
 /// Entry point: call from your `#[wasm_bindgen(start)]` function.
 pub fn run<G: Game>(game: G) {
+    run_with(game, crate::renderer::RenderConfig::default());
+}
+
+/// Like [`run`] with startup render options (MSAA). The page URL overrides them: `?msaa=1|4`.
+pub fn run_with<G: Game>(game: G, config: crate::renderer::RenderConfig) {
     debug::install_panic_hook();
     wasm_bindgen_futures::spawn_local(async move {
-        if let Err(e) = start(game).await {
+        if let Err(e) = start(game, config).await {
             debug::fatal(&e);
         }
     });
 }
 
-async fn start<G: Game>(game: G) -> Result<(), String> {
+async fn start<G: Game>(game: G, mut config: crate::renderer::RenderConfig) -> Result<(), String> {
     let window = web_sys::window().ok_or("no window")?;
     let document = window.document().ok_or("no document")?;
     let canvas: HtmlCanvasElement = match document.get_element_by_id("canvas") {
@@ -555,7 +560,12 @@ async fn start<G: Game>(game: G) -> Result<(), String> {
         Ok(_) => {}
         Err(e) => crate::log_warn!("job system: thread pool failed, running serial: {e}"),
     }
-    let renderer = Renderer::new(&canvas).await?;
+    let query = js_sys::Reflect::get(&window, &"location".into()).and_then(|l| js_sys::Reflect::get(&l, &"search".into())).ok().and_then(|s| s.as_string()).unwrap_or_default();
+    if let Some(m) = query.trim_start_matches('?').split('&').find_map(|kv| kv.strip_prefix("msaa=")).and_then(|v| v.parse::<u32>().ok()) {
+        config.msaa = m;
+    }
+    let renderer = Renderer::new(&canvas, config).await?;
+    log_info!("render config: {}x MSAA{}", renderer.samples, if renderer.samples == 1 { " (FXAA)" } else { "" });
     debug::install_gpu_error_handler(&renderer.device);
     let ui = Ui::new(&document).map_err(|e| format!("ui: {e:?}"))?;
 

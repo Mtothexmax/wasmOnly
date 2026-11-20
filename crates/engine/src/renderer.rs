@@ -16,7 +16,27 @@ use std::rc::Rc;
 use wasm_bindgen::{JsCast, JsValue};
 use web_sys::*;
 
-const SAMPLES: u32 = 4;
+/// Startup render options (`engine::run_with`; the page URL can override: `?msaa=1`).
+#[derive(Clone, Copy, Debug)]
+pub struct RenderConfig {
+    /// Samples per pixel of the scene targets: 4 = 4x MSAA (default), 1 = no MSAA, FXAA in the
+    /// composite instead (much less bandwidth: integrated and mobile GPUs).
+    pub msaa: u32,
+}
+
+impl Default for RenderConfig {
+    fn default() -> Self {
+        RenderConfig { msaa: 4 }
+    }
+}
+
+/// Shader source for `samples` per pixel: the scene depth is a plain depth texture without MSAA.
+pub(crate) fn ms_src(src: &str, samples: u32) -> String {
+    if samples > 1 {
+        return src.to_string();
+    }
+    src.replace("texture_depth_multisampled_2d", "texture_depth_2d")
+}
 const DEPTH_FORMAT: GpuTextureFormat = GpuTextureFormat::Depth24plus;
 const SHADOW_FORMAT: GpuTextureFormat = GpuTextureFormat::Depth32float;
 /// First automatic LOD switch at this multiple of the mesh's bounding radius (see `add_mesh_with_lods`).
@@ -949,6 +969,8 @@ pub struct Renderer {
     shadow_sampler: GpuSampler,
     color_sampler: GpuSampler,
     msaa_view: Option<GpuTextureView>,
+    /// Samples per pixel of the scene targets (`RenderConfig::msaa`): 4, or 1 (FXAA).
+    pub samples: u32,
     depth_view: Option<GpuTextureView>,
     /// Desktop GPU (AMD / NVIDIA / Intel: immediate-mode rendering) as opposed to a tile-based
     /// mobile GPU. Decides the load/store ops of the multisampled scene target: clears and discards
@@ -1016,7 +1038,8 @@ fn nums(v: &[u32]) -> Vec<Number> {
 }
 
 impl Renderer {
-    pub async fn new(canvas: &HtmlCanvasElement) -> Result<Renderer, String> {
+    pub async fn new(canvas: &HtmlCanvasElement, config: RenderConfig) -> Result<Renderer, String> {
+        let samples = if config.msaa <= 1 { 1 } else { 4 };
         let gpu: Gpu = window().ok_or("no window")?.navigator().gpu();
         if gpu.is_undefined() {
             return Err(
@@ -1174,7 +1197,7 @@ impl Renderer {
         let depth_entry = GpuBindGroupLayoutEntry::new(5, gpu_shader_stage::FRAGMENT);
         let dt = GpuTextureBindingLayout::new();
         dt.set_sample_type(GpuTextureSampleType::Depth);
-        dt.set_multisampled(true);
+        dt.set_multisampled(samples > 1);
         depth_entry.set_texture(&dt);
         let st2 = GpuBindGroupLayoutEntry::new(2, gpu_shader_stage::FRAGMENT);
         let t2 = GpuTextureBindingLayout::new();
@@ -1205,7 +1228,7 @@ impl Renderer {
 
         // --- Shaders & pipelines ----------------------------------------------------------
         let common = include_str!("shaders/common.wgsl");
-        let pbr_src = format!("{common}\n{}", include_str!("shaders/pbr.wgsl"));
+        let pbr_src = ms_src(&format!("{common}\n{}", include_str!("shaders/pbr.wgsl")), samples);
         let shadow_src = format!("{common}\n{}", include_str!("shaders/shadow.wgsl"));
         let pbr_module = device.create_shader_module(&GpuShaderModuleDescriptor::new(&pbr_src));
         pbr_module.set_label("pbr.wgsl");
@@ -1264,7 +1287,7 @@ impl Renderer {
             ds.set_depth_write_enabled(!blend); // blended surfaces test but do not write depth
             ds.set_depth_compare(GpuCompareFunction::Less);
             let ms = GpuMultisampleState::new();
-            ms.set_count(SAMPLES);
+            ms.set_count(samples);
             let desc = GpuRenderPipelineDescriptor::new(if blend { &layout_t } else { &layout }, &vs);
             let label = match (kind, two_sided) {
                 (0, false) => "pbr-opaque",
@@ -1410,7 +1433,7 @@ impl Renderer {
             &sky_gpu,
         );
         let cull = if gpu_cull_supported {
-            match crate::gpu_cull::GpuCull::new(&device).and_then(|c| Ok((c, gpu_scene::SceneGpu::new(&device)?))) {
+            match crate::gpu_cull::GpuCull::new(&device, samples).and_then(|c| Ok((c, gpu_scene::SceneGpu::new(&device)?))) {
                 Ok(c) => Some(c),
                 Err(e) => {
                     crate::log_warn!("GPU culling disabled: {e}");
@@ -1429,8 +1452,8 @@ impl Renderer {
             None => (None, None),
         };
 
-        let post = crate::post::Post::new(&device, format, common, &bgl0, &bgl0_t, DEPTH_FORMAT, SAMPLES)?;
-        let grass = crate::vegetation::GrassRenderer::new(&device, &pbr_module, &bgl0, &bgl_mat, crate::post::HDR_FORMAT, DEPTH_FORMAT, SAMPLES)?;
+        let post = crate::post::Post::new(&device, format, common, &bgl0, &bgl0_t, DEPTH_FORMAT, samples)?;
+        let grass = crate::vegetation::GrassRenderer::new(&device, &pbr_module, &bgl0, &bgl_mat, crate::post::HDR_FORMAT, DEPTH_FORMAT, samples)?;
         let timing = if timing_supported {
             crate::gpu_timing::GpuTiming::new(&device).map_err(|e| crate::log_warn!("GPU timing disabled: {e}")).ok()
         } else {
@@ -1492,6 +1515,7 @@ impl Renderer {
             shadow_sampler,
             color_sampler,
             msaa_view: None,
+            samples,
             depth_view: None,
             post,
             grass,
@@ -2211,7 +2235,7 @@ impl Renderer {
         vd.set_mip_level_count(1);
         let view0 = tex.create_view_with_descriptor(&vd).map_err(js_err)?;
         let texture = self.push_texture_view(&full, TexInfo { tex: Some(tex.clone()), label: label.into(), width: w, height: h, mips, uploads: 0, linear: false });
-        let targets = self.post.targets(&self.device, w, h, DEPTH_FORMAT, SAMPLES, label)?;
+        let targets = self.post.targets(&self.device, w, h, DEPTH_FORMAT, self.samples, label)?;
         self.rtts.push(crate::render_texture::RenderTexture {
             size: (w, h),
             texture,
@@ -2433,7 +2457,7 @@ impl Renderer {
             return;
         }
         self.size = (w, h);
-        match self.post.targets(&self.device, w, h, DEPTH_FORMAT, SAMPLES, "canvas") {
+        match self.post.targets(&self.device, w, h, DEPTH_FORMAT, self.samples, "canvas") {
             Ok(t) => {
                 self.msaa_view = Some(t.msaa.clone());
                 self.depth_view = Some(t.depth.clone());
@@ -3559,8 +3583,13 @@ impl Renderer {
         let skip_blend = blend_runs.is_empty() && n_add + n_alpha == 0 && !has_water;
         // --- Opaque pass (indirect on the GPU path); keeps colour + depth for the blend pass ---
         {
-            let att = GpuRenderPassColorAttachment::new_with_gpu_texture_view(GpuLoadOp::Clear, GpuStoreOp::Store, &msaa);
-            if skip_blend {
+            // without MSAA: the scene is drawn straight into the HDR target (into scene_color while
+            // water samples it, copied into the HDR target before the blend pass)
+            let single = self.samples == 1;
+            let opaque_target = if single && has_water { &scene_color } else { &msaa };
+            let att = GpuRenderPassColorAttachment::new_with_gpu_texture_view(GpuLoadOp::Clear, GpuStoreOp::Store, opaque_target);
+            if single {
+            } else if skip_blend {
                 att.set_resolve_target_gpu_texture_view(&hdr_view);
                 if !self.immediate_gpu {
                     att.set_store_op(GpuStoreOp::Discard);
@@ -3660,10 +3689,22 @@ impl Renderer {
 
         // --- Blend pass: back to front, depth read-only *and* bound as a texture (water) -----
         if !skip_blend {
+            let single = self.samples == 1;
+            if single && has_water {
+                // the opaque scene went into scene_color (water reads it): continue in the HDR target
+                let t = match rtt { None => self.targets.as_ref(), Some(i) => Some(&self.rtts[i].targets) };
+                if let Some(t) = t {
+                    let src = GpuTexelCopyTextureInfo::new(&t.scene_tex);
+                    let dst = GpuTexelCopyTextureInfo::new(&t.hdr_tex);
+                    encoder.copy_texture_to_texture_with_u32_sequence(&src, &dst, &nums(&[t.size.0.max(1), t.size.1.max(1)])).map_err(js_err)?;
+                }
+            }
             // immediate-mode GPUs keep the samples (free there) so the next opaque pass can skip its clear
-            let store = if self.immediate_gpu { GpuStoreOp::Store } else { GpuStoreOp::Discard };
+            let store = if self.immediate_gpu || single { GpuStoreOp::Store } else { GpuStoreOp::Discard };
             let att = GpuRenderPassColorAttachment::new_with_gpu_texture_view(GpuLoadOp::Load, store, &msaa);
-            att.set_resolve_target_gpu_texture_view(&hdr_view);
+            if !single {
+                att.set_resolve_target_gpu_texture_view(&hdr_view);
+            }
             let datt = GpuRenderPassDepthStencilAttachment::new_with_gpu_texture_view(&depth);
             datt.set_depth_read_only(true);
             let desc = GpuRenderPassDescriptor::new(&[JsNullable::wrap(att)]);

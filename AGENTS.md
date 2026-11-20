@@ -107,6 +107,10 @@ normal `cargo` output above it.
   fixed-step poses (`crate::interp`, `call interpolation {on}`, opt out per entity with `NoInterpolation`). Check
   smoothness with `call trace '{"id":N,"frames":300}'` then `call trace` -> `speed_jitter_pct` (a few % = smooth),
   frames with 0 / 2+ steps. A high fps number can hide hitches: look at `perf` `frame_ms.max` / `missed_frames_pct`.
+- **Anti-aliasing:** 4x MSAA by default; `engine::run_with(game, RenderConfig { msaa: 1 })` (or the page URL
+  `?msaa=1|4`, for A/B without a rebuild) renders without MSAA and runs FXAA in the composite: far less bandwidth on
+  integrated/mobile GPUs (Brickhollow at 2400x1350 on a Radeon 780M: 74 -> 97 fps uncapped). The log says
+  `render config: 1x MSAA (FXAA)`.
 - **Resolution:** `render {render_scale}` (0.25..1; the canvas backing store has the scene size too, the browser scales it), `auto_resolution` (default on) adapts it to
   `frame_budget_ms` of whole-frame GPU time (`gpu_ms.frame`); every change reallocates the targets (a 20-35 ms
   hitch at 4K), so it jumps once to a scale that fits and changes at most every 4 s; `stats.render` has `width/height` (scene) and `canvas`.
