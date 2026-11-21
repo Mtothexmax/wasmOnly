@@ -1,0 +1,43 @@
+# Fading a static caster (opacity only) keeps its full shadow: the static shadow cache must not
+# re-render while the opacity changes (it did every frame of a fade: a phone hitch).
+#   node tools/bridge.mjs run games/demo/tests/fadeshadow.txt
+reload
+screen play
+wait 1500
+pause
+call sky {"cycle":false}
+call render {"particles":false}
+frames 40
+expect stats.render.shadow_static_rendered == 0
+call set {"name":"tree.glb","opacity":0.9}
+frames 1
+expect stats.render.shadow_static_rendered == 0
+call set {"name":"tree.glb","opacity":0.75}
+frames 1
+expect stats.render.shadow_static_rendered == 0
+call set {"name":"tree.glb","opacity":0.6}
+frames 1
+expect stats.render.shadow_static_rendered == 0
+call set {"name":"tree.glb","opacity":0.45}
+frames 1
+expect stats.render.shadow_static_rendered == 0
+call set {"name":"tree.glb","opacity":0.3}
+frames 1
+expect stats.render.shadow_static_rendered == 0
+# solid fade path switch: same shadow
+call render {"solid_fade":true}
+call set {"name":"tree.glb","opacity":0.25}
+frames 1
+expect stats.render.shadow_static_rendered == 0
+call set {"name":"tree.glb","opacity":0.5}
+frames 1
+expect stats.render.shadow_static_rendered == 0
+# back to opaque: the caster returns to its own slot, still the same shadow
+call set {"name":"tree.glb","opacity":1}
+frames 1
+expect stats.render.shadow_static_rendered == 0
+frames 2
+expect stats.render.shadow_static_rendered == 0
+call render {"solid_fade":false,"particles":true}
+call sky {"cycle":true,"time":15.5}
+resume

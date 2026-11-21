@@ -368,6 +368,14 @@ impl GpuScene {
         }
     }
 
+    /// What slot `i` (and its shadow-only slot) casts: (sphere, shadow groups, static) as bits.
+    fn caster_sig(&self, i: usize) -> Option<([u32; 4], [u32; LEVELS], bool)> {
+        let casting = |k: usize| self.infos.get(k).filter(|f| f.active && f.obj.info[1] & 2 != 0).map(|f| (f.obj.sphere.map(f32::to_bits), f.obj.sgroups, f.obj.info[1] & 4 == 0));
+        let inf = self.infos.get(i)?;
+        let ss = inf.shadow_slot;
+        casting(i).or_else(|| if ss != NONE { casting(ss as usize) } else { None })
+    }
+
     fn note_shadow(&mut self, i: usize) {
         let o = &self.infos[i].obj;
         if o.info[1] & 2 != 0 {
@@ -457,6 +465,7 @@ impl GpuScene {
         }
         for (ent, g, mr, lod) in world.query::<(hecs::Entity, &GlobalTransform, &MeshRenderer, Option<&Lod>)>().iter() {
             let ek = ent.to_bits().get();
+            let mut opacity_only = false;
             let mv = mesh_version(meshes, mr, lod);
             let mat_v = mat_ver.get(mr.material.0 as usize).copied().unwrap_or(0);
             if let Some(&s) = pool.slot_of.get(&(ek, false)) {
@@ -467,6 +476,16 @@ impl GpuScene {
                         && inf.material == mr.material.0
                         && inf.mat_ver == mat_v
                         && inf.opacity == mr.opacity.to_bits()
+                        && inf.cast == mr.cast_shadows
+                        && inf.layer == mr.layer
+                        && LodKey::matches(&inf.lod, lod);
+                    opacity_only = !same_inputs
+                        && inf.model == g.0
+                        && inf.mesh_ver == mv
+                        && inf.epoch == self.epoch
+                        && inf.mesh == mr.mesh.0
+                        && inf.material == mr.material.0
+                        && inf.mat_ver == mat_v
                         && inf.cast == mr.cast_shadows
                         && inf.layer == mr.layer
                         && LodKey::matches(&inf.lod, lod);
@@ -503,8 +522,19 @@ impl GpuScene {
                     }
                 }
             }
-            self.note_why = "rebuilt";
+            self.note_why = if opacity_only { "opacity" } else { "rebuilt" };
+            // a fade (opacity only) keeps the full shadow: same casting geometry, possibly from the
+            // faded entity's own shadow slot now. Its notes would only re-render cached shadow maps.
+            let marks = (self.shadow_changes.len(), self.shadow_static_changes.len(), self.static_change_slots.len());
+            let before = opacity_only.then(|| pool.slot_of.get(&(ek, false)).map(|&s| self.caster_sig(s as usize))).flatten();
             self.rebuild(ek, &g.0, mr, lod, mv, mat_v, pool, materials, meshes, shadows_on, frame);
+            if let (Some(b), Some(&s)) = (before, pool.slot_of.get(&(ek, false))) {
+                if self.caster_sig(s as usize) == b {
+                    self.shadow_changes.truncate(marks.0);
+                    self.shadow_static_changes.truncate(marks.1);
+                    self.static_change_slots.truncate(marks.2);
+                }
+            }
             if let Some(&s) = pool.slot_of.get(&(ek, false)) {
                 self.changed.push((s, "rebuilt"));
             }
