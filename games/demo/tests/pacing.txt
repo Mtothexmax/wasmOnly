@@ -1,0 +1,19 @@
+# Frame cap on a whole divisor of the display refresh, ambient specular setting.
+#   node tools/bridge.mjs run games/demo/tests/pacing.txt
+
+reload
+screen play
+frames 40
+expect stats.time.frame_interval == 1
+expect stats.time.refresh_hz > 20
+call render {"max_fps": 1}
+frames 60
+expect stats.time.frame_interval >= 2
+call render {"max_fps": 0}
+frames 10
+expect stats.time.frame_interval == 1
+
+call render {"ambient_specular": 0.8}
+expect render.ambient_specular ~= 0.8
+frames 3
+call render {"ambient_specular": 0}

@@ -379,6 +379,7 @@ fn shade(i: VsOut, front: bool, d: Deriv, face_n: vec3f) -> Surface {
     // a flat pane; keeps the up tilt of foliage normals, which flipping turned black).
     let nn = safe_normal(i.normal, vec3f(0.0, 1.0, 0.0));
     var n = select(nn, normalize(nn - 2.0 * dot(nn, face_n) * face_n), !front);
+    let n_geo = n; // before normal mapping (horizon occlusion of the ambient specular)
     let v = normalize(g.camera_pos.xyz - i.world);
     let tbn = cotangent_frame(n, d);
 
@@ -433,9 +434,26 @@ fn shade(i: VsOut, front: bool, d: Deriv, face_n: vec3f) -> Surface {
         color += cluster_lights(i.clip, i.world, n, v, albedo, metallic, rough);
         let hemi = mix(g.ground_color.rgb, g.sky_color.rgb, n.y * 0.5 + 0.5);
         color += hemi * albedo * (1.0 - metallic * 0.6);
+        if (g.push.w > 0.0) { color += ambient_specular(n, n_geo, v, albedo, metallic, rough) * g.push.w; }
         if (!is_terrain) { color += inst.emissive_metallic.rgb; }
     }
     return Surface(vec4f(finish(color, i.world), alpha), n, shadow);
+}
+
+// render.ambient_specular: the hemisphere (ground -> sky colour) seen in the reflection direction,
+// weighted by Karis' analytic split-sum environment BRDF (F0 0.04 for dielectrics, albedo for
+// metals): a fresnel rim and sky sheen outside the sun's highlight that fades with roughness.
+// Reflections that point below the geometric surface are occluded.
+fn ambient_specular(n: vec3f, n_geo: vec3f, v: vec3f, albedo: vec3f, metallic: f32, rough: f32) -> vec3f {
+    let r = reflect(-v, n);
+    let env = mix(g.ground_color.rgb, g.sky_color.rgb, smoothstep(-0.3, 0.3, r.y));
+    let nv = max(dot(n, v), 1e-4);
+    let c = rough * vec4f(-1.0, -0.0275, -0.572, 0.022) + vec4f(1.0, 0.0425, 1.04, -0.04);
+    let a004 = min(c.x * c.x, exp2(-9.28 * nv)) * c.x + c.y;
+    let ab = vec2f(-1.04, 1.04) * a004 + c.zw;
+    let f0 = mix(vec3f(0.04), albedo, metallic);
+    let horizon = clamp(1.0 + 1.5 * dot(r, n_geo), 0.0, 1.0);
+    return env * (f0 * ab.x + ab.y) * horizon * horizon;
 }
 
 fn debug_out(s: Surface) -> vec4f {

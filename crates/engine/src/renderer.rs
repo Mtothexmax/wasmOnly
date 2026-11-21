@@ -553,6 +553,13 @@ pub struct RenderSettings {
     /// latency (`stats.render.gpu_latency_ms`) stays under 6 frame intervals (min 150 ms); 64 frames are the hard cap (an uncapped desktop keeps
     /// many cheap frames in flight without a real backlog). 0 = no limit.
     pub max_frames_in_flight: u32,
+    /// Frame cap (0 = off): frames are drawn on every Nth display refresh, N the smallest whole
+    /// divisor that keeps the rate at or below `max_fps` (45 on 90 Hz = every 2nd, 30 on 60 Hz = every
+    /// 2nd, 45 on 120 Hz = every 3rd = 40). Phase-locked to the measured refresh, so a device that
+    /// almost makes the full rate shows an even cadence instead of 1/2/1 vsync judder. The skipped
+    /// refreshes run nothing (simulation catches up with fixed steps, drawn interpolated).
+    /// `stats.time`: `refresh_hz`, `frame_interval`.
+    pub max_fps: f32,
     /// World-space offset added to the camera position (flicker detection: tiny shifts between
     /// screenshots reveal z-fighting and shimmering).
     pub camera_jitter: Vec3,
@@ -615,6 +622,10 @@ pub struct RenderSettings {
     /// Multiplier on the ambient light (`sky_color`, `ground_color`) as it reaches the shaders,
     /// applied after the day cycle (indoors, caves). The sky itself keeps its colours. Default 1.
     pub ambient_scale: f32,
+    /// Ambient specular on lit opaque materials (0..1, default 0 = diffuse-only ambient): the
+    /// ambient sky/ground colours reflected with a split-sum fresnel, fading with roughness. Shiny
+    /// plastic (roughness ~0.2) gets its rim and sky sheen outside the sun's highlight.
+    pub ambient_specular: f32,
     /// Lens flare when looking towards the sun (glow, starburst, coloured ghosts); 0 = off. Hidden
     /// by anything in front of the sun disk (objects, clouds).
     pub lens_flare: f32,
@@ -692,6 +703,7 @@ impl Default for RenderSettings {
             occlusion_min_triangles: 100_000,
             occlusion_min_ratio: 0.08,
             max_frames_in_flight: 2,
+            max_fps: 0.0,
             camera_jitter: Vec3::ZERO,
             freeze_time: false,
             depth_jitter: 0.0,
@@ -719,6 +731,7 @@ impl Default for RenderSettings {
             daylight_intensity: 3.2,
             sun_scale: 1.0,
             ambient_scale: 1.0,
+            ambient_specular: 0.0,
             moon_intensity: 1.0,
             day_cycle_exposure: true,
             lens_flare: 1.0,
@@ -2978,7 +2991,7 @@ impl Renderer {
             push: {
                 // the GPU grass wind also sways Material::bend geometry (strength 0 = still)
                 let w = self.grass.settings.wind;
-                [self.push_count as f32, w[0] * w[2], w[1] * w[2], 0.0]
+                [self.push_count as f32, w[0] * w[2], w[1] * w[2], s.ambient_specular.max(0.0)]
             },
         };
 

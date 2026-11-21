@@ -93,6 +93,10 @@ pub struct Time {
     pub(crate) live_scene: Option<u32>,
     #[serde(skip)]
     live_acc: f32,
+    /// Display refresh rate measured from requestAnimationFrame (median of recent intervals).
+    pub refresh_hz: f32,
+    /// Frames are drawn on every Nth refresh (`render {max_fps}`; 1 = every refresh).
+    pub frame_interval: u32,
     /// CPU milliseconds per engine phase (smoothed): where a frame's CPU time goes.
     pub phases: Phases,
     #[serde(skip)]
@@ -521,6 +525,49 @@ impl Ctx {
     }
 }
 
+/// Frame cap: measures the display refresh from every rAF callback and lets a frame through on
+/// every `interval`-th refresh, counted from the last drawn frame (rounded, so callback jitter
+/// does not slip a refresh; a late frame restarts the count from where it was drawn).
+#[derive(Default)]
+struct Pacer {
+    raw: std::collections::VecDeque<f64>,
+    prev: Option<f64>,
+    vsync_ms: f64,
+    interval: u32,
+}
+
+impl Pacer {
+    fn due(&mut self, ts: f64, last_drawn: Option<f64>, max_fps: f32) -> bool {
+        if let Some(p) = self.prev {
+            let d = ts - p;
+            if d > 2.0 && d < 100.0 {
+                self.raw.push_back(d);
+                if self.raw.len() > 31 {
+                    self.raw.pop_front();
+                }
+                let mut s: Vec<f64> = self.raw.iter().copied().collect();
+                s.sort_by(f64::total_cmp);
+                self.vsync_ms = s[s.len() / 2];
+            }
+        }
+        self.prev = Some(ts);
+        self.interval = if max_fps > 0.0 && self.vsync_ms > 0.0 && self.raw.len() >= 8 {
+            // smallest whole divisor whose rate stays at or below max_fps (2 % tolerance)
+            ((1000.0 / max_fps as f64) / self.vsync_ms - 0.02).ceil().max(1.0) as u32
+        } else {
+            1
+        };
+        match last_drawn {
+            Some(l) if self.interval > 1 => ((ts - l) / self.vsync_ms).round() as u32 >= self.interval,
+            _ => true,
+        }
+    }
+
+    fn refresh_hz(&self) -> f32 {
+        if self.vsync_ms > 0.0 { (1000.0 / self.vsync_ms) as f32 } else { 0.0 }
+    }
+}
+
 /// Runs one fixed simulation step (game logic, then physics).
 pub(crate) fn fixed_step<G: Game>(ctx: &mut Ctx, game: &mut G) {
     let t0 = log::now_ms();
@@ -634,6 +681,8 @@ async fn start<G: Game>(game: G, mut config: crate::renderer::RenderConfig) -> R
             held: false,
             live_scene: None,
             live_acc: 0.0,
+            refresh_hz: 0.0,
+            frame_interval: 1,
             phases: Phases::default(),
             accumulator: 0.0,
             acc_game_fixed: 0.0,
@@ -667,7 +716,16 @@ async fn start<G: Game>(game: G, mut config: crate::renderer::RenderConfig) -> R
     let f: Rc<RefCell<Option<Closure<dyn FnMut(f64)>>>> = Rc::new(RefCell::new(None));
     let g = f.clone();
     let mut last_ts: Option<f64> = None;
+    let mut pacer = Pacer::default();
     *g.borrow_mut() = Some(Closure::new(move |ts: f64| {
+        let max_fps = ctx.borrow().renderer.settings.max_fps;
+        if !pacer.due(ts, last_ts, max_fps) {
+            // skipped refresh (frame cap): nothing runs, the next drawn frame catches up
+            if let Some(cb) = f.borrow().as_ref() {
+                let _ = web_sys::window().unwrap().request_animation_frame(cb.as_ref().unchecked_ref());
+            }
+            return;
+        }
         let dt = last_ts
             .map(|l| ((ts - l) / 1000.0) as f32)
             .unwrap_or(0.0)
@@ -675,6 +733,8 @@ async fn start<G: Game>(game: G, mut config: crate::renderer::RenderConfig) -> R
         last_ts = Some(ts);
         {
             let mut c = ctx.borrow_mut();
+            c.time.refresh_hz = pacer.refresh_hz();
+            c.time.frame_interval = pacer.interval;
             let mut gm = game.borrow_mut();
             frame(&mut c, &mut *gm, dt);
         }

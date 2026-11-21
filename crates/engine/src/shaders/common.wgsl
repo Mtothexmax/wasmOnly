@@ -49,7 +49,7 @@ struct Globals {
     cascade_scale: array<vec4f, 4>,
     cascade_offset: array<vec4f, 4>,
     pushers: array<vec4f, 16>, // xyz = position, w = radius: bendable geometry leans away (`set_pushers`)
-    push: vec4f,               // x = pusher count, yz = wind (xz direction * strength) for Material::bend
+    push: vec4f,               // x = pusher count, yz = wind (xz direction * strength) for Material::bend, w = ambient specular
 }
 
 // Lean of a point `h` metres above its base `base` away from the pushers (xz offset grows with

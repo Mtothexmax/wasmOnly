@@ -183,10 +183,14 @@ export async function perf(s, opts = {}) {
   }
   const sample = await s.eval(`new Promise(res => {
     const dts = [], cpu = [], ph = [], gpu = [];
-    let last = performance.now(); const end = last + ${ms};
+    let last = performance.now(), lastFrame = -1, raf = 0; const end = last + ${ms};
     const f = (t) => {
-      dts.push(t - last); last = t;
+      // count only refreshes the engine drew (a frame cap, render {max_fps}, skips the others)
       const st = engine.call('stats').result;
+      raf++;
+      if (st.time.frame === lastFrame) { if (t < end) requestAnimationFrame(f); return; }
+      lastFrame = st.time.frame;
+      dts.push(t - last); last = t;
       cpu.push(st.time.frame_ms); ph.push(st.time.phases); if (st.render.gpu_ms) gpu.push(st.render.gpu_ms);
       if (t < end) requestAnimationFrame(f); else res({ dts: dts.slice(1), cpu, ph, gpu, st,
         dpr: devicePixelRatio, css: [innerWidth, innerHeight], focus: document.hasFocus(), visible: document.visibilityState });

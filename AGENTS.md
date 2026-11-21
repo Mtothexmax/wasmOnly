@@ -223,6 +223,15 @@ normal `cargo` output above it.
   (smooth / gpu-bound / cpu-bound / stutter). `--profile [--top 40]` adds a CDP CPU profile (`top_self` functions).
   Live values: `stats.time.phases`, `stats.render.gpu_ms`. When the *user* sees low fps, ask them to press ` while
   it happens: debug mode writes a `"kind":"perf"` line per second (p50/p95/max, slow frames, phases, GPU) into the log.
+- **Frame cap / even cadence:** `render {max_fps}` (0 = off) draws on every Nth display refresh, N the smallest whole
+  divisor keeping the rate <= max_fps (45 on 90 Hz = every 2nd, 30 on 60 Hz = every 2nd, 45 on 120 Hz = 40). It is
+  phase-locked to the refresh measured from rAF, so a device that *almost* makes the full rate (frames alternating 1/2
+  vsyncs = judder, high `speed_jitter_pct`) gets an even cadence. Skipped refreshes run nothing; the simulation catches
+  up in fixed steps and is drawn interpolated. `stats.time.refresh_hz`, `frame_interval`; `bridge perf` counts only drawn
+  frames. Test: `games/demo/tests/pacing.txt`.
+- **Plastic / glossy look:** `render {ambient_specular: 0..1}` (default 0) adds the ambient sky/ground colours reflected
+  with a split-sum fresnel (F0 0.04, albedo for metals) on lit opaque materials, fading with roughness and occluded
+  below the surface's horizon: rims and sky sheen outside the sun's highlight (roughness ~0.2 reads as plastic).
 - **Input lag on a GPU-bound device:** without a limit Chrome queues frames and the screen shows one that is
   up to a second old (desktop repro: 320vw canvas, 7 frames in flight, 1 s latency). `render {max_frames_in_flight}`
   (default 2) skips rendering a frame (simulation and input still run) while `gpu_latency_ms` > 6 frame intervals (min
