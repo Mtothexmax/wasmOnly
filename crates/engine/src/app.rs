@@ -78,7 +78,22 @@ pub struct Time {
     /// Simulated seconds (step * fixed_dt).
     pub sim_time: f64,
     pub frame: u64,
+    /// Seconds this frame advanced the simulation clock. With the frame cap active
+    /// (`frame_interval` > 1) or `lock_fixed_to_frames` it is the number of display refreshes since
+    /// the last drawn frame times the measured refresh interval, so rAF jitter cannot shift steps.
     pub frame_dt: f32,
+    /// The raw requestAnimationFrame delta of this frame (seconds), for stats.
+    pub frame_dt_raw: f32,
+    /// Sets `fixed_dt` every frame so a whole number of steps fits each drawn frame:
+    /// `fixed_dt = frame_time / k`, `k` the smallest count keeping steps at most `nominal_fixed_dt` long
+    /// (45.9 fps on 91.7 Hz: 2 steps of 10.9 ms). Everything moved in `fixed_update` (bone angles,
+    /// plain transforms) then moves the same amount every drawn frame. Off by default: the step length
+    /// follows the display, so a 120 Hz display without a cap simulates at 120 Hz.
+    pub lock_fixed_to_frames: bool,
+    /// Longest step `lock_fixed_to_frames` may pick (default 1/60 s).
+    pub nominal_fixed_dt: f32,
+    /// Fixed steps per drawn frame chosen by `lock_fixed_to_frames` (0 = lock off).
+    pub steps_per_frame: u32,
     pub fps: f32,
     pub frame_ms: f32,
     pub time_scale: f32,
@@ -587,7 +602,7 @@ pub(crate) fn fixed_step<G: Game>(ctx: &mut Ctx, game: &mut G) {
     ctx.time.acc_game_fixed += (t1 - t0) as f32;
     ctx.time.acc_physics += (t2 - t1) as f32;
     ctx.time.step += 1;
-    ctx.time.sim_time = ctx.time.step as f64 * dt as f64;
+    ctx.time.sim_time += dt as f64;
     log::set_step(ctx.time.step);
 }
 
@@ -670,6 +685,10 @@ async fn start<G: Game>(game: G, mut config: crate::renderer::RenderConfig) -> R
         origin: glam::DVec3::ZERO,
         time: Time {
             fixed_dt: 1.0 / 60.0,
+            frame_dt_raw: 0.0,
+            lock_fixed_to_frames: false,
+            nominal_fixed_dt: 1.0 / 60.0,
+            steps_per_frame: 0,
             step: 0,
             sim_time: 0.0,
             frame: 0,
@@ -726,15 +745,31 @@ async fn start<G: Game>(game: G, mut config: crate::renderer::RenderConfig) -> R
             }
             return;
         }
-        let dt = last_ts
-            .map(|l| ((ts - l) / 1000.0) as f32)
-            .unwrap_or(0.0)
-            .clamp(0.0, 0.25);
+        let raw = last_ts.map(|l| ((ts - l) / 1000.0) as f32).unwrap_or(0.0).clamp(0.0, 0.25);
+        let lock = ctx.borrow().time.lock_fixed_to_frames;
+        // capped or locked: whole refreshes x the measured vsync (rAF jitter cannot slip a step)
+        let dt = match last_ts {
+            Some(l) if (pacer.interval > 1 || lock) && pacer.vsync_ms > 0.0 => {
+                let r = ((ts - l) / pacer.vsync_ms).round().max(1.0);
+                ((r * pacer.vsync_ms / 1000.0) as f32).clamp(0.0, 0.25)
+            }
+            _ => raw,
+        };
         last_ts = Some(ts);
         {
             let mut c = ctx.borrow_mut();
             c.time.refresh_hz = pacer.refresh_hz();
             c.time.frame_interval = pacer.interval;
+            c.time.frame_dt_raw = raw;
+            if lock && pacer.vsync_ms > 0.0 {
+                let frame_s = (pacer.interval as f64 * pacer.vsync_ms / 1000.0) as f32;
+                let nominal = c.time.nominal_fixed_dt.max(1e-4);
+                let k = (frame_s / nominal - 0.02).ceil().max(1.0) as u32;
+                c.time.steps_per_frame = k;
+                c.time.fixed_dt = frame_s / k as f32;
+            } else {
+                c.time.steps_per_frame = 0;
+            }
             let mut gm = game.borrow_mut();
             frame(&mut c, &mut *gm, dt);
         }
@@ -785,10 +820,16 @@ fn frame<G: Game>(c: &mut Ctx, game: &mut G, dt: f32) {
     if !c.time.paused {
         c.time.accumulator += dt * c.time.time_scale;
         let mut n = 0;
-        while c.time.accumulator >= c.time.fixed_dt && n < 8 {
+        // locked: a remainder within 0.1 % of a step is float noise, not time (2 x 10.9 ms frames
+        // would otherwise leave 1.9999 steps now and then: one step short, one extra later)
+        let eps = if c.time.steps_per_frame > 0 { c.time.fixed_dt * 1e-3 } else { 0.0 };
+        while c.time.accumulator + eps >= c.time.fixed_dt && n < 8 {
             fixed_step(c, game);
-            c.time.accumulator -= c.time.fixed_dt;
+            c.time.accumulator = (c.time.accumulator - c.time.fixed_dt).max(0.0);
             n += 1;
+        }
+        if eps > 0.0 && c.time.accumulator < eps {
+            c.time.accumulator = 0.0;
         }
         if n == 8 {
             c.time.accumulator = 0.0; // spiral-of-death guard

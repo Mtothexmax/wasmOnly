@@ -255,7 +255,13 @@ puts the CLI in `~/.cargo/bin`. A failing wasm-opt fails the build (`"stage":"wa
   phase-locked to the refresh measured from rAF, so a device that *almost* makes the full rate (frames alternating 1/2
   vsyncs = judder, high `speed_jitter_pct`) gets an even cadence. Skipped refreshes run nothing; the simulation catches
   up in fixed steps and is drawn interpolated. `stats.time.refresh_hz`, `frame_interval`; `bridge perf` counts only drawn
-  frames. Test: `games/demo/tests/pacing.txt`.
+  frames. While capped the sim clock advances whole refreshes x the measured vsync (`time.frame_dt`; the rAF delta is
+  `frame_dt_raw`), so jitter cannot slip a step. Fixed steps still beat against the drawn rate (60 Hz steps at 45.9 fps
+  = 1,1,2 per frame: walk cycles and game-moved Transforms judder); `ctx.time.lock_fixed_to_frames = true` (API `time
+  {lock_fixed_to_frames, nominal_fixed_dt}`) sets `fixed_dt = frame_time / k` every frame, `k` = fewest steps no longer
+  than `nominal_fixed_dt` (1/60): 45.9 fps -> 2 x 10.9 ms steps, the same count every frame (`time.steps_per_frame`;
+  a late frame runs the steps for its extra refreshes). The step length then follows the display (uncapped 120 Hz =
+  120 Hz simulation), so read `ctx.time.fixed_dt` instead of assuming 1/60. Test: `games/demo/tests/pacing.txt`.
 - **Plastic / glossy look:** `render {ambient_specular: 0..1}` (default 0) adds the ambient sky/ground colours reflected
   with a split-sum fresnel (F0 0.04, albedo for metals) on lit opaque materials, fading with roughness and occluded
   below the surface's horizon: rims and sky sheen outside the sun's highlight (roughness ~0.2 reads as plastic).

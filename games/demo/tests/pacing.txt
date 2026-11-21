@@ -9,6 +9,17 @@ expect stats.time.refresh_hz > 20
 call render {"max_fps": 1}
 frames 60
 expect stats.time.frame_interval >= 2
+# capped: the sim clock advances whole refreshes, not the raw rAF delta
+expect time.frame_dt > 0
+# lock: whole steps per drawn frame, no step longer than nominal_fixed_dt
+# (max_fps 1 draws once a second: values update only on drawn frames)
+call render {"max_fps": 30}
+call time {"lock_fixed_to_frames": true, "nominal_fixed_dt": 0.0166667}
+frames 20
+expect time.steps_per_frame >= 1
+expect time.fixed_dt <= 0.0167
+call time {"lock_fixed_to_frames": false, "fixed_dt": 0.0166667}
+expect time.steps_per_frame == 0
 call render {"max_fps": 0}
 frames 10
 expect stats.time.frame_interval == 1

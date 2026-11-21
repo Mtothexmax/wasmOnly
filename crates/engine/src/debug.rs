@@ -67,6 +67,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("resume", "Resume simulation."),
     ("step", "Run N fixed steps immediately (works while paused). args: {n?: 1}"),
     ("time_scale", "Set simulation speed. args: {value}"),
+    ("time", "Simulation clock: fixed_dt, frame_dt (sim) / frame_dt_raw (rAF), refresh_hz, frame_interval, steps_per_frame. args: {lock_fixed_to_frames?, nominal_fixed_dt?, fixed_dt?}"),
     ("seed", "Reseed the engine RNG (ctx.rng). args: {value}"),
     ("input", "Inject input. args: {key?: 'KeyW', down?: bool} | {button?: 0|1|2, down?} | {x?, y?: pointer position, CSS px} | {dx?, dy?} | {action?: 'ui-action'} | {touch: {id, x, y, phase: 'start'|'move'|'end'}} | {release_all: true} | {stick: bool} (virtual joystick on/off). Returns keys, buttons and touch gestures"),
     ("logs", "Structured log entries (ring buffer of the last 10000). args: {since?: seq, level?: 'debug'|'info'|'warn'|'error', limit?: 100 (newest N; 'omitted' counts the rest)}. Returns next, oldest, omitted, entries."),
@@ -676,6 +677,21 @@ pub(crate) fn handle<G: Game>(
             }
             crate::scene::propagate_transforms(&mut ctx.world);
             Ok(json!({"step": ctx.time.step, "sim_time": ctx.time.sim_time}))
+        }
+        "time" => {
+            if let Some(v) = a["lock_fixed_to_frames"].as_bool() {
+                ctx.time.lock_fixed_to_frames = v;
+                if !v {
+                    ctx.time.steps_per_frame = 0;
+                }
+            }
+            if let Some(v) = a["nominal_fixed_dt"].as_f64() {
+                ctx.time.nominal_fixed_dt = (v as f32).max(1e-4);
+            }
+            if let Some(v) = a["fixed_dt"].as_f64() {
+                ctx.time.fixed_dt = (v as f32).max(1e-4);
+            }
+            Ok(serde_json::to_value(&ctx.time).map_err(|e| e.to_string())?)
         }
         "time_scale" => {
             ctx.time.time_scale = a
