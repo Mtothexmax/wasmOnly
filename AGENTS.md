@@ -187,6 +187,8 @@ normal `cargo` output above it.
   `shadow_fade` > 0 while cross-fading.
 - **Opacity:** `MeshRenderer.opacity` (0..1) fades one entity without material copies; it moves to the blend pass
   and keeps its full shadow (0 = invisible, still casts). `set {id|name, opacity}` (applies to children, e.g. glTF).
+  An opacity-only change (a fade, the solid-fade switch) leaves the shadow caches alone (`stats.render.shadow_static_rendered`
+  stays 0 during a fade; test `games/demo/tests/fadeshadow.txt`).
   `Material.blend_casts_shadow` lets blended materials cast. Test: `games/demo/tests/opacity.txt`.
   **Solid fade** (`render {solid_fade: true}`, `settings.solid_fade`, default off): faded entities look like a 2D
   image with its alpha turned down: only their nearest surface per pixel (culling as the material says; inner bricks
