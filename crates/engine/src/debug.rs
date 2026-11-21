@@ -79,7 +79,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("raycast", "Physics ray cast. args: {origin, dir, max?: 1000, exclude?: id|name|[...] (ignore these bodies, e.g. the caster)}"),
     ("pick", "Entity under a canvas point (CSS px). args: {x, y, mesh?: true = test rendered meshes instead of physics colliders; also returns depth_ties (z-fighting partners)}"),
     ("ui", "HUD slot contents."),
-    ("material", "Materials. Without id: every material (id, name, roughness, metallic, subsurface, clearcoat, bend). args: {id, roughness?, metallic?, subsurface?: 0..1, subsurface_color?: '#rrggbb' | null (= albedo), clearcoat?: 0..1, clearcoat_roughness?} sets them and returns the material."),
+    ("material", "Materials. Without id: every material (id, name, roughness, metallic, subsurface, clearcoat, bend). args: {id | entity: id|name (its MeshRenderer's material), roughness?, metallic?, subsurface?: 0..1, subsurface_color?: '#rrggbb' | null (= albedo), clearcoat?: 0..1, clearcoat_roughness?, studs?: {pitch_uv, height?: 0.22, r_base?: 0.30, r_top?: 0.272, bevel?: 0.025, strength?: 1, up_only?: true} | null (analytic stud relief, quality render.stud_relief 0/1/2)} sets them and returns the material."),
     ("bend", "Pushers that bend Material::bend geometry and GPU grass. args: {pushers?: [[x,y,z,radius], ...] (replaces; [] = none), material?: id, bend?: value (sets Material::bend), wind?: [dir_x, dir_z, strength] (shared with GPU grass; strength 0 = still)}. Returns pushers, wind and every material with bend > 0."),
     ("static_collider", "args: {pos: [x,y,z], half?: [x,y,z]} adds a static box collider to the current scene (physics.add_static) -> {handle: [index, generation]}; {remove: [index, generation]} removes one (physics.remove_static, the scene forgets it) -> {removed}."),
     ("zfight", "args: {radius?: m around the camera or `center` (use in big worlds), center?: [x,y,z] (default radius 10), entity?: id|name|[...] (only pairs involving these and their children; a name matches every entity with it), exclude?: id|name|[...], same_root?: true skips pairs within one hierarchy (parts of one model)}. Entities with the NoZCheck component (and their children) are never checked; `auto` = the automatic check (runs, incremental_runs, last_entities_checked, last_ms). Find z-fighting: coplanar, same-facing, overlapping triangles of different entities (opaque/masked). args: {eps?: 0.002 plane distance, tolerance?: 0.002 overlap, limit?: 50}. Returns pair count and the worst pairs with entities, world point and screen position."),
@@ -1059,10 +1059,18 @@ pub(crate) fn handle<G: Game>(
         }
         "material" => {
             use crate::renderer::MaterialId;
-            let Some(id) = a.get("id").and_then(|v| v.as_u64()) else {
+            let by_entity = match a.get("entity") {
+                Some(v) => {
+                    let e = resolve_entity(ctx, v)?;
+                    let mr = ctx.world.get::<&crate::scene::MeshRenderer>(e).map_err(|_| "entity has no MeshRenderer")?;
+                    Some(mr.material.0 as u64)
+                }
+                None => None,
+            };
+            let Some(id) = by_entity.or_else(|| a.get("id").and_then(|v| v.as_u64())) else {
                 let list: Vec<Value> = (0..ctx.renderer.material_count() as u32)
                     .filter_map(|i| ctx.renderer.material(MaterialId(i)).map(|m| json!({"id": i, "name": m.name, "roughness": m.roughness, "metallic": m.metallic,
-                        "subsurface": m.subsurface, "clearcoat": m.clearcoat, "bend": m.bend})))
+                        "subsurface": m.subsurface, "clearcoat": m.clearcoat, "bend": m.bend, "studs": m.studs})))
                     .collect();
                 return Ok(json!({"materials": list}));
             };
@@ -1079,6 +1087,23 @@ pub(crate) fn handle<G: Game>(
                     let c = v.as_str().and_then(parse_color).ok_or("subsurface_color: '#rrggbb' or null")?;
                     m.subsurface_color = Some(crate::renderer::srgb_hex(c).truncate());
                 }
+                None => {}
+            }
+            match a.get("studs") {
+                Some(Value::Null) => m.studs = None,
+                Some(Value::Object(o)) => {
+                    let mut st = m.studs.unwrap_or_default();
+                    let g = |k: &str| o.get(k).and_then(|v| v.as_f64()).map(|v| v as f32);
+                    if let Some(v) = g("pitch_uv") { st.pitch_uv = v; }
+                    if let Some(v) = g("height") { st.height = v; }
+                    if let Some(v) = g("r_base") { st.r_base = v; }
+                    if let Some(v) = g("r_top") { st.r_top = v; }
+                    if let Some(v) = g("bevel") { st.bevel = v; }
+                    if let Some(v) = g("strength") { st.strength = v; }
+                    if let Some(v) = o.get("up_only").and_then(|v| v.as_bool()) { st.up_only = v; }
+                    m.studs = Some(st);
+                }
+                Some(_) => return Err("studs: {pitch_uv, height, r_base, r_top, bevel, strength, up_only} or null".into()),
                 None => {}
             }
             Ok(json!(m))

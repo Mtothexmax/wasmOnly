@@ -402,6 +402,111 @@ fn terrain_albedo(i: VsOut, d: Deriv, inst: Instance) -> vec3f {
     return c * (0.82 + 0.36 * vnoise(i.world.xz * 0.035));
 }
 
+// Material::studs: analytic stud relief. A flat face shows a grid of standing LEGO studs (cylinder
+// r_base, top bevel = cone to r_top over `bevel`, flat cap at `height`; stud units, centres at
+// (i + 0.5) in uv * studs-per-uv). The view ray enters the stud slab at the top (shifted by
+// view.xy / max(view.z, 0.16) in tangent space) and descends to the face; it is intersected with the
+// 3x3 or 5x5 neighbouring studs analytically, the first hit wins. Result: tangent-space normal of the
+// hit (cap = up, bevel = cone, wall = radial; plate = up), the uv of the hit point (the colour map
+// follows the stud), a soft shade (0.92..1 by height on a stud, 0.95..1 within 0.16 of a stud's
+// foot on the plate) and the weight (fades out where a stud is smaller than ~2 pixels).
+struct StudHit {
+    n: vec3f,
+    uv: vec2f,
+    shade: f32,
+    w: f32,
+}
+
+fn stud_relief(uv: vec2f, view_ts: vec3f, st: vec4f, st2: vec4f, wide: bool, d: Deriv) -> StudHit {
+    var r: StudHit;
+    r.n = vec3f(0.0, 0.0, 1.0);
+    r.uv = uv;
+    r.shade = 1.0;
+    let inv = st.x;
+    let foot = max(length(d.duvx), length(d.duvy)) * inv; // studs per pixel
+    r.w = 1.0 - smoothstep(0.3, 0.6, foot);
+    if (r.w <= 0.0 || view_ts.z <= 0.0) { r.w = 0.0; return r; }
+    let h = st.y;
+    let rb = st.z;
+    let rt = st.w;
+    let bev = st2.x;
+    let k = select(0.0, (rb - rt) / bev, bev > 1e-5);
+    let s = uv * inv;
+    let e = view_ts.xy / max(view_ts.z, 0.16);
+    let o = s + e * h;  // ray entry at the top of the slab; p(t) = o - e t, height h - t
+    let dq = -e;
+    // only the cells whose stud can touch the ray's footprint (o -> s), at most 3x3 / 5x5 around its middle
+    let mid = floor(s + e * (h * 0.5));
+    let rad = select(1.0, 2.0, wide);
+    let lo = max(ceil(min(o, s) - rb - 0.5), mid - rad);
+    let hi = min(floor(max(o, s) + rb - 0.5), mid + rad);
+    var best = 1e9;
+    var bn = vec3f(0.0, 0.0, 1.0);
+    for (var cy = lo.y; cy <= hi.y; cy += 1.0) {
+        for (var cx = lo.x; cx <= hi.x; cx += 1.0) {
+            let q0 = o - (vec2f(cx, cy) + 0.5);
+            let c0 = dot(q0, q0);
+            // cap (the ray starts at cap height)
+            if (c0 <= rt * rt) {
+                if (0.0 < best) { best = 0.0; bn = vec3f(0.0, 0.0, 1.0); }
+                continue;
+            }
+            // bevel cone, t in [0, bev]: |q0 + t dq| = rt + k t
+            if (bev > 1e-5) {
+                let a = dot(dq, dq) - k * k;
+                let b = 2.0 * (dot(q0, dq) - rt * k);
+                let c = c0 - rt * rt;
+                var t = -1.0;
+                if (abs(a) < 1e-6) {
+                    if (abs(b) > 1e-6) { t = -c / b; }
+                } else {
+                    let disc = b * b - 4.0 * a * c;
+                    if (disc >= 0.0) {
+                        let sq = sqrt(disc);
+                        let t1 = (-b - sq) / (2.0 * a);
+                        let t2 = (-b + sq) / (2.0 * a);
+                        let lo = min(t1, t2);
+                        let hi = max(t1, t2);
+                        t = select(hi, lo, lo >= 0.0);
+                    }
+                }
+                if (t >= 0.0 && t <= bev && t < best && rt + k * t >= 0.0) {
+                    let q = q0 + dq * t;
+                    best = t;
+                    bn = normalize(vec3f(q / max(length(q), 1e-5), k));
+                    continue;
+                }
+            }
+            // wall, t in [bev, h]: |q0 + t dq| = rb
+            let a = dot(dq, dq);
+            if (a > 1e-8) {
+                let b = 2.0 * dot(q0, dq);
+                let c = c0 - rb * rb;
+                let disc = b * b - 4.0 * a * c;
+                if (disc >= 0.0) {
+                    let t = (-b - sqrt(disc)) / (2.0 * a);
+                    if (t >= bev && t <= h && t < best) {
+                        let q = q0 + dq * t;
+                        best = t;
+                        bn = vec3f(q / max(length(q), 1e-5), 0.0);
+                    }
+                }
+            }
+        }
+    }
+    if (best <= h) {
+        r.n = bn;
+        r.uv = (o + dq * best) / inv;
+        r.shade = mix(0.92, 1.0, (h - best) / max(h, 1e-5));
+    } else {
+        // plate: soft contact shade around the nearest stud's foot
+        let dist = length(fract(s) - 0.5);
+        r.shade = mix(0.95, 1.0, smoothstep(rb, rb + 0.16, dist));
+    }
+    r.shade = mix(1.0, r.shade, r.w);
+    return r;
+}
+
 struct Surface {
     color: vec4f,  // linear HDR colour (fogged) + alpha
     n: vec3f,      // shading normal (for debug views)
@@ -424,6 +529,19 @@ fn shade(i: VsOut, front: bool, d: Deriv, face_n: vec3f) -> Surface {
         let view_ts = vec3f(dot(v, tbn[0]), dot(v, tbn[1]), dot(v, tbn[2]));
         uv = parallax_uv(uv, view_ts, inst.maps.z, d);
     }
+    // Material::studs (render.stud_relief = quality, 0 = off)
+    var stud = StudHit(vec3f(0.0, 0.0, 1.0), uv, 1.0, 0.0);
+    var stud_tbn = tbn;
+    if (inst.studs.x > 0.0 && g.shadow_sets.w > 0.5 && !is_terrain && (inst.studs2.z < 0.5 || n_geo.y > 0.5)) {
+        // cotangent_frame drops the determinant's sign (WebGPU's y-down screen: T, B = -du, -dv on
+        // front faces); the ray needs the true +u / +v directions, so orient the frame by the uv gradient
+        let ori = dot(d.dpx, tbn[0]) * d.duvx.x + dot(d.dpy, tbn[0]) * d.duvy.x;
+        let fs = select(-1.0, 1.0, ori >= 0.0);
+        stud_tbn = mat3x3f(tbn[0] * fs, tbn[1] * fs, tbn[2]);
+        let view_ts = vec3f(dot(v, stud_tbn[0]), dot(v, stud_tbn[1]), dot(v, stud_tbn[2]));
+        stud = stud_relief(uv, view_ts, inst.studs, inst.studs2, g.shadow_sets.w > 1.5, d);
+        uv = mix(uv, stud.uv, step(0.5, stud.w)); // the colour map follows the stud (no half shift)
+    }
     var tex = textureSampleGrad(base_tex, base_sampler, uv, d.duvx, d.duvy);
     if (is_terrain) {
         tex = vec4f(terrain_albedo(i, d, inst), 1.0);
@@ -432,6 +550,9 @@ fn shade(i: VsOut, front: bool, d: Deriv, face_n: vec3f) -> Surface {
         var tn = textureSampleGrad(normal_tex, base_sampler, uv, d.duvx, d.duvy).xyz * 2.0 - 1.0;
         tn = vec3f(tn.xy * inst.maps.x, tn.z);
         n = normalize(tbn * tn);
+    }
+    if (stud.w > 0.0) { // the stud normal replaces the surface (and normal-map) normal
+        n = normalize(mix(n, normalize(stud_tbn * stud.n), stud.w * inst.studs2.y));
     }
 
     let alpha_mode = inst.params.w;
@@ -442,7 +563,7 @@ fn shade(i: VsOut, front: bool, d: Deriv, face_n: vec3f) -> Surface {
     } else if (alpha_mode == 0.0) {    // opaque
         alpha = 1.0;
     }
-    var albedo = tex.rgb * inst.base_color.rgb * i.color.rgb;
+    var albedo = tex.rgb * inst.base_color.rgb * i.color.rgb * stud.shade;
     let checker = inst.params.y;
     if (checker > 0.0) {
         let c = floor(i.world.x * checker) + floor(i.world.z * checker);

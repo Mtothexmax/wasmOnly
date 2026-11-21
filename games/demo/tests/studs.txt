@@ -1,0 +1,29 @@
+# Analytic stud relief (Material::studs, render.stud_relief): a flat cube top shows standing studs.
+#   node tools/bridge.mjs run games/demo/tests/studs.txt
+reload
+screen play
+wait 1000
+pause
+call spawn {"shape": "cube", "pos": [0, 2, 0], "size": 4, "color": "#2e8b3a", "body": "none", "name": "studplate"}
+# 4 m cube, uv 0..1 per face: 8 x 8 studs of 0.5 m
+call material {"entity": "studplate", "roughness": 0.3, "clearcoat": 1, "studs": {"pitch_uv": 0.125}}
+expect material{"entity": "studplate"}.studs.height > 0.21
+expect material{"entity": "studplate"}.studs.up_only == true
+expect render.stud_relief == 2
+call spawn {"camera": true, "pos": [2.5, 4.6, 3.2], "look_at": [0, 4, 0], "main": true}
+frames 3
+screenshot out/studs-5x5.png
+call render {"stud_relief": 1}
+frames 2
+screenshot out/studs-3x3.png
+call render {"stud_relief": 0}
+frames 2
+screenshot out/studs-off.png
+call render {"stud_relief": 2}
+# grazing view: the ray crosses several studs
+call camera {"pos": [3.5, 4.25, 2.4], "look_at": [-1, 4, -1]}
+frames 2
+screenshot out/studs-grazing.png
+call material {"entity": "studplate", "studs": null}
+expect material{"entity": "studplate"}.studs == null
+expect logs{"level": "error"}.entries.length == 0

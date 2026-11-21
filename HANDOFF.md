@@ -50,6 +50,8 @@ auto_lod: false, ..Default::default() })`, `ctx.gltf_defaults.auto_lod = false`,
 `render.lod_distance_scale` (bigger = more detail; formerly `lod_bias`). Far forests: `GltfOpts { impostor: true, .. }`
 (one camera-facing card per model beyond ~60x its radius); far static towns: `ctx.batch_static_with(root, cell,
 Some(Hlod { distance, cluster }))`; a far clip that fades into the fog: `render.view_distance`.
+LEGO baseplates without stud geometry: `Material::studs = Some(StudRelief::lego(pitch_uv))` (analytic per-pixel
+studs, quality `render.stud_relief` 0/1/2).
 
 ## 3. Working rules (they prevented real bugs)
 

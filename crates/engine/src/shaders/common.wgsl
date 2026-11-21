@@ -44,6 +44,7 @@ struct Globals {
     scene_max: vec4f,
     cascades_prev: array<mat4x4f, 4>, // previous shadow direction while cross-fading (stepped sun)
     shadow_sets: vec4f,               // x = first layer of the current set, y = of the previous set, z = previous weight
+                                      // w = render.stud_relief (0 off, 1 = 3x3, 2 = 5x5)
     // All cascades of a set share the light rotation, so cascade k's coordinate is cascade 0's
     // scaled and offset per axis: one fixed matrix per pixel instead of a dynamically indexed one.
     cascade_scale: array<vec4f, 4>,
@@ -101,6 +102,8 @@ struct Instance {
                               // w = alpha: 0 opaque, (0,1] mask cutoff, -1 blend
     maps: vec4f,              // x = normal-map strength (0 = none), y = displacement (water: wave height),
                               // z = parallax scale (0 = off), w = water wave scale
+    studs: vec4f,             // Material::studs: x = studs per uv (0 = off), y = height, z = r_base, w = r_top
+    studs2: vec4f,            // x = bevel, y = strength, z = 1: up-facing faces only
 }
 
 @group(0) @binding(0) var<uniform> g: Globals;

@@ -338,6 +338,17 @@ normal `cargo` output above it.
   subsurface 0.3. They ride in the unused part of the instance's normal matrix (no layout change). API: `material`
   lists every material; `material {id, roughness, metallic, subsurface, subsurface_color, clearcoat,
   clearcoat_roughness}` sets them. Test: `games/demo/tests/plastic.txt`.
+- **Studs without geometry:** `Material::studs = Some(StudRelief::lego(pitch_uv))` (prelude; fields `pitch_uv` = UV
+  units per stud, `height` 0.22, `r_base` 0.30, `r_top` 0.272, `bevel` 0.025 in stud units, `strength` 0..1,
+  `up_only` true) turns a flat face into a plate of standing LEGO studs: per pixel the view ray enters the stud slab
+  at its top and is intersected analytically with the neighbouring stud cylinders (bevel cone + flat cap), the first
+  hit's normal replaces the surface normal (and the normal map; clear coat uses it too), the colour map is sampled at
+  the hit point, soft shade 0.92..1 by height on a stud and 0.95..1 around a stud's foot. Stud centres sit at
+  `(i + 0.5) * pitch_uv`; needs uniform UVs (world UVs). Fades to the flat face where a stud is < ~2 px (no moiré;
+  keep a stud colour/normal map for that distance if wanted). Lit materials only; shadows and depth stay flat.
+  Quality `render {stud_relief: 0|1|2}` (off / 3x3 / 5x5 neighbours, default 2; only the cells the ray crosses
+  are tested, so 1 and 2 cost about the same: +0.6 ms opaque at 14 Mpx full of studs on a Radeon 780M).
+  API `material {entity: id|name | id, studs: {pitch_uv, ..} | null}`. Test: `games/demo/tests/studs.txt`.
 - **Input lag on a GPU-bound device:** without a limit Chrome queues frames and the screen shows one that is
   up to a second old (desktop repro: 320vw canvas, 7 frames in flight, 1 s latency). The back-pressure of frame pacing
   (`render {max_frames_in_flight}`, default 2; 0 = off; 64 queued = hard cap) prevents it. `stats.render.pacing`:

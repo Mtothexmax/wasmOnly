@@ -247,6 +247,14 @@ fn classify(model: &Mat4, mr: &MeshRenderer, mat: &Material, shadows_on: bool) -
                 mat.bend.max(0.0),
             ]
         },
+        studs: match (&mat.studs, plastic || mat.unlit) {
+            (Some(st), true) if st.pitch_uv > 0.0 => [1.0 / st.pitch_uv, st.height.max(0.0), st.r_base.max(0.0), st.r_top.clamp(0.0, st.r_base.max(0.0))],
+            _ => [0.0; 4],
+        },
+        studs2: match &mat.studs {
+            Some(st) => [st.bevel.clamp(0.0, st.height.max(0.0)), st.strength.clamp(0.0, 1.0), st.up_only as u32 as f32, 0.0],
+            None => [0.0; 4],
+        },
     };
     let shadow_raw = (faded && casts).then(|| {
         let mut r = raw;
@@ -383,6 +391,43 @@ pub struct Material {
     /// (0 = normal mesh). The vertex shader turns the card around the model's up axis toward the
     /// camera (shadows: toward the sun) and picks the nearest view's atlas cell.
     pub impostor_views: u32,
+    /// Analytic LEGO studs (`StudRelief`): per pixel the view ray is cast against the neighbouring
+    /// stud cylinders of a grid in the material's UVs; the hit's normal and UV replace the surface's,
+    /// so a flat plate shows standing studs (silhouette inside the plate, bevel, soft contact shade).
+    pub studs: Option<StudRelief>,
+}
+
+/// Stud grid for [`Material::studs`]. Sizes are in stud units (1 = one stud pitch); the grid is
+/// aligned to the UVs (stud centres at (i + 0.5) * pitch_uv). The UV mapping should be uniform
+/// (world UVs, same scale in u and v). Quality: `render.stud_relief` (0 off, 1 = 3x3, 2 = 5x5).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct StudRelief {
+    /// UV units per stud (world UVs of 1 per metre with an 8 mm stud: 0.008).
+    pub pitch_uv: f32,
+    /// Stud height (LEGO: 1.7 / 8 ≈ 0.22).
+    pub height: f32,
+    /// Radius at the foot (LEGO: 2.4 / 8 = 0.30).
+    pub r_base: f32,
+    /// Radius of the flat cap; the bevel is a cone from `r_base` to `r_top` over the top `bevel`.
+    pub r_top: f32,
+    pub bevel: f32,
+    /// 0..1: how much the stud normal replaces the surface normal (1 = fully).
+    pub strength: f32,
+    /// Only faces whose (shading) normal points up (> 0.5): plates whose sides share the material.
+    pub up_only: bool,
+}
+
+impl Default for StudRelief {
+    fn default() -> Self {
+        Self { pitch_uv: 1.0, height: 0.22, r_base: 0.30, r_top: 0.272, bevel: 0.025, strength: 1.0, up_only: true }
+    }
+}
+
+impl StudRelief {
+    /// LEGO proportions with `pitch_uv` UV units per stud.
+    pub fn lego(pitch_uv: f32) -> Self {
+        Self { pitch_uv, ..Default::default() }
+    }
 }
 
 /// Transparency of a material (glTF semantics).
@@ -435,6 +480,7 @@ impl Default for Material {
             clearcoat: 0.0,
             clearcoat_roughness: 0.06,
             impostor_views: 0,
+            studs: None,
         }
     }
 }
@@ -479,6 +525,11 @@ impl Material {
     pub fn normal_map(mut self, tex: Option<TextureId>, strength: f32) -> Self {
         self.normal_texture = tex;
         self.normal_scale = strength;
+        self
+    }
+    /// Analytic stud relief (see [`StudRelief`]).
+    pub fn studs(mut self, studs: StudRelief) -> Self {
+        self.studs = Some(studs);
         self
     }
     /// Height map driving parallax occlusion mapping (`parallax` in UV units).
@@ -668,6 +719,10 @@ pub struct RenderSettings {
     /// ambient sky/ground colours reflected with a split-sum fresnel, fading with roughness. Shiny
     /// plastic (roughness ~0.2) gets its rim and sky sheen outside the sun's highlight.
     pub ambient_specular: f32,
+    /// Quality of `Material::studs` (analytic stud relief): 0 = off (flat plate, studs only as the
+    /// material's colour/normal maps), 1 = 3x3 neighbour studs per pixel (phones), 2 = 5x5 (default;
+    /// needed for grazing views where the ray crosses more than one stud).
+    pub stud_relief: u32,
     /// Lens flare when looking towards the sun (glow, starburst, coloured ghosts); 0 = off. Hidden
     /// by anything in front of the sun disk (objects, clouds).
     pub lens_flare: f32,
@@ -808,6 +863,7 @@ impl Default for RenderSettings {
             sun_scale: 1.0,
             ambient_scale: 1.0,
             ambient_specular: 0.0,
+            stud_relief: 2,
             moon_intensity: 1.0,
             day_cycle_exposure: true,
             lens_flare: 1.0,
@@ -1003,6 +1059,10 @@ struct InstanceRaw {
     emissive_metallic: [f32; 4],
     params: [f32; 4],
     maps: [f32; 4],
+    /// Material::studs: x = studs per UV unit (0 = off), y = height, z = base radius, w = top radius
+    studs: [f32; 4],
+    /// x = bevel, y = strength, z = 1: only faces whose normal points up, w = unused
+    studs2: [f32; 4],
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -3292,7 +3352,7 @@ impl Renderer {
             scene_min: [0.0; 4], // set after the instance pass
             scene_max: [0.0; 4],
             cascades_prev,
-            shadow_sets: [(cur_set * MAX_CASCADES as u32) as f32, ((cur_set ^ 1) * MAX_CASCADES as u32) as f32, prev_weight, 0.0],
+            shadow_sets: [(cur_set * MAX_CASCADES as u32) as f32, ((cur_set ^ 1) * MAX_CASCADES as u32) as f32, prev_weight, s.stud_relief.min(2) as f32],
             cascade_scale: [[1.0, 1.0, 1.0, 0.0]; MAX_CASCADES],
             cascade_offset: [[0.0; 4]; MAX_CASCADES],
             pushers: self.pushers,
