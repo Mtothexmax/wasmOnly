@@ -109,6 +109,7 @@ struct BlendObj {
     double_sided: bool,
     tex: u32,
     water: bool,
+    solid: bool,
 }
 
 #[derive(Clone, Default)]
@@ -697,7 +698,7 @@ impl GpuScene {
             sgroups: if shadow_here { sgroups } else { [NONE; LEVELS] },
             info: [info_x, main as u32 | (shadow_here as u32) << 1, 0, 0],
         };
-        let blend = (c.blend && !c.hidden).then(|| Box::new(BlendObj { meshes: ms, double_sided: c.double_sided, tex, water: c.water }));
+        let blend = (c.blend && !c.hidden).then(|| Box::new(BlendObj { meshes: ms, double_sided: c.double_sided, tex, water: c.water, solid: c.solid }));
         let mut new_shadow = NONE;
         if let Some(r) = &c.shadow_raw {
             let ss = pool.put((ek, true), r) as usize;
@@ -874,7 +875,7 @@ impl GpuScene {
 
     /// Blended entities in view: (view depth, double_sided, texture, mesh, slot), unsorted; and
     /// whether one of them is water.
-    pub fn blended(&self, planes: &[Vec4; 6], cam: Vec3, fwd: Vec3, lod_bias: f32, layers: u32, meshes: &[GpuMesh]) -> (Vec<(f32, bool, u32, u32, u32)>, bool) {
+    pub fn blended(&self, planes: &[Vec4; 6], cam: Vec3, fwd: Vec3, lod_bias: f32, layers: u32, meshes: &[GpuMesh]) -> (Vec<(f32, bool, u32, u32, u32, bool)>, bool) {
         let mut out = vec![];
         let mut water = false;
         for &s in &self.blend_slots {
@@ -906,7 +907,7 @@ impl GpuScene {
                 continue;
             }
             water |= b.water;
-            out.push(((c - cam).dot(fwd), b.double_sided, b.tex, mesh, s));
+            out.push(((c - cam).dot(fwd), b.double_sided, b.tex, mesh, s, b.solid));
         }
         (out, water)
     }

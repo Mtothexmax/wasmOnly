@@ -180,6 +180,9 @@ struct Classified {
     pub shadow_raw: Option<InstanceRaw>,
     /// Drawn in the blend pass (blended material or faded).
     pub blend: bool,
+    /// Faded (opacity < 1) entity with a non-blended material: with `settings.solid_fade` it is
+    /// drawn as its nearest surface only, then blended (see `Renderer::render_view`).
+    pub solid: bool,
     pub mask: bool,
     pub casts: bool,
     /// Opacity 0: not drawn (may still cast).
@@ -255,6 +258,8 @@ fn classify(model: &Mat4, mr: &MeshRenderer, mat: &Material, shadows_on: bool) -
         raw,
         shadow_raw,
         blend: mat_blend || faded,
+        // alpha-tested materials stay classic: the depth-only pass has no discard (cut-outs would occlude)
+        solid: faded && !mat_blend && !mat.water && !mat.terrain && !mat.ui && !matches!(mat.alpha_mode, AlphaMode::Mask(_)),
         mask: matches!(mat.alpha_mode, AlphaMode::Mask(_)),
         casts,
         hidden,
@@ -586,6 +591,13 @@ pub struct RenderSettings {
     /// refreshes run nothing (simulation catches up with fixed steps, drawn interpolated).
     /// `stats.time`: `refresh_hz`, `frame_interval`.
     pub max_fps: f32,
+    /// How entities with `MeshRenderer::opacity` < 1 are drawn. false: every face blended
+    /// (back and inner faces show). true: like a 2D image whose alpha is turned down: only the
+    /// nearest surface of the faded entities per pixel (culling as the material says), blended
+    /// once with its opacity. Costs a depth-only copy + prepass while something is faded; blended
+    /// materials (glass), water and render textures keep the classic path. Blended things behind a
+    /// faded entity (particles, water) are hidden by it.
+    pub solid_fade: bool,
     /// World-space offset added to the camera position (flicker detection: tiny shifts between
     /// screenshots reveal z-fighting and shimmering).
     pub camera_jitter: Vec3,
@@ -744,6 +756,7 @@ impl Default for RenderSettings {
             occlusion_min_ratio: 0.08,
             max_frames_in_flight: 2,
             max_fps: 0.0,
+            solid_fade: false,
             camera_jitter: Vec3::ZERO,
             freeze_time: false,
             depth_jitter: 0.0,
@@ -835,6 +848,8 @@ pub struct FrameStats {
     pub frames_in_flight: u32,
     /// Submit -> GPU done of the main view, smoothed (ms). Large = the GPU runs behind (input lag).
     pub gpu_latency_ms: f32,
+    /// Draws of faded entities through the solid-fade path this frame (`settings.solid_fade`).
+    pub solid_fade_draws: u32,
     /// Frames not rendered because `max_frames_in_flight` was reached (total).
     pub frames_skipped: u64,
     /// Per cascade of the current set: re-rendered this frame (false = cached map reused).
@@ -1034,6 +1049,13 @@ pub struct Renderer {
     /// Depth prepass: [prepass, prepass 2-sided, opaque after prepass (depth equal), 2-sided].
     prepass_pipelines: [GpuRenderPipeline; 4],
     prepass_broken: [Rc<Cell<bool>>; 4],
+    /// Solid fade: [depth only, 2-sided, blended depth-equal, 2-sided] (`settings.solid_fade`).
+    fade_pipelines: [GpuRenderPipeline; 4],
+    fade_broken: [Rc<Cell<bool>>; 4],
+    /// Full-screen copy of the scene depth into `fade_depth` (frag_depth, per sample).
+    fade_copy: (GpuRenderPipeline, GpuBindGroupLayout),
+    /// Second depth buffer of the canvas size: scene depth + nearest faded surfaces.
+    fade_depth: Option<((u32, u32), GpuTextureView)>,
     /// Set when the driver failed to build that pipeline: its draws are skipped (see
     /// `debug::create_pipeline_guarded`), so one broken shader does not blank the whole frame.
     pipeline_broken: [Rc<Cell<bool>>; 6],
@@ -1408,7 +1430,8 @@ impl Renderer {
         ]));
         // Main pipelines: (kind, double_sided) variants of the same PBR shader.
         // kind 0 = opaque (no discard -> early-Z), 1 = alpha-test / UI, 2 = blend.
-        // variant: 0 = normal, 1 = depth prepass (depth only), 2 = after a prepass (depth equal, no write)
+        // variant: 0 = normal, 1 = depth prepass (depth only), 2 = after a prepass (depth equal, no write),
+        // 3 = blended with depth equal (solid fade colour), 4 = depth only without colour target (solid fade depth)
         let make_pipeline_v = |kind: u8, two_sided: bool, variant: u8| -> Result<(GpuRenderPipeline, Rc<Cell<bool>>), String> {
             let blend = kind == 2;
             let vs = GpuVertexState::new(&pbr_module);
@@ -1441,7 +1464,7 @@ impl Renderer {
             let ds = GpuDepthStencilState::new(DEPTH_FORMAT);
             ds.set_depth_write_enabled(!blend && variant != 2); // blended surfaces test but do not write depth
             // after the prepass the depth buffer already holds the nearest surface: only it is shaded
-            ds.set_depth_compare(if variant == 2 { GpuCompareFunction::Equal } else { GpuCompareFunction::Less });
+            ds.set_depth_compare(if variant == 2 || variant == 3 { GpuCompareFunction::Equal } else { GpuCompareFunction::Less });
             let ms = GpuMultisampleState::new();
             ms.set_count(samples);
             let desc = GpuRenderPipelineDescriptor::new(if blend { &layout_t } else { &layout }, &vs);
@@ -1456,10 +1479,14 @@ impl Renderer {
             let label = match variant {
                 1 => if two_sided { "pbr-prepass-2s" } else { "pbr-prepass" },
                 2 => if two_sided { "pbr-opaque-eq-2s" } else { "pbr-opaque-eq" },
+                3 => if two_sided { "pbr-fade-2s" } else { "pbr-fade" },
+                4 => if two_sided { "pbr-fade-depth-2s" } else { "pbr-fade-depth" },
                 _ => label,
             };
             desc.set_label(label);
-            desc.set_fragment(&fs);
+            if variant != 4 {
+                desc.set_fragment(&fs);
+            }
             desc.set_primitive(&prim);
             desc.set_depth_stencil(&ds);
             desc.set_multisample(&ms);
@@ -1479,6 +1506,10 @@ impl Renderer {
         ];
         let pipeline_broken: [Rc<Cell<bool>>; 6] = std::array::from_fn(|i| built[i].1.clone());
         let pipelines: [GpuRenderPipeline; 6] = built.map(|b| b.0);
+        let fade_built = [make_pipeline_v(0, false, 4)?, make_pipeline_v(0, true, 4)?, make_pipeline_v(2, false, 3)?, make_pipeline_v(2, true, 3)?];
+        let fade_broken: [Rc<Cell<bool>>; 4] = std::array::from_fn(|i| fade_built[i].1.clone());
+        let fade_pipelines: [GpuRenderPipeline; 4] = fade_built.map(|b| b.0);
+        let fade_copy = Self::make_fade_copy(&device, samples)?;
 
         let shadow_layout =
             device.create_pipeline_layout(&GpuPipelineLayoutDescriptor::new(&[JsNullable::wrap(
@@ -1631,6 +1662,10 @@ impl Renderer {
             pipelines,
             prepass_pipelines,
             prepass_broken,
+            fade_pipelines,
+            fade_broken,
+            fade_copy,
+            fade_depth: None,
             pipeline_broken,
             shadow_pipeline,
             shadow_mask_pipeline,
@@ -1869,6 +1904,53 @@ impl Renderer {
 
     /// Pipeline that copies depth from a static shadow copy into the bound shadow layer, limited to
     /// the scissor rect (WebGPU only copies whole depth textures; the dirty part is tiny).
+    /// Copies the scene depth (multisampled when `samples` > 1) into another depth target via
+    /// frag_depth: depth24plus cannot be copied with copyTextureToTexture.
+    fn make_fade_copy(device: &GpuDevice, samples: u32) -> Result<(GpuRenderPipeline, GpuBindGroupLayout), String> {
+        let code = if samples > 1 {
+            "@group(0) @binding(0) var src: texture_depth_multisampled_2d;\n\
+            @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {\n\
+              let p = vec2f(f32((i << 1u) & 2u), f32(i & 2u));\n\
+              return vec4f(p * 2.0 - 1.0, 0.0, 1.0);\n\
+            }\n\
+            @fragment fn fs(@builtin(position) p: vec4f, @builtin(sample_index) s: u32) -> @builtin(frag_depth) f32 {\n\
+              return textureLoad(src, vec2i(p.xy), i32(s));\n\
+            }\n"
+        } else {
+            "@group(0) @binding(0) var src: texture_depth_2d;\n\
+            @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {\n\
+              let p = vec2f(f32((i << 1u) & 2u), f32(i & 2u));\n\
+              return vec4f(p * 2.0 - 1.0, 0.0, 1.0);\n\
+            }\n\
+            @fragment fn fs(@builtin(position) p: vec4f) -> @builtin(frag_depth) f32 {\n\
+              return textureLoad(src, vec2i(p.xy), 0);\n\
+            }\n"
+        };
+        let module = device.create_shader_module(&GpuShaderModuleDescriptor::new(code));
+        let e = GpuBindGroupLayoutEntry::new(0, gpu_shader_stage::FRAGMENT);
+        let t = GpuTextureBindingLayout::new();
+        t.set_sample_type(GpuTextureSampleType::Depth);
+        t.set_multisampled(samples > 1);
+        e.set_texture(&t);
+        let bgl = device.create_bind_group_layout(&GpuBindGroupLayoutDescriptor::new(&[e])).map_err(js_err)?;
+        let layout = device.create_pipeline_layout(&GpuPipelineLayoutDescriptor::new(&[JsNullable::wrap(bgl.clone())]));
+        let vs = GpuVertexState::new(&module);
+        vs.set_entry_point("vs");
+        let fs = GpuFragmentState::new(&module, &[]);
+        fs.set_entry_point("fs");
+        let ds = GpuDepthStencilState::new(DEPTH_FORMAT);
+        ds.set_depth_write_enabled(true);
+        ds.set_depth_compare(GpuCompareFunction::Always);
+        let ms = GpuMultisampleState::new();
+        ms.set_count(samples);
+        let d = GpuRenderPipelineDescriptor::new(&layout, &vs);
+        d.set_label("fade-depth-copy");
+        d.set_fragment(&fs);
+        d.set_depth_stencil(&ds);
+        d.set_multisample(&ms);
+        Ok((device.create_render_pipeline(&d).map_err(js_err)?, bgl))
+    }
+
     fn make_shadow_restore(device: &GpuDevice) -> Result<(GpuRenderPipeline, GpuBindGroupLayout), String> {
         let code = "@group(0) @binding(0) var src: texture_depth_2d;\n\
             @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {\n\
@@ -3067,7 +3149,7 @@ impl Renderer {
         // (pipeline 0..3 << 56 | texture key << 28 | mesh, mi); opaque pipelines sort first
         let mut visible: Vec<(u64, u32)> = Vec::with_capacity(raws.capacity());
         // (view depth, double_sided, texture, mesh, mi)
-        let mut blended: Vec<(f32, bool, u32, u32, u32)> = vec![];
+        let mut blended: Vec<(f32, bool, u32, u32, u32, bool)> = vec![];
         let mut has_water = false;
         // (alpha-tested << 63 | texture key << 32 | mesh, mi)
         let mut casters: Vec<(u64, u32)> = Vec::with_capacity(raws.capacity());
@@ -3094,7 +3176,7 @@ impl Renderer {
             let (mut b, w) = self.scene.blended(&planes, cam_pos, cam_fwd_n, lod_bias, layers, &self.meshes);
             b.sort_by_key(|e| e.4);
             for e in b {
-                blended.push((e.0, e.1, e.2, e.3, raws.len() as u32));
+                blended.push((e.0, e.1, e.2, e.3, raws.len() as u32, e.5));
                 raws.push(e.4);
             }
             has_water = w;
@@ -3164,7 +3246,7 @@ impl Renderer {
             }
             if is_blend {
                 has_water |= mat.water;
-                blended.push(((center - cam_pos).dot(cam_fwd_n), mat.double_sided, tex, mesh_id.0, mi));
+                blended.push(((center - cam_pos).dot(cam_fwd_n), mat.double_sided, tex, mesh_id.0, mi, c.solid));
             } else {
                 let pipe = (if is_mask || mat.ui { 2 } else { 0 }) + mat.double_sided as u64;
                 visible.push((pipe << 56 | (tex as u64) << 28 | mesh_id.0 as u64, mi));
@@ -3398,10 +3480,15 @@ impl Renderer {
         // driven path: the blended ids follow the main + shadow slices the GPU fills
         let blend_base = if gpu { self.scene.id_layout().1 } else { visible.len() as u32 };
         let mut blend_runs: Vec<(bool, u32, u32, u32, u32)> = vec![];
+        // solid fade (main view): faded entities drawn as their nearest surface, then blended
+        let solid_on = main && self.settings.solid_fade && self.fade_broken.iter().all(|b| !b.get());
+        let mut solid_runs: Vec<(bool, u32, u32, u32, u32)> = vec![];
         for (i, b) in blended.iter().enumerate() {
-            match blend_runs.last_mut() {
-                Some(r) if r.0 == b.1 && r.1 == b.2 && r.2 == b.3 => r.4 += 1,
-                _ => blend_runs.push((b.1, b.2, b.3, blend_base + i as u32, 1)),
+            let runs = if solid_on && b.5 { &mut solid_runs } else { &mut blend_runs };
+            let at = blend_base + i as u32;
+            match runs.last_mut() {
+                Some(r) if r.0 == b.1 && r.1 == b.2 && r.2 == b.3 && r.3 + r.4 == at => r.4 += 1,
+                _ => runs.push((b.1, b.2, b.3, at, 1)),
             }
         }
 
@@ -3844,7 +3931,7 @@ impl Renderer {
         // Nothing blended (no transparent draws, particles or water): the opaque pass resolves
         // straight into the HDR target and the blend pass is skipped. Saves a full load + store of
         // the 4x MSAA HDR target, pure bandwidth (a few ms on integrated GPUs).
-        let skip_blend = blend_runs.is_empty() && n_add + n_alpha == 0 && !has_water;
+        let skip_blend = blend_runs.is_empty() && solid_runs.is_empty() && n_add + n_alpha == 0 && !has_water;
         // --- Opaque pass (indirect on the GPU path); keeps colour + depth for the blend pass ---
         {
             // without MSAA: the scene is drawn straight into the HDR target (into scene_color while
@@ -3982,6 +4069,50 @@ impl Renderer {
             pass.end();
         }
 
+        // --- Solid fade: scene depth + the faded entities' nearest surfaces into a second depth
+        // buffer (depth only, no colour traffic); the blend pass tests against it (equal = nearest)
+        let mut fade_depth_view = None;
+        if !solid_runs.is_empty() {
+            let size = self.size;
+            if self.fade_depth.as_ref().map(|f| f.0) != Some(size) {
+                let d = GpuTextureDescriptor::new(DEPTH_FORMAT, &nums(&[size.0.max(1), size.1.max(1)]), gpu_texture_usage::RENDER_ATTACHMENT);
+                d.set_sample_count(self.samples);
+                d.set_label("fade-depth");
+                let t = self.device.create_texture(&d).map_err(js_err)?;
+                self.fade_depth = Some((size, t.create_view().map_err(js_err)?));
+            }
+            let fd = self.fade_depth.as_ref().unwrap().1.clone();
+            let datt = GpuRenderPassDepthStencilAttachment::new_with_gpu_texture_view(&fd);
+            datt.set_depth_clear_value(1.0);
+            datt.set_depth_load_op(GpuLoadOp::Clear);
+            datt.set_depth_store_op(GpuStoreOp::Store);
+            let desc = GpuRenderPassDescriptor::new(&[]);
+            desc.set_depth_stencil_attachment(&datt);
+            desc.set_label("fade-depth");
+            let pass = encoder.begin_render_pass(&desc).map_err(js_err)?;
+            let copy_group = self.device.create_bind_group(&GpuBindGroupDescriptor::new(&[GpuBindGroupEntry::new_with_gpu_texture_view(0, &depth)], &self.fade_copy.1));
+            pass.set_pipeline(&self.fade_copy.0);
+            pass.set_bind_group(0, Some(&copy_group));
+            pass.draw(3);
+            pass.set_bind_group(0, Some(&self.bind0));
+            let mut bound = usize::MAX;
+            for &(two_sided, tex, mesh_id, first, count) in &solid_runs {
+                let pi = two_sided as usize;
+                if pi != bound {
+                    pass.set_pipeline(&self.fade_pipelines[pi]);
+                    bound = pi;
+                }
+                pass.set_bind_group(1, Some(&groups[tex as usize]));
+                let mesh = &self.meshes[mesh_id as usize];
+                pass.set_vertex_buffer(0, Some(&mesh.vb));
+                pass.set_index_buffer(&mesh.ib, GpuIndexFormat::Uint32);
+                pass.draw_indexed_with_instance_count_and_first_index_and_base_vertex_and_first_instance(mesh.index_count, count, 0, 0, first);
+                stats.draw_calls += 1;
+            }
+            pass.end();
+            fade_depth_view = Some(fd);
+        }
+
         // --- Blend pass: back to front, depth read-only *and* bound as a texture (water) -----
         if !skip_blend {
             let single = self.samples == 1;
@@ -4000,7 +4131,8 @@ impl Renderer {
             if !single {
                 att.set_resolve_target_gpu_texture_view(&hdr_view);
             }
-            let datt = GpuRenderPassDepthStencilAttachment::new_with_gpu_texture_view(&depth);
+            // with solid fade the blend pass tests against scene depth + nearest faded surfaces
+            let datt = GpuRenderPassDepthStencilAttachment::new_with_gpu_texture_view(fade_depth_view.as_ref().unwrap_or(&depth));
             datt.set_depth_read_only(true);
             let desc = GpuRenderPassDescriptor::new(&[JsNullable::wrap(att)]);
             desc.set_depth_stencil_attachment(&datt);
@@ -4014,6 +4146,22 @@ impl Renderer {
             }
             let mut bound_tex = u32::MAX;
             let mut bound_pipe = usize::MAX;
+            // solid fade first: only the nearest faded surface passes (depth equal), blended once
+            for &(two_sided, tex, mesh_id, first, count) in &solid_runs {
+                pass.set_pipeline(&self.fade_pipelines[2 + two_sided as usize]);
+                pass.set_bind_group(1, Some(&groups[tex as usize]));
+                bound_tex = tex;
+                let mesh = &self.meshes[mesh_id as usize];
+                pass.set_vertex_buffer(0, Some(&mesh.vb));
+                pass.set_index_buffer(&mesh.ib, GpuIndexFormat::Uint32);
+                pass.draw_indexed_with_instance_count_and_first_index_and_base_vertex_and_first_instance(mesh.index_count, count, 0, 0, first);
+                stats.draw_calls += 1;
+                stats.transparent_draw_calls += 1;
+                stats.solid_fade_draws += 1;
+                let tris = (mesh.index_count / 3) as u64 * count as u64;
+                stats.triangles += tris;
+                stats.candidate_triangles += tris;
+            }
             for &(two_sided, tex, mesh_id, first, count) in &blend_runs {
                 let pi = 4 + two_sided as usize;
                 if self.pipeline_broken[pi].get() {

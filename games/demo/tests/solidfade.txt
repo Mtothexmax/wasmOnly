@@ -1,0 +1,26 @@
+# Solid fade: faded entities drawn as their nearest surface, blended once (render.solid_fade).
+#   node tools/bridge.mjs run games/demo/tests/solidfade.txt
+
+reload
+screen play
+pause
+call spawn {"shape":"cube","pos":[0,1.6,11],"name":"fOuter","body":"none","color":"#3070e0"}
+call set {"name":"fOuter","scale":[2.2,2.2,2.2]}
+call spawn {"shape":"cube","pos":[0,1.6,11],"name":"fInner","body":"none","color":"#e03030"}
+call set {"name":"fOuter","opacity":0.5}
+call set {"name":"fInner","opacity":0.5}
+call render {"solid_fade": false}
+frames 3
+expect stats.render.solid_fade_draws == 0
+call render {"solid_fade": true}
+frames 3
+expect stats.render.solid_fade_draws >= 1
+expect logs{"level": "error"}.entries.length == 0
+# fully opaque again: back on the opaque path
+call set {"name":"fOuter","opacity":1}
+call set {"name":"fInner","opacity":1}
+frames 3
+expect stats.render.solid_fade_draws == 0
+call render {"solid_fade": false}
+call despawn {"name":"fOuter"}
+call despawn {"name":"fInner"}
