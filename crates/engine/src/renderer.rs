@@ -1203,10 +1203,16 @@ pub struct Renderer {
     /// Latency fallback: (sum, count) this window, overloaded windows in a row, healthy since,
     /// last step back up, wait before the next step back up (ms).
     lat_window: (f32, u32),
+    /// Drawn triangles summed over the window (the load a failed cadence is remembered with).
+    lat_tris: f64,
+    /// Per `auto_frame_step` level k (index k-1): the average drawn triangles when the faster cadence
+    /// (k-1) failed. Stepping back needs the load to drop clearly below it (session-wide).
+    lat_failed_tris: [f64; 3],
     lat_over: u32,
     lat_ok_since: Option<f64>,
     lat_last_up: f64,
     lat_wait_ms: f64,
+    lat_avg_tris: f64,
     /// When frames started being skipped (a promise that never resolves must not stop rendering).
     skip_since: Option<f64>,
     /// `copyExternalImageToTexture` works on this device (PowerVR B-Series writes zeros); if not,
@@ -1793,10 +1799,13 @@ impl Renderer {
             paced_interval: 1,
             late_presents: Rc::new(Cell::new(0)),
             lat_window: (0.0, 0),
+            lat_tris: 0.0,
+            lat_failed_tris: [0.0; 3],
             lat_over: 0,
             lat_ok_since: None,
             lat_last_up: -1e9,
             lat_wait_ms: 20000.0,
+            lat_avg_tris: 0.0,
             skip_since: None,
             external_copy_ok,
             meshes: vec![],
@@ -2765,6 +2774,7 @@ impl Renderer {
         if self.stats.gpu_latency_ms > 0.0 {
             self.lat_window.0 += self.stats.gpu_latency_ms;
             self.lat_window.1 += 1;
+            self.lat_tris += self.stats.triangles as f64;
         }
         let gpu = self.stats.gpu_ms.filter(|g| g.samples > 0).map(|g| if g.frame > 0.0 { g.frame } else { g.total });
         self.adapt.0 += gpu.unwrap_or(0.0);
@@ -2831,7 +2841,10 @@ impl Renderer {
             // no timestamp queries, but the submit -> done latency is known: judge the GPU by it
             None if self.lat_window.1 > 0 => {
                 let avg_lat = self.lat_window.0 / self.lat_window.1 as f32;
+                let avg_tris = self.lat_tris / self.lat_window.1 as f64;
                 self.lat_window = (0.0, 0);
+                self.lat_tris = 0.0;
+                self.lat_avg_tris = avg_tris;
                 if self.latency_step(avg_lat, s, lo, since, now) {
                     return;
                 }
@@ -2900,8 +2913,13 @@ impl Renderer {
                 self.adapt_last_change = now;
             } else if self.settings.auto_frame_cap && self.auto_frame_step < 3 && since >= 1500.0 && self.paced_on_time() {
                 self.auto_frame_step += 1;
+                let k = self.auto_frame_step as usize - 1;
+                // remember the load the faster cadence failed at (the lowest such load counts)
+                if self.lat_failed_tris[k] <= 0.0 || self.lat_avg_tris < self.lat_failed_tris[k] {
+                    self.lat_failed_tris[k] = self.lat_avg_tris.max(1.0);
+                }
                 self.adapt_last_change = now;
-                crate::log_info!("adaptive frame cap: +{} refresh per frame (gpu latency {avg_lat:.0} ms > {over:.0} ms at scale {s:.2})", self.auto_frame_step);
+                crate::log_info!("adaptive frame cap: +{} refresh per frame (gpu latency {avg_lat:.0} ms > {over:.0} ms at scale {s:.2}, {:.0}k triangles)", self.auto_frame_step, self.lat_avg_tris / 1000.0);
             }
             return true;
         }
@@ -2915,8 +2933,17 @@ impl Renderer {
             return true;
         }
         if self.auto_frame_step > 0 {
+            // Latency at the slow cadence says little about the fast one (Chrome adds 1-2 refreshes, the
+            // busy time is unknown): step back only when it already fits the faster frame time *and*
+            // the scene got clearly lighter than where the faster cadence failed.
+            let v = if self.vsync_ms > 0.0 { self.vsync_ms } else { 16.7 };
+            let fast_frame = (self.paced_interval.max(2) - 1) as f32 * v;
+            let failed = self.lat_failed_tris[self.auto_frame_step as usize - 1];
+            if avg_lat >= fast_frame + v || (failed > 0.0 && self.lat_avg_tris > failed * 0.7) {
+                return true;
+            }
             self.auto_frame_step -= 1;
-            crate::log_info!("adaptive frame cap: back to +{} (gpu latency {avg_lat:.0} ms < {ok:.0} ms)", self.auto_frame_step);
+            crate::log_info!("adaptive frame cap: back to +{} (gpu latency {avg_lat:.0} ms, {:.0}k triangles < 70 % of the {:.0}k it failed at)", self.auto_frame_step, self.lat_avg_tris / 1000.0, failed / 1000.0);
         } else if s < 1.0 {
             let next = (s + 0.05).min(1.0);
             crate::log_info!("adaptive resolution (latency): scale {s:.2} -> {next:.2} (gpu latency {avg_lat:.0} ms < {ok:.0} ms)");

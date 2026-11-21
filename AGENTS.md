@@ -157,7 +157,10 @@ normal `cargo` output above it.
   frame (`stats.render.auto_frame_step`, max +3, added to the `max_fps` divisor), but only while drawn frames still
   arrive at the paced rate (a GPU slower than that already slows rAF: only resolution helps). Under `1.5P + 2v` for
   20 s it steps back (first the extra refresh, then +0.05 scale); falling behind again within a minute of a step back
-  doubles the wait (max 5 min). Logged as `adaptive frame cap` / `adaptive resolution (latency)`.
+  doubles the wait (max 5 min). The extra refresh is only taken back when the latency already fits the faster frame
+  time (< its frame time + v) *and* the drawn triangles (`stats.render.triangles`, window average) are below 70 % of
+  the load the faster cadence failed at (remembered per level for the session): latency at the slow cadence cannot
+  show whether the GPU makes the fast one, and a failed step back is a visible hitch. Logged as `adaptive frame cap` / `adaptive resolution (latency)`.
   `stats.render.late_presents` counts frames whose latency exceeded the limit (total; reloads and shader compiles add
   some, so compare before/after).
 - **Render settings:** `call render` lists every setting; set any by name (sky, fog_*, bloom*, exposure,
