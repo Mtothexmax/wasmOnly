@@ -54,13 +54,13 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("gpu_scene", "GPU-driven scene of the main view: object slots, draw groups, id-buffer layout, last GPU counters (frustum, occluded, visible, shadow instances, LOD levels)"),
     ("render_texture", "Render textures (portraits, mirrors). args: {id?, render?: true (re-render once), export?: true (PNG blob URL -> url)}"),
     ("animation", "Animators (glTF clips, skinning, morph targets). args: {id?, play?: clip, fade?: 0.2, speed?: 1, looped?: true, stop?: true, morph?: index, weight?: w}"),
-    ("particles", "Particle emitters + live counts. args: {preset?: 'fire'|'smoke'|'sparks'|'fireflies'|'dust'|'magic'|'rain'|'splash', pos?: [x,y,z], burst?: n}"),
+    ("particles", "Particle emitters + live counts. args: {preset?: 'fire'|'smoke'|'sparks'|'fireflies'|'dust'|'magic'|'rain'|'splash', pos?: [x,y,z], burst?: n, layer?: 0..31, seed?: n, name?} spawns one (name defaults to the preset); without preset, {name?} filters the list."),
     ("scenes", "Scenes (entity groups) with counts. args: {unload?: name, begin?: name}"),
     ("save", "Save slots (localStorage) + blobs (IndexedDB). args: {op?: 'list'|'get'|'set'|'delete'|'blobs'|'delete_blob', slot?, data?, key?}"),
     ("stats", "Frame/sim timing, renderer stats, entity and body counts."),
     ("entities", "List entities. args: {name?: substring, limit?: 200, with?: 'mesh'|'body'|'light'|'label'|'camera'}"),
     ("entity", "Full detail of one entity. args: {id}"),
-    ("set", "Modify an entity. args: {id, pos?: [x,y,z], rot?: [deg x,y,z], scale?: [x,y,z], vel?: [x,y,z], color?: '#rrggbb', opacity?: 0..1 (this entity and its children; keeps its shadow)}"),
+    ("set", "Modify an entity. args: {id, pos?: [x,y,z], rot?: [deg x,y,z], scale?: [x,y,z], vel?: [x,y,z], color?: '#rrggbb', opacity?: 0..1 (this entity and its children; keeps its shadow), layer?: 0..31 (MeshRenderer::layer, children too)}"),
     ("spawn", "Spawn a primitive or a glTF model. args: {shape: 'cube'|'sphere', pos, size?: 1, color?: '#rrggbb', body?: 'dynamic'|'fixed'|'kinematic'|'none', name?} or {gltf: 'assets/x.glb', pos, size?: scale, auto_lod?: bool} or {camera: true, pos?, look_at?, fov?, name?, main?: bool} or {water: [x, z], pos, spacing?: 0.25, name?} (bounded water surface)"),
     ("despawn", "Remove entity and children. args: {id}"),
     ("pause", "Pause simulation (rendering continues)."),
@@ -69,14 +69,14 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("time_scale", "Set simulation speed. args: {value}"),
     ("seed", "Reseed the engine RNG (ctx.rng). args: {value}"),
     ("input", "Inject input. args: {key?: 'KeyW', down?: bool} | {button?: 0|1|2, down?} | {x?, y?: pointer position, CSS px} | {dx?, dy?} | {action?: 'ui-action'} | {touch: {id, x, y, phase: 'start'|'move'|'end'}} | {release_all: true} | {stick: bool} (virtual joystick on/off). Returns keys, buttons and touch gestures"),
-    ("logs", "Structured log entries. args: {since?: seq, level?: 'debug'|'info'|'warn'|'error', limit?: 100}"),
+    ("logs", "Structured log entries (ring buffer of the last 10000). args: {since?: seq, level?: 'debug'|'info'|'warn'|'error', limit?: 100 (newest N; 'omitted' counts the rest)}. Returns next, oldest, omitted, entries."),
     ("render", "Get/set any render setting by name (call without args to list them): shadows, debug_view 0|1|2, sun_dir, sun_intensity, sky, sky_zenith, sky_horizon, fog_density, fog_height_falloff, fog_start, fog_max, fog_color ([r,g,b] or null), exposure, bloom, bloom_intensity, bloom_threshold, depth_darkening, vignette, saturation, particles, gpu_culling, occlusion_culling, camera_jitter, depth_jitter, reverse_draw_order, freeze_time, ... Result includes gpu_culling_supported."),
     ("cameras", "Every Camera entity: id, name, main (renders the canvas), marked_main, render_texture, layers."),
     ("camera", "Main camera pose + projection (the one with MainCamera, else the first Camera); args {pos?, look_at?} moves it, {layers: mask} sets its layer mask, {main: id|name} makes another Camera entity the main one; `cameras` lists all."),
     ("raycast", "Physics ray cast. args: {origin, dir, max?: 1000, exclude?: id|name|[...] (ignore these bodies, e.g. the caster)}"),
     ("pick", "Entity under a canvas point (CSS px). args: {x, y, mesh?: true = test rendered meshes instead of physics colliders; also returns depth_ties (z-fighting partners)}"),
     ("ui", "HUD slot contents."),
-    ("bend", "Pushers that bend Material::bend geometry and GPU grass. args: {pushers?: [[x,y,z,radius], ...] (replaces; [] = none), material?: id, bend?: value (sets Material::bend)}. Returns pushers and every material with bend > 0."),
+    ("bend", "Pushers that bend Material::bend geometry and GPU grass. args: {pushers?: [[x,y,z,radius], ...] (replaces; [] = none), material?: id, bend?: value (sets Material::bend), wind?: [dir_x, dir_z, strength] (shared with GPU grass; strength 0 = still)}. Returns pushers, wind and every material with bend > 0."),
     ("zfight", "args: {radius?: m around the camera or `center` (use in big worlds), center?: [x,y,z] (default radius 10), entity?: id|name|[...] (only pairs involving these and their children; a name matches every entity with it), exclude?: id|name|[...]}. Find z-fighting: coplanar, same-facing, overlapping triangles of different entities (opaque/masked). args: {eps?: 0.002 plane distance, tolerance?: 0.002 overlap, limit?: 50}. Returns pair count and the worst pairs with entities, world point and screen position."),
     ("debug_mode", "Debug mode (also the ` key): logs every key/mouse press and the camera pose once per second to logs/debug-*.log via the dev server, shows a badge. args: {on?: bool}. Returns file, line counts, last camera, last error."),
     ("audio", "Audio state: context state, sounds (ready/loading/failed, plays), active voices with 3D position, last 32 plays with sim step."),
@@ -546,13 +546,20 @@ pub(crate) fn handle<G: Game>(
                     m.base_color = crate::renderer::srgb_hex(c);
                 }
             }
-            if let Some(o) = a.get("opacity").and_then(|v| v.as_f64()) {
+            let opacity = a.get("opacity").and_then(|v| v.as_f64());
+            let layer = a.get("layer").and_then(|v| v.as_u64());
+            if opacity.is_some() || layer.is_some() {
                 // glTF models: the root has no mesh, its descendants do
                 let mut targets = vec![e];
                 targets.extend(crate::scene::descendants_of(&ctx.world, &[e]));
                 for t in targets {
                     if let Ok(mut mr) = ctx.world.get::<&mut MeshRenderer>(t) {
-                        mr.opacity = o.clamp(0.0, 1.0) as f32;
+                        if let Some(o) = opacity {
+                            mr.opacity = o.clamp(0.0, 1.0) as f32;
+                        }
+                        if let Some(l) = layer {
+                            mr.layer = l.min(31) as u8;
+                        }
                     }
                 }
             }
@@ -653,10 +660,12 @@ pub(crate) fn handle<G: Game>(
         }
         "pause" => {
             ctx.time.paused = true;
+            ctx.time.held = true;
             Ok(json!({"paused": true, "step": ctx.time.step}))
         }
         "resume" => {
             ctx.time.paused = false;
+            ctx.time.held = false;
             Ok(json!({"paused": false, "step": ctx.time.step}))
         }
         "step" => {
@@ -740,7 +749,12 @@ pub(crate) fn handle<G: Game>(
                 _ => Level::Debug,
             };
             let limit = a.get("limit").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
-            Ok(json!({"next": log::next_seq(), "entries": log::entries_since(since, level, limit)}))
+            let all = log::entries_since(since, level, usize::MAX);
+            let omitted = all.len().saturating_sub(limit);
+            let entries: Vec<_> = all.into_iter().skip(omitted).collect();
+            // `omitted`: matching entries left out by `limit` (ask again with a higher limit);
+            // `oldest`: first seq still kept (the buffer holds the last 10000 entries)
+            Ok(json!({"next": log::next_seq(), "oldest": log::oldest_seq(), "omitted": omitted, "entries": entries}))
         }
         "render" => {
             // any RenderSettings field by name (unknown names are an error, types are checked)
@@ -938,13 +952,17 @@ pub(crate) fn handle<G: Game>(
                     .collect();
                 ctx.renderer.set_pushers(&p);
             }
+            if let Some(w) = a.get("wind").and_then(|v| v.as_array()) {
+                let f = |i: usize| w.get(i).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                ctx.renderer.grass_settings().wind = [f(0), f(1), f(2)];
+            }
             if let (Some(m), Some(b)) = (a.get("material").and_then(|v| v.as_u64()), a.get("bend").and_then(|v| v.as_f64())) {
                 ctx.renderer.material_mut(crate::renderer::MaterialId(m as u32)).ok_or("unknown material")?.bend = b as f32;
             }
             let mats: Vec<Value> = (0..ctx.renderer.material_count() as u32)
                 .filter_map(|i| ctx.renderer.material(crate::renderer::MaterialId(i)).filter(|m| m.bend > 0.0).map(|m| json!({"id": i, "name": m.name, "bend": m.bend})))
                 .collect();
-            Ok(json!({"pushers": ctx.renderer.pushers().iter().map(|(p, r)| json!([p.x, p.y, p.z, r])).collect::<Vec<_>>(), "max": crate::renderer::MAX_PUSHERS, "materials": mats}))
+            Ok(json!({"pushers": ctx.renderer.pushers().iter().map(|(p, r)| json!([p.x, p.y, p.z, r])).collect::<Vec<_>>(), "max": crate::renderer::MAX_PUSHERS, "wind": ctx.renderer.grass_settings().wind, "materials": mats}))
         }
         "zfight" => {
             let eps = a.get("eps").and_then(|v| v.as_f64()).unwrap_or(0.002) as f32;

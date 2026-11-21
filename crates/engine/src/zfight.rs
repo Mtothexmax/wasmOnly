@@ -153,12 +153,22 @@ pub fn find_near(world: &World, renderer: &Renderer, eps: f32, tolerance: f32, l
 #[allow(clippy::too_many_arguments)]
 pub fn find_filtered(world: &World, renderer: &Renderer, eps: f32, tolerance: f32, limit: usize, view_proj: Mat4, css: Vec2, near: Option<(Vec3, f32)>, involving: Option<&[Entity]>, exclude: &[Entity]) -> Value {
     let mut owners: Vec<Entity> = vec![];
+    let mut owner_layer: Vec<u32> = vec![];
     let mut tris: Vec<Tri> = vec![];
     let mut skipped: HashMap<&'static str, u32> = HashMap::new();
+    // layer masks of every camera (canvas and render textures): surfaces fight only where one
+    // camera draws both
+    let masks: Vec<u32> = world.query::<&crate::scene::Camera>().iter().map(|c| c.layers).collect();
+    let drawn = masks.iter().fold(0u32, |m, l| m | l);
     for (e, g, mr) in world.query::<(Entity, &GlobalTransform, &MeshRenderer)>().iter() {
         let Some(mat) = renderer.material(mr.material) else { continue };
         if exclude.contains(&e) {
             *skipped.entry("excluded").or_default() += 1;
+            continue;
+        }
+        let bit = 1u32 << (mr.layer & 31);
+        if drawn & bit == 0 {
+            *skipped.entry("layer not drawn").or_default() += 1;
             continue;
         }
         if mat.alpha_mode == AlphaMode::Blend || mat.water {
@@ -183,6 +193,7 @@ pub fn find_filtered(world: &World, renderer: &Renderer, eps: f32, tolerance: f3
         };
         let owner = owners.len() as u32;
         owners.push(e);
+        owner_layer.push(bit);
         let m = g.0;
         for t in cpu.1.as_chunks::<3>().0 {
             let p = [0, 1, 2].map(|k| m.transform_point3(Vec3::from(cpu.0[t[k] as usize])));
@@ -214,6 +225,10 @@ pub fn find_filtered(world: &World, renderer: &Renderer, eps: f32, tolerance: f3
                     break;
                 }
                 if ta.owner == tb.owner || ta.n.dot(tb.n) < 0.9995 {
+                    continue;
+                }
+                let both = owner_layer[ta.owner as usize] | owner_layer[tb.owner as usize];
+                if !masks.iter().any(|m| m & both == both) {
                     continue;
                 }
                 // 2D basis in the plane

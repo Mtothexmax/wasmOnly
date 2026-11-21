@@ -49,7 +49,7 @@ struct Globals {
     cascade_scale: array<vec4f, 4>,
     cascade_offset: array<vec4f, 4>,
     pushers: array<vec4f, 16>, // xyz = position, w = radius: bendable geometry leans away (`set_pushers`)
-    push: vec4f,               // x = pusher count
+    push: vec4f,               // x = pusher count, yz = wind (xz direction * strength) for Material::bend
 }
 
 // Lean of a point `h` metres above its base `base` away from the pushers (xz offset grows with
@@ -69,6 +69,25 @@ fn push_offset(base: vec3f, h: f32, strength: f32) -> vec3f {
     let l = length(off);
     if (l < 1e-4 || h <= 0.0) { return vec3f(0.0); }
     let o = off / l * min(l, 1.0) * min(strength * h, 0.85 * h);
+    let drop = h - sqrt(max(h * h - dot(o, o), 0.0));
+    return vec3f(o.x, -drop, o.y);
+}
+
+// Material::bend offset of a point `h` metres above its base: pushers plus wind sway (gusts phase-
+// shifted by position, like the GPU grass), capped at 0.85 h; the point drops to keep its length.
+fn bend_offset(base: vec3f, h: f32, strength: f32) -> vec3f {
+    if (h <= 0.0) { return vec3f(0.0); }
+    var o = vec2f(0.0);
+    if (g.push.x > 0.0) { o = push_offset(base, h, strength).xz; }
+    let wv = g.push.yz;
+    if (dot(wv, wv) > 0.0) {
+        let t = g.time.x;
+        let gust = sin(t * 1.7 + dot(base.xz, vec2f(0.21, 0.17))) * 0.6 + sin(t * 3.1 + base.x * 0.5 + h) * 0.25;
+        o += wv * (0.5 + gust) * strength * h * 0.5;
+    }
+    let l = length(o);
+    if (l < 1e-5) { return vec3f(0.0); }
+    o = o / l * min(l, 0.85 * h);
     let drop = h - sqrt(max(h * h - dot(o, o), 0.0));
     return vec3f(o.x, -drop, o.y);
 }

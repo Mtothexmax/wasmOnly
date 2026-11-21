@@ -83,6 +83,16 @@ pub struct Time {
     pub frame_ms: f32,
     pub time_scale: f32,
     pub paused: bool,
+    /// Set by the AI API `pause` (cleared by `resume`): freezes everything, also the emitters of an
+    /// overlay screen that keep running while it pauses the screens below.
+    #[serde(skip)]
+    pub(crate) held: bool,
+    /// Scene of the top screen while it pauses the screens below (`Screen::pauses_below`): its
+    /// particle emitters keep simulating although `paused` is set.
+    #[serde(skip)]
+    pub(crate) live_scene: Option<u32>,
+    #[serde(skip)]
+    live_acc: f32,
     /// CPU milliseconds per engine phase (smoothed): where a frame's CPU time goes.
     pub phases: Phases,
     #[serde(skip)]
@@ -621,6 +631,9 @@ async fn start<G: Game>(game: G, mut config: crate::renderer::RenderConfig) -> R
             frame_ms: 0.0,
             time_scale: 1.0,
             paused: false,
+            held: false,
+            live_scene: None,
+            live_acc: 0.0,
             phases: Phases::default(),
             accumulator: 0.0,
             acc_game_fixed: 0.0,
@@ -722,6 +735,19 @@ fn frame<G: Game>(c: &mut Ctx, game: &mut G, dt: f32) {
         }
         crate::interp::after_steps(c, n > 0);
     } else {
+        // an overlay that pauses the screens below still animates its own particles
+        if let (Some(scene), false) = (c.time.live_scene, c.time.held) {
+            c.time.live_acc += dt * c.time.time_scale;
+            let mut n = 0;
+            while c.time.live_acc >= c.time.fixed_dt && n < 8 {
+                crate::particles::step_scene(c, c.time.fixed_dt, scene);
+                c.time.live_acc -= c.time.fixed_dt;
+                n += 1;
+            }
+            if n == 8 {
+                c.time.live_acc = 0.0;
+            }
+        }
         crate::interp::after_steps(c, false);
     }
     let t_fixed = log::now_ms();

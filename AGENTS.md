@@ -34,7 +34,9 @@ normal `cargo` output above it.
   steps (1/60 s) synchronously. Assert with `call game_state` / `call entity '{"id":N}'`.
 - **Input injection:** `call input '{"key":"KeyW","down":true}'` takes the same code path as a
   real keypress. Buttons: `{"button":0}`; mouse motion: `{"dx":10,"dy":0}`; UI buttons: `{"action":"reset"}`.
-- **Logs:** `call logs '{"since":<seq>,"level":"warn"}'`. Every entry has `seq`, `step`, `t`, `level`.
+- **Logs:** `call logs '{"since":<seq>,"level":"warn"}'`. Every entry has `seq`, `step`, `t`, `level`. The ring
+  buffer keeps the last 10000 entries; `limit` (default 100) returns the newest N matches, `omitted` counts the rest
+  (ask again with a higher `limit`), `oldest` is the first seq still kept.
   Use `stats.log_seq` before an action and `since` after it to see only what the action caused.
 - **Debug mode / session logs:** the user presses ` (German: ^) to record keys, mouse buttons and the
   camera pose (1/s) into `logs/debug-*.log` (JSON lines: `t`, `step`, `frame`, `kind`, ...). Read the newest
@@ -55,6 +57,8 @@ normal `cargo` output above it.
   2. `call zfight` — geometric test, names both entities, world point, screen position; must be `"pairs": 0`;
      `{center:[x,y,z], radius}` checks around a point (top-down cameras), `{entity: id|name|[..]}` only pairs
      involving those (a name matches every entity with it, children included), `{exclude}` leaves some out;
+     render layers count: a pair is reported only when one camera (canvas or render texture) draws both layers,
+     entities on layers no camera draws are skipped (`skipped["layer not drawn"]`); `set {id|name, layer}`;
   3. `node tools/bridge.mjs flicker --out heat.png` — screenshots with flipped draw order and shifted depth
      mapping (pixels stay put), returns flickering regions + entity + `depth_ties` partner; catches what the
      geometric test skips (water, displaced meshes). `check --flicker` includes it.
@@ -64,6 +68,7 @@ normal `cargo` output above it.
   call, wait_for, expect, screenshot) and returns a pass/fail report per step plus new engine warnings; exit 1
   on failure. MCP: `run_script`. Syntax in the header of `tools/script.mjs`; example `games/demo/tests/smoke.txt`.
   Test scripts live in `games/<g>/tests/` (the watcher ignores that folder, so screenshots don't trigger reloads).
+  `expect`/`wait_for` paths may carry command args with spaces: `expect zfight{"center": [0,0,0], "radius": 5}.pairs == 0`.
   Phone layouts: `viewport 390 844 3 touch` in a script emulates the page size, DPR and touch (CDP device metrics;
   `viewport off`, ends with the run). `#` comments: at the line start or ` # ` after a command (`#id` stays text).
 - **Screens / scenes:** `call screens` = stack, history, scenes; `screens {switch|push|reset: name}`, `{pop:true}`.
@@ -78,11 +83,16 @@ normal `cargo` output above it.
   `ctx.spawn_particles_seeded(.., seed)` fixes one. `ParticleEmitter::layer` = render layer (like
   `MeshRenderer::layer`: a battle camera without that bit does not draw it). `Splash` is a one-shot burst:
   `..preset(Splash)` with a `rate` also needs `one_shot: false`, or it despawns once the first drops die.
+  Emitters on a layer no camera draws (canvas or render texture) are not simulated: they wait where they are. An
+  overlay screen that pauses the screens below (`pauses_below`) still simulates its own scene's emitters; the AI
+  API `pause` freezes those too (`step` steps everything). API `particles {preset, .., name}`, list filter `{name}`.
 - **Bending vegetation:** `Material::bend` (0 = off; ~0.5..1.5) makes instances lean away from *pushers* in the vertex
   shader, growing with height above the instance origin (the mesh origin must be at its foot); GPU grass flattens
   around them too. Per frame: `ctx.renderer.set_pushers(&[(player_pos, 0.8), ..])` (max 16, world position + radius).
+  Bend materials also sway in the wind (gusts phased by position, like the GPU grass) with the same wind as the grass:
+  `renderer.grass_settings().wind = [dir_x, dir_z, strength]` (strength 0 = still; also when grass is off).
   No per-frame upload; shadows and culling bounds stay unbent; don't `batch_static` bendable props (the batch has one
-  origin). API: `bend {pushers: [[x,y,z,r],..], material, bend}`. Test: `games/demo/tests/vegetation.txt`.
+  origin). API: `bend {pushers: [[x,y,z,r],..], material, bend, wind}`. Test: `games/demo/tests/vegetation.txt`.
 - **Render textures:** `call render_texture` = size, camera, renders, export url; `{id, render:true}`, `{id, export:true}`.
 - **Several cameras:** the canvas renders from the camera with `MainCamera` (`ctx.set_main_camera(e)`), else the first
   `Camera`; audio listener, streaming, terrain, ocean and debug tools follow it (`scene::main_camera(world)`). `call

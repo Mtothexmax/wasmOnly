@@ -30,3 +30,38 @@ expect zfight{"center":[30,0.5,30],"radius":3}.pairs == 1
 expect zfight{"entity":"zA","exclude":"zB"}.pairs == 0
 call despawn {"name":"zA"}
 call despawn {"name":"zB"}
+
+# zfight ignores surfaces that no camera draws together (render layers)
+call spawn {"shape":"cube","pos":[34,0.5,30],"name":"zL1","body":"none"}
+call spawn {"shape":"cube","pos":[34,0.5,30],"name":"zL2","body":"none"}
+step 1
+expect zfight{"center": [34, 0.5, 30], "radius": 3}.pairs == 1
+call set {"name":"zL2","layer":31}
+expect zfight{"center": [34, 0.5, 30], "radius": 3}.pairs == 1   # a camera draws both layers
+call camera {"layers":2147483647}
+expect zfight{"center": [34, 0.5, 30], "radius": 3}.pairs == 0   # no camera draws layer 31
+call camera {"layers":4294967295}
+call despawn {"name":"zL1"}
+call despawn {"name":"zL2"}
+
+# wind for Material::bend (shared with the GPU grass)
+call bend {"wind":[1,0,0.5]}
+expect bend.wind == [1,0,0.5]
+call bend {"wind":[0.8,0.4,0.25]}
+
+# particles on a layer no camera draws are not simulated
+call particles {"preset":"sparks","pos":[0,2,0],"layer":6,"burst":40,"name":"hidden6"}
+call camera {"layers":4294967231}
+step 10
+expect particles{"name":"hidden6"}.emitters.0.count == 0
+call camera {"layers":4294967295}
+step 2
+expect particles{"name":"hidden6"}.emitters.0.count > 0
+
+# an overlay that pauses the screens below still runs its own emitters (not under API pause)
+resume
+call screens {"push":"pause"}
+call particles {"preset":"sparks","pos":[0,2,0],"burst":40,"name":"overlay"}
+wait 300
+expect particles{"name":"overlay"}.emitters.0.count > 0
+call screens {"pop":true}

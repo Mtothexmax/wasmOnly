@@ -65,7 +65,11 @@ impl Scenes {
     pub fn id(&self, name: &str) -> Option<u32> {
         self.names.iter().position(|n| n == name).map(|i| i as u32)
     }
-    fn id_or_new(&mut self, name: &str) -> u32 {
+    pub(crate) fn current_id(&self) -> u32 {
+        self.current
+    }
+
+    pub(crate) fn id_or_new(&mut self, name: &str) -> u32 {
         self.id(name).unwrap_or_else(|| {
             self.names.push(name.to_string());
             (self.names.len() - 1) as u32
@@ -190,7 +194,8 @@ pub trait Screen<D>: 'static {
     fn update(&mut self, ctx: &mut Ctx, data: &mut D, dt: f32) -> Trans<D> {
         Trans::None
     }
-    /// For overlays: pause the simulation of the screens below while this one is on top.
+    /// For overlays: pause the simulation of the screens below while this one is on top. The
+    /// overlay's own particle emitters (its scene) keep simulating; the AI API `pause` stops them too.
     fn pauses_below(&self) -> bool {
         true
     }
@@ -309,6 +314,11 @@ impl<D: 'static> ScreenStack<D> {
                 self.enter_top(ctx);
             }
         }
+        // the top screen's particles keep running while it pauses the screens below
+        ctx.time.live_scene = match self.stack.last() {
+            Some(top) if self.stack.len() > 1 && top.pauses_below() && ctx.time.paused => Some(ctx.scenes.id_or_new(top.name())),
+            _ => None,
+        };
     }
 
     fn make(&self, name: &str) -> Result<Box<dyn Screen<D>>, String> {

@@ -105,10 +105,10 @@ fn vs_main(v: VsIn) -> VsOut {
     }
     var world = inst.model * vec4f(local, 1.0);
     var normal = (inst.normal * vec4f(v.normal, 0.0)).xyz;
-    // Material::bend: lean away from the pushers, growing with the height above the instance origin
-    if (inst.maps.w > 0.0 && inst.params.z >= 0.0 && inst.params.z < 2.5 && g.push.x > 0.0) {
+    // Material::bend: wind sway + lean away from the pushers, growing with the height above the origin
+    if (inst.maps.w > 0.0 && inst.params.z >= 0.0 && inst.params.z < 2.5 && (g.push.x > 0.0 || dot(g.push.yz, g.push.yz) > 0.0)) {
         let base = inst.model[3].xyz;
-        world = vec4f(world.xyz + push_offset(base, max(world.y - base.y, 0.0), inst.maps.w), 1.0);
+        world = vec4f(world.xyz + bend_offset(base, max(world.y - base.y, 0.0), inst.maps.w), 1.0);
     }
     var uv = v.uv;
     if (inst.params.z > 2.5) { // water: Gerstner waves in world space; uv = undisplaced world xz

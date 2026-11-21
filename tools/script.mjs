@@ -90,7 +90,8 @@ const OPS = {
 
 /** "game_state.score >= 1 [timeout]" -> {path, op, value, timeout} */
 function parseCond(arg) {
-  const m = arg.match(/^(\S+)\s+(==|!=|<=|>=|<|>|~=|contains)\s+(.+?)(?:\s+(\d+))?$/);
+  // the path may carry command args in braces, with spaces: zfight{"center": [0,0,0], "radius": 5}.pairs
+  const m = arg.match(/^((?:[^\s{]|\{[^}]*\})+)\s+(==|!=|<=|>=|<|>|~=|contains)\s+(.+?)(?:\s+(\d+))?$/);
   if (!m) throw new Error(`condition must be '<path> <op> <value>', got '${arg}'`);
   return { path: parsePath(m[1]), op: m[2], value: parseValue(m[3]), timeout: m[4] ? Number(m[4]) : undefined };
 }

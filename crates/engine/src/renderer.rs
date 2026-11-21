@@ -2975,7 +2975,11 @@ impl Renderer {
             cascade_scale: [[1.0, 1.0, 1.0, 0.0]; MAX_CASCADES],
             cascade_offset: [[0.0; 4]; MAX_CASCADES],
             pushers: self.pushers,
-            push: [self.push_count as f32, 0.0, 0.0, 0.0],
+            push: {
+                // the GPU grass wind also sways Material::bend geometry (strength 0 = still)
+                let w = self.grass.settings.wind;
+                [self.push_count as f32, w[0] * w[2], w[1] * w[2], 0.0]
+            },
         };
 
         // --- Instances -------------------------------------------------------------------------

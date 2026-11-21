@@ -428,10 +428,31 @@ impl ParticleSystem {
     }
 }
 
-/// Steps every particle system (fixed step) and despawns finished one-shots.
+/// Steps every particle system (fixed step) and despawns finished one-shots. Emitters on a layer
+/// that no camera draws (canvas or render texture) are not simulated: they wait where they are.
 pub(crate) fn step_all(ctx: &mut Ctx, dt: f32) {
+    step_where(ctx, dt, None);
+}
+
+/// Steps only the emitters of one scene (the top screen while it pauses the screens below).
+pub(crate) fn step_scene(ctx: &mut Ctx, dt: f32, scene: u32) {
+    step_where(ctx, dt, Some(scene));
+}
+
+fn step_where(ctx: &mut Ctx, dt: f32, scene: Option<u32>) {
+    let drawn = ctx.world.query::<&crate::scene::Camera>().iter().fold(0u32, |m, c| m | c.layers);
+    // entities spawned this frame are tagged later, with the current scene
+    let current = ctx.scenes.current_id();
     let mut done = vec![];
-    for (e, ps, t, g) in ctx.world.query_mut::<(Entity, &mut ParticleSystem, &Transform, Option<&GlobalTransform>)>() {
+    for (e, ps, t, g, tag) in ctx.world.query_mut::<(Entity, &mut ParticleSystem, &Transform, Option<&GlobalTransform>, Option<&crate::screens::SceneTag>)>() {
+        if drawn & (1u32 << (ps.emitter.layer & 31)) == 0 {
+            continue;
+        }
+        if let Some(s) = scene {
+            if tag.map_or(current, |t| t.0) != s {
+                continue;
+            }
+        }
         let (origin, rot) = match g {
             Some(g) => {
                 let (_, r, p) = g.0.to_scale_rotation_translation();
@@ -493,9 +514,10 @@ impl Ctx {
             if let Some(l) = a["layer"].as_u64() {
                 em.layer = l.min(31) as u8;
             }
+            let ename = a["name"].as_str().unwrap_or(name).to_string();
             let e = match a["seed"].as_u64() {
-                Some(seed) => self.spawn_particles_seeded(name, pos, em, seed),
-                None => self.spawn_particles(name, pos, em),
+                Some(seed) => self.spawn_particles_seeded(&ename, pos, em, seed),
+                None => self.spawn_particles(&ename, pos, em),
             };
             return Ok(json!({"id": e.id()}));
         }
@@ -503,6 +525,7 @@ impl Ctx {
             .world
             .query::<(Entity, &ParticleSystem, Option<&Name>, &Transform)>()
             .iter()
+            .filter(|(_, _, n, _)| a["name"].as_str().is_none_or(|f| n.is_some_and(|n| n.0 == f)))
             .map(|(e, ps, n, t)| json!({"id": e.id(), "name": n.map(|n| n.0.clone()), "pos": t.translation.to_array(), "count": ps.count(), "emitter": ps.emitter}))
             .collect();
         let total: usize = self.world.query::<&ParticleSystem>().iter().map(|p| p.count()).sum();

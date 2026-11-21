@@ -5,7 +5,7 @@ use serde::Serialize;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 
-const CAPACITY: usize = 1000;
+const CAPACITY: usize = 10_000;
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "lowercase")]
@@ -74,7 +74,12 @@ pub fn write(level: Level, msg: String) {
     });
 }
 
-/// Entries with `seq >= since` and `level >= min_level`.
+/// Seq of the oldest entry still in the ring buffer (older ones were dropped).
+pub fn oldest_seq() -> u64 {
+    LOG.with(|l| l.borrow().entries.front().map_or(l.borrow().next_seq, |e| e.seq))
+}
+
+/// Entries with `seq >= since` and `level >= min_level`; the newest `limit` of them.
 pub fn entries_since(since: u64, min_level: Level, limit: usize) -> Vec<Entry> {
     LOG.with(|l| {
         let l = l.borrow();
