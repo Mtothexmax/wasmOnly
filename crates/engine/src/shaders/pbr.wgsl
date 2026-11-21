@@ -24,6 +24,7 @@ struct VsIn {
     @location(0) pos: vec3f,
     @location(1) normal: vec3f,
     @location(2) uv: vec2f,
+    @location(3) color: vec4f, // sRGB bytes (Unorm8x4)
     @builtin(instance_index) inst: u32,
 }
 
@@ -35,6 +36,7 @@ struct VsOut {
     @location(1) normal: vec3f,
     @location(2) uv: vec2f,
     @location(3) @interpolate(flat) inst: u32,
+    @location(4) color: vec4f, // linear vertex colour (white = none)
 }
 
 // Instance indirection: draw instance k reads the record in slot visible_ids[first_instance + k].
@@ -124,6 +126,8 @@ fn vs_main(v: VsIn) -> VsOut {
     o.normal = normal;
     o.uv = uv;
     o.inst = idx;
+    let c = v.color.rgb;
+    o.color = vec4f(c * (c * (c * 0.305306011 + 0.682171111) + 0.012522878), v.color.a); // sRGB -> linear
     return o;
 }
 
@@ -425,14 +429,14 @@ fn shade(i: VsOut, front: bool, d: Deriv, face_n: vec3f) -> Surface {
     }
 
     let alpha_mode = inst.params.w;
-    var alpha = inst.base_color.a * tex.a;
+    var alpha = inst.base_color.a * tex.a * i.color.a;
     if (alpha_mode > 0.0) {            // mask (alpha test)
         if (ALPHA_TEST && alpha < alpha_mode) { discard; }
         alpha = 1.0;
     } else if (alpha_mode == 0.0) {    // opaque
         alpha = 1.0;
     }
-    var albedo = tex.rgb * inst.base_color.rgb;
+    var albedo = tex.rgb * inst.base_color.rgb * i.color.rgb;
     let checker = inst.params.y;
     if (checker > 0.0) {
         let c = floor(i.world.x * checker) + floor(i.world.z * checker);
@@ -803,6 +807,7 @@ fn terrain_h(local_xz: vec2f) -> f32 {
 fn vs_grass(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VsOut {
     var o: VsOut;
     o.inst = 0u;
+    o.color = vec4f(1.0);
     o.clip = vec4f(2.0, 2.0, 2.0, 1.0); // culled unless placed below
     let n = grass.layer.y;
     let sp = grass.center.w;

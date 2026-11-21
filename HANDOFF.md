@@ -67,7 +67,8 @@ auto_lod: false, ..Default::default() })`, `ctx.gltf_defaults.auto_lod = false`,
    biggest pass or phase. Frame pacing picks the cadence (`stats.render.pacing`), adaptive resolution keeps the GPU
    inside `render.frame_budget_ms`; don't set a fixed `max_fps` per device. Call `ctx.renderer.prewarm()` at the end of
    a loading screen so first-use pipeline compiles (mobile drivers) don't hitch mid-game.
-6. **Z-fighting**: the debug build checks automatically near the camera; `zfight {radius}` on demand.
+6. **Z-fighting**: the debug build checks automatically near the camera (then only new entities); `zfight {radius}`
+   on demand, `{same_root: true}` ignores parts of one model, `NoZCheck` opts an entity out.
    Fix by offsetting surfaces, never with depth bias.
 7. Engine gaps or bugs: fix them in the engine repository (with a test in `games/demo/tests`) so every
    game benefits; keep game content (levels, generators, art) in the game repository.
@@ -87,7 +88,9 @@ auto_lod: false, ..Default::default() })`, `ctx.gltf_defaults.auto_lod = false`,
 | Canvas2D card art / `toDataURL` | Canvas in the DOM as before, or render to texture (`create_render_texture`, `export_render_texture` → blob URL for `<img>`) |
 | Photo mode (`snapPhoto`) | render texture + `export_render_texture`, or `bridge screenshot` for tests |
 | `THREE.Fog`, background colour, sky | `renderer.settings` fog_*, `sky_mode: 1` (atmosphere) + `clouds`, or sky_zenith/sky_horizon (gradient), `ctx.load_skybox(url)` |
-| Water plane | `Material::water(deep, shallow)` on `ctx.spawn_water(...)` (dense mesh for vertex waves) or `ctx.spawn_ocean(mat, y)` |
+| Water plane | `Material::water(deep, shallow)` on `ctx.spawn_water(...)` (dense mesh for vertex waves) or `ctx.spawn_ocean(mat, y)` (~145k triangles; phones: `spawn_ocean_with(mat, y, OceanOpts {..})`) |
+| Many colours, one material | `MeshBuilder::color(0xRRGGBB)` / `Vertex.color` (multiplied with the base colour) |
+| Deferred work under a frame budget | `JobQueue<T>` + `FrameBudget::new(ms)`, `while let Some(j) = q.pop(&b) {..}` |
 | Point/spot lights, day/night | `PointLight`, `SpotLight` (clustered, hundreds); `day_cycle` + `time_of_day` (+ `day_length_minutes`) drive sun, moon, sky and ambient; lamps follow `ctx.renderer.sky.night` |
 | Sprite particles | `ctx.spawn_particles(name, pos, ParticleEmitter::preset(..))` |
 | Rain `InstancedMesh` | `ParticlePreset::Rain`, or instanced entities (same mesh = one draw) |

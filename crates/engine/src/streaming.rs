@@ -4,7 +4,10 @@
 //! content when the camera comes within `load_radius` and the cell's scene is unloaded beyond
 //! `unload_radius` (hysteresis). Each loaded cell is its own scene (`stream:<layer>:<x>:<z>`), so
 //! everything spawned in the generator — entities, bodies, static colliders, particles, glTF that
-//! finishes loading later — goes away with it. Cells load nearest first, `budget` per frame.
+//! finishes loading later — goes away with it. Cells load nearest first, `budget` per frame
+//! (and `budget_ms` of generator time per frame when set). A generator that needs game data
+//! captures it (`Rc<RefCell<..>>`); work that should not run inside the generator goes into a
+//! [`crate::jobs::JobQueue`] the game drains under a [`crate::jobs::FrameBudget`].
 //!
 //! ```ignore
 //! ctx.add_stream_layer("props", 128.0, 400.0, |ctx, cell| {
@@ -60,6 +63,9 @@ pub struct StreamLayer {
     pub unload_radius: f64,
     /// Cells built per frame at most.
     pub budget: u32,
+    /// Stop building more cells this frame once the layer's generators took this long (ms,
+    /// 0 = only `budget` counts). The first cell of a frame always builds.
+    pub budget_ms: f32,
     pub enabled: bool,
     generator: CellFn,
     loaded: HashMap<(i32, i32), String>,
@@ -98,6 +104,7 @@ impl Ctx {
             load_radius: load_radius as f64,
             unload_radius: (load_radius * 1.2 + cell * 0.5) as f64,
             budget: 2,
+            budget_ms: 0.0,
             enabled: true,
             generator: Rc::new(generator),
             loaded: HashMap::new(),
@@ -134,9 +141,9 @@ impl Ctx {
             self.shift_origin(delta);
         }
         for li in 0..self.streaming.layers.len() {
-            let (name, cell, lr, ur, budget, enabled, gen) = {
+            let (name, cell, lr, ur, budget, budget_ms, enabled, gen) = {
                 let l = &self.streaming.layers[li];
-                (l.name.clone(), l.cell, l.load_radius, l.unload_radius, l.budget, l.enabled, l.generator.clone())
+                (l.name.clone(), l.cell, l.load_radius, l.unload_radius, l.budget, l.budget_ms, l.enabled, l.generator.clone())
             };
             if !enabled {
                 continue;
@@ -164,7 +171,11 @@ impl Ctx {
                 l.loaded.remove(&k);
                 l.unloads += 1;
             }
-            for (_, x, z) in want.into_iter().take(budget.max(1) as usize) {
+            let frame_t0 = crate::log::now_ms();
+            for (i, (_, x, z)) in want.into_iter().take(budget.max(1) as usize).enumerate() {
+                if i > 0 && budget_ms > 0.0 && (crate::log::now_ms() - frame_t0) as f32 >= budget_ms {
+                    break;
+                }
                 let scene = format!("stream:{name}:{x}:{z}");
                 let prev = self.scenes.current().to_string();
                 self.begin_scene(&scene);
@@ -243,6 +254,12 @@ impl Ctx {
             if let Some(e) = a["enabled"].as_bool() {
                 l.enabled = e;
             }
+            if let Some(b) = a["budget"].as_u64() {
+                l.budget = b as u32;
+            }
+            if let Some(b) = a["budget_ms"].as_f64() {
+                l.budget_ms = b as f32;
+            }
         }
         let cam = self.camera_absolute();
         let layers: Vec<Value> = self
@@ -253,7 +270,7 @@ impl Ctx {
                 let mut cells: Vec<[i32; 2]> = l.loaded.keys().map(|k| [k.0, k.1]).collect();
                 cells.sort();
                 json!({"name": l.name, "cell": l.cell, "load_radius": l.load_radius, "unload_radius": l.unload_radius, "enabled": l.enabled,
-                       "loaded": cells.len(), "cells": cells, "loads": l.loads, "unloads": l.unloads, "last_build_ms": l.last_build_ms})
+                       "budget": l.budget, "budget_ms": l.budget_ms, "loaded": cells.len(), "cells": cells, "loads": l.loads, "unloads": l.unloads, "last_build_ms": l.last_build_ms})
             })
             .collect();
         Ok(json!({

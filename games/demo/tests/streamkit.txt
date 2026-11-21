@@ -1,0 +1,30 @@
+# Open-world kit: ocean size, vertex colours, z-fighting filters (same root, NoZCheck), the
+# incremental automatic z-fighting check.
+#   node tools/bridge.mjs run games/demo/tests/streamkit.txt
+reload
+screen play
+# the first automatic check (everything near the camera) settles 1.5 s after the scene stops changing
+wait 2500
+pause
+# a small camera-following ocean (phones): far fewer triangles than the default 145k
+expect spawn{"ocean": -30, "radius": 2000, "segments": 64, "spacing": 0.5}.triangles < 15000
+# vertex colours: one material, a colour per brick (generator "palette", MeshBuilder::color)
+call generate {"name": "palette", "params": {"n": 4}, "pos": [-2, 0.5, 4]}
+step 2
+screenshot out/streamkit-palette.png
+# a coplanar overlap inside one hierarchy: reported, unless same_root
+call spawn {"shape": "cube", "pos": [30, 0.5, 30], "size": 1, "body": "none", "name": "zf_root"}
+call spawn {"shape": "cube", "pos": [0, 0, 0], "size": 1, "body": "none", "name": "zf_child", "parent": "zf_root"}
+step 1
+expect zfight{"entity": "zf_root"}.pairs >= 1
+expect zfight{"entity": "zf_root", "same_root": true}.pairs == 0
+expect zfight{"entity": "zf_root", "same_root": true}.same_root_triangle_pairs_skipped > 0
+# NoZCheck: a second overlapping cube opted out
+call spawn {"shape": "cube", "pos": [30, 0.5, 30], "size": 1, "body": "none", "name": "zf_quiet", "no_zcheck": true}
+step 1
+expect zfight{"entity": "zf_quiet"}.pairs == 0
+expect zfight{"entity": "zf_quiet"}.skipped.NoZCheck >= 1
+# the automatic check after the spawns only looked at the new entities
+resume
+wait_for zfight.auto.incremental_runs >= 1 10000
+expect zfight.auto.last_entities_checked < 20

@@ -28,6 +28,28 @@ pub struct Ocean {
     pub snap: f32,
 }
 
+/// Parameters of [`Ctx::spawn_ocean_with`].
+#[derive(Clone, Copy, Debug)]
+pub struct OceanOpts {
+    /// Outer radius in metres (default 5000; fog usually hides the edge).
+    pub radius: f32,
+    /// Vertices per ring (default 256, min 16): the main triangle lever.
+    pub segments: u32,
+    /// Ring spacing near the centre; `None` = the material's `water_vertex_spacing`.
+    pub spacing: Option<f32>,
+}
+
+impl Default for OceanOpts {
+    fn default() -> Self {
+        Self { radius: 5000.0, segments: 256, spacing: None }
+    }
+}
+
+/// Triangles of `ocean_mesh(radius, inner, segments)` without building it.
+pub fn ocean_triangles(radius: f32, inner: f32, segments: u32) -> usize {
+    ocean_mesh(radius, inner, segments).indices.len() / 3
+}
+
 /// Radial water mesh: rings of `segments` vertices, linear spacing `inner` up to the radius where
 /// the ring spacing equals it, then geometric growth (square-ish cells) out to `radius`.
 pub fn ocean_mesh(radius: f32, inner: f32, segments: u32) -> MeshData {
@@ -47,12 +69,12 @@ pub fn ocean_mesh(radius: f32, inner: f32, segments: u32) -> MeshData {
         r *= growth;
     }
     radii.push(radius);
-    let mut vertices = vec![Vertex { pos: [0.0, 0.0, 0.0], normal: [0.0, 1.0, 0.0], uv: [0.5, 0.5] }];
+    let mut vertices = vec![Vertex { pos: [0.0, 0.0, 0.0], normal: [0.0, 1.0, 0.0], uv: [0.5, 0.5], color: Vertex::WHITE }];
     for &rr in &radii[1..] {
         for s in 0..segs {
             let a = s as f32 / segs as f32 * tau;
             let (x, z) = (a.cos() * rr, a.sin() * rr);
-            vertices.push(Vertex { pos: [x, 0.0, z], normal: [0.0, 1.0, 0.0], uv: [0.5 + x / (2.0 * radius), 0.5 + z / (2.0 * radius)] });
+            vertices.push(Vertex { pos: [x, 0.0, z], normal: [0.0, 1.0, 0.0], uv: [0.5 + x / (2.0 * radius), 0.5 + z / (2.0 * radius)], color: Vertex::WHITE });
         }
     }
     let mut indices = vec![];
@@ -101,10 +123,20 @@ impl Ctx {
     }
 
     /// Endless sea at height `y` (local coordinates) that follows the camera: dense near the
-    /// viewer (the material's `water_vertex_spacing`), coarser with distance, 5 km radius.
+    /// viewer (the material's `water_vertex_spacing`), coarser with distance, 5 km radius,
+    /// 256 segments (~145k triangles). Smaller budgets (phones): [`Ctx::spawn_ocean_with`].
     pub fn spawn_ocean(&mut self, material: MaterialId, y: f32) -> Entity {
-        let spacing = self.renderer.material(material).map(|m| m.water_vertex_spacing).unwrap_or(0.25).max(0.05);
-        let mesh: MeshId = self.renderer.add_mesh("ocean", &ocean_mesh(5000.0, spacing, 256));
+        self.spawn_ocean_with(material, y, OceanOpts::default())
+    }
+
+    /// [`Ctx::spawn_ocean`] with radius, segments and inner spacing. Triangles grow with
+    /// `segments` (each ring has `segments` quads) and logarithmically with `radius`;
+    /// [`ocean_triangles`] predicts the count. 64 segments at 0.5 m spacing and 2 km: ~10k.
+    pub fn spawn_ocean_with(&mut self, material: MaterialId, y: f32, opts: OceanOpts) -> Entity {
+        let spacing = opts.spacing.unwrap_or_else(|| self.renderer.material(material).map(|m| m.water_vertex_spacing).unwrap_or(0.25)).max(0.05);
+        let md = ocean_mesh(opts.radius.max(1.0), spacing, opts.segments);
+        crate::log_info!("ocean: radius {} m, {} segments, spacing {spacing} m, {} triangles", opts.radius, opts.segments.max(16), md.indices.len() / 3);
+        let mesh: MeshId = self.renderer.add_mesh("ocean", &md);
         let e = self.spawn_mesh("ocean", mesh, material, Transform::from_xyz(0.0, y, 0.0));
         let _ = self.world.insert_one(e, Ocean { snap: spacing * 4.0 });
         follow_camera(self);

@@ -9,6 +9,33 @@ pub struct Vertex {
     pub pos: [f32; 3],
     pub normal: [f32; 3],
     pub uv: [f32; 2],
+    /// sRGB colour + alpha (0..255), multiplied with the material's base colour and texture
+    /// (alpha with the material alpha). [`Vertex::WHITE`] = no change.
+    pub color: [u8; 4],
+}
+
+impl Vertex {
+    pub const WHITE: [u8; 4] = [255; 4];
+
+    /// White vertex (no colour change).
+    pub fn new(pos: [f32; 3], normal: [f32; 3], uv: [f32; 2]) -> Self {
+        Self { pos, normal, uv, color: Self::WHITE }
+    }
+
+    /// Same vertex with an sRGB `0xRRGGBB` colour (opaque).
+    pub fn with_color(self, rgb: u32) -> Self {
+        Self { color: Self::rgb(rgb), ..self }
+    }
+
+    /// `0xRRGGBB` -> `[r, g, b, 255]`.
+    pub const fn rgb(rgb: u32) -> [u8; 4] {
+        [(rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8, 255]
+    }
+
+    /// Component-wise product of two colours (0..255 each).
+    pub fn mul_color(a: [u8; 4], b: [u8; 4]) -> [u8; 4] {
+        [0, 1, 2, 3].map(|i| ((a[i] as u32 * b[i] as u32 + 127) / 255) as u8)
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -60,6 +87,7 @@ impl MeshData {
                     pos: p.into(),
                     normal: n.into(),
                     uv: [(su + 1.0) * 0.5, 1.0 - (sv + 1.0) * 0.5],
+                    color: Vertex::WHITE,
                 });
             }
             m.indices
@@ -86,6 +114,7 @@ impl MeshData {
                     pos: (n * radius).into(),
                     normal: n.into(),
                     uv: [u, v],
+                    color: Vertex::WHITE,
                 });
             }
         }
@@ -109,21 +138,25 @@ impl MeshData {
                 pos: [-h, 0.0, -h],
                 normal: n,
                 uv: [0.0, 0.0],
+                color: Vertex::WHITE,
             },
             Vertex {
                 pos: [h, 0.0, -h],
                 normal: n,
                 uv: [uv_scale, 0.0],
+                color: Vertex::WHITE,
             },
             Vertex {
                 pos: [h, 0.0, h],
                 normal: n,
                 uv: [uv_scale, uv_scale],
+                color: Vertex::WHITE,
             },
             Vertex {
                 pos: [-h, 0.0, h],
                 normal: n,
                 uv: [0.0, uv_scale],
+                color: Vertex::WHITE,
             },
         ];
         MeshData {
@@ -147,7 +180,7 @@ impl MeshData {
         for z in 0..=nz {
             for x in 0..=nx {
                 let (u, v) = (x as f32 / nx as f32, z as f32 / nz as f32);
-                vertices.push(Vertex { pos: [-hx + u * size_x, 0.0, -hz + v * size_z], normal: [0.0, 1.0, 0.0], uv: [u * uv_scale, v * uv_scale] });
+                vertices.push(Vertex { pos: [-hx + u * size_x, 0.0, -hz + v * size_z], normal: [0.0, 1.0, 0.0], uv: [u * uv_scale, v * uv_scale], color: Vertex::WHITE });
             }
         }
         let mut indices = Vec::with_capacity((nx * nz * 6) as usize);
@@ -164,14 +197,14 @@ impl MeshData {
     /// vertices so it can be displaced; UVs are planar, `uv_scale` repeats across the diameter.
     pub fn disk(radius: f32, rings: u32, segments: u32, uv_scale: f32) -> Self {
         let (rings, segs) = (rings.max(1), segments.max(3));
-        let mut vertices = vec![Vertex { pos: [0.0, 0.0, 0.0], normal: [0.0, 1.0, 0.0], uv: [0.5 * uv_scale, 0.5 * uv_scale] }];
+        let mut vertices = vec![Vertex { pos: [0.0, 0.0, 0.0], normal: [0.0, 1.0, 0.0], uv: [0.5 * uv_scale, 0.5 * uv_scale], color: Vertex::WHITE }];
         for r in 1..=rings {
             let rr = radius * r as f32 / rings as f32;
             for s in 0..segs {
                 let a = s as f32 / segs as f32 * std::f32::consts::TAU;
                 let (x, z) = (a.cos() * rr, a.sin() * rr);
                 let uv = [(x / (2.0 * radius) + 0.5) * uv_scale, (z / (2.0 * radius) + 0.5) * uv_scale];
-                vertices.push(Vertex { pos: [x, 0.0, z], normal: [0.0, 1.0, 0.0], uv });
+                vertices.push(Vertex { pos: [x, 0.0, z], normal: [0.0, 1.0, 0.0], uv, color: Vertex::WHITE });
             }
         }
         let ring = |r: u32, s: u32| 1 + (r - 1) * segs + s % segs;
@@ -196,21 +229,25 @@ impl MeshData {
                 pos: [-0.5, 0.5, 0.0],
                 normal: n,
                 uv: [0.0, 0.0],
+                color: Vertex::WHITE,
             },
             Vertex {
                 pos: [0.5, 0.5, 0.0],
                 normal: n,
                 uv: [1.0, 0.0],
+                color: Vertex::WHITE,
             },
             Vertex {
                 pos: [0.5, -0.5, 0.0],
                 normal: n,
                 uv: [1.0, 1.0],
+                color: Vertex::WHITE,
             },
             Vertex {
                 pos: [-0.5, -0.5, 0.0],
                 normal: n,
                 uv: [0.0, 1.0],
+                color: Vertex::WHITE,
             },
         ];
         MeshData {
@@ -257,7 +294,7 @@ impl MeshData {
         };
         let mut cluster_of: Vec<u32> = Vec::with_capacity(self.vertices.len());
         let mut keys: HashMap<(u32, u32, u32, u8), u32> = HashMap::new();
-        let mut acc: Vec<(Vec3, Vec3, [f32; 2], f32)> = vec![];
+        let mut acc: Vec<(Vec3, Vec3, [f32; 2], f32, [f32; 4])> = vec![];
         for v in &self.vertices {
             let p = Vec3::from(v.pos);
             let q = ((p - min) / size * c).floor().min(Vec3::splat(c - 1.0));
@@ -268,7 +305,7 @@ impl MeshData {
                 bucket(Vec3::from(v.normal)),
             );
             let id = *keys.entry(key).or_insert_with(|| {
-                acc.push((Vec3::ZERO, Vec3::ZERO, [0.0, 0.0], 0.0));
+                acc.push((Vec3::ZERO, Vec3::ZERO, [0.0, 0.0], 0.0, [0.0; 4]));
                 acc.len() as u32 - 1
             });
             let a = &mut acc[id as usize];
@@ -277,14 +314,18 @@ impl MeshData {
             a.2[0] += v.uv[0];
             a.2[1] += v.uv[1];
             a.3 += 1.0;
+            for k in 0..4 {
+                a.4[k] += v.color[k] as f32;
+            }
             cluster_of.push(id);
         }
         let vertices: Vec<Vertex> = acc
             .iter()
-            .map(|(p, n, uv, k)| Vertex {
+            .map(|(p, n, uv, k, col)| Vertex {
                 pos: (*p / *k).into(),
                 normal: n.normalize_or(Vec3::Y).into(),
                 uv: [uv[0] / k, uv[1] / k],
+                color: col.map(|c| (c / k).round() as u8),
             })
             .collect();
         let mut seen = std::collections::HashSet::new();

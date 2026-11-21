@@ -54,12 +54,16 @@ normal `cargo` output above it.
   stubbed out and reports each (page + POST `/__log`).
 - **Z-fighting / flicker:** a screenshot cannot show flicker. Three layers:
   1. debug builds run the z-fighting test automatically after scene changes and log a warning
-     (shows up in `bridge reload` / `check`);
+     (shows up in `bridge reload` / `check`); the first run checks everything within 80 m of the camera, later runs
+     only the drawn entities that are new since the last run, against what their bounds touch (streamed chunks cost
+     their own size); `zfight` -> `auto` (runs, incremental_runs, last_entities_checked, last_ms);
   2. `call zfight` — geometric test, names both entities, world point, screen position; must be `"pairs": 0`;
      `{center:[x,y,z], radius}` checks around a point (top-down cameras), `{entity: id|name|[..]}` only pairs
      involving those (a name matches every entity with it, children included), `{exclude}` leaves some out;
      render layers count: a pair is reported only when one camera (canvas or render texture) draws both layers,
      entities on layers no camera draws are skipped (`skipped["layer not drawn"]`); `set {id|name, layer}`;
+     `{same_root: true}` skips pairs within one hierarchy (parts of one model); the `NoZCheck` component (entity and
+     its children) opts out of every check (API `spawn {.., no_zcheck: true}`, `{.., parent: id|name}`);
   3. `node tools/bridge.mjs flicker --out heat.png` — screenshots with flipped draw order and shifted depth
      mapping (pixels stay put), returns flickering regions + entity + `depth_ties` partner; catches what the
      geometric test skips (water, displaced meshes). `check --flicker` includes it.
@@ -100,7 +104,13 @@ normal `cargo` output above it.
   cameras` lists them; `camera {main: id|name}` switches, `{layers: mask}` sets the mask; `spawn {camera: true, pos,
   look_at, main}`. `stats.render.triangles` (drawn) and `candidate_triangles` count only the main camera's layers.
 - **Open world:** `call world` = floating origin (`origin`, `shifts`), streaming layers (loaded cells, loads/unloads,
-  build ms), entity + mesh counts; `{shift:[x,y,z]}`, `{origin_shift_distance}`, `{layer, radius, enabled}`.
+  build ms), entity + mesh counts; `{shift:[x,y,z]}`, `{origin_shift_distance}`, `{layer, radius, enabled, budget,
+  budget_ms}` (`StreamLayer::budget` = cells per frame, `budget_ms` = stop after that much generator time, 0 = off).
+  Game-side deferred work (chunk builds that need game data): `engine::jobs::JobQueue<T>` + `FrameBudget` (prelude):
+  `let b = FrameBudget::new(2.0); while let Some(job) = self.queue.pop(&b) { self.build(ctx, job) }` (first item
+  always runs; `push_front`, `retain`, `sort_by_key`; `stats()` JSON for `debug_state`). A static collider of a
+  rebuilt chunk: `physics.remove_static(handle)` (the scene forgets it; `physics.world.remove_collider` would leave it
+  in the scene's list); API `static_collider {pos, half}` / `{remove: [index, generation]}`.
   `call terrain` = size, chunks loaded/built/unloaded, height range; `{height_at:[x,z]}` (absolute), `{flatten|raise|paint}`.
   `call grass` (GPU grass settings, blade count), `call lights` (clustered lights; `{grid:{n}}` stress test),
   `call generate` (registered generators; `{name, params, seed, pos}` spawns one live), `call batch` (static batches,
@@ -202,6 +212,13 @@ normal `cargo` output above it.
   water_caustics}`. `render {debug_view:1}` shows the water normals.
   `spawn_water` tessellates each axis to the spacing (a 38.8x1.5 m strip at 0.1 m = 388x15 cells; at most 65536 cells,
   beyond that the spacing grows). API: `spawn {water: [x, z], pos, spacing}`. Test: `games/demo/tests/sky.txt`.
+  `spawn_ocean` = 5 km, 256 segments, ~145k triangles; phones: `ctx.spawn_ocean_with(mat, y, OceanOpts { radius: 2000.0,
+  segments: 64, spacing: Some(0.5) })` (~9k; `ocean_triangles(..)` predicts, the log names the count). API `spawn
+  {ocean: y, radius, segments, spacing}` -> triangles. Test: `games/demo/tests/streamkit.txt`.
+- **Vertex colours:** `Vertex.color: [u8; 4]` (sRGB + alpha, multiplied with the material's base colour/texture and
+  alpha; `Vertex::WHITE` = none; `Vertex::new(pos, normal, uv)`, `.with_color(0xRRGGBB)`). `MeshBuilder::color(0xRRGGBB)`
+  colours everything added after it (one material, a colour per brick; `add` multiplies), glTF `COLOR_0` is loaded,
+  LOD simplification averages them. Shadows ignore vertex alpha. Demo generator `palette` (`generate {name: "palette"}`).
 - **Music:** `call music` -> tracks with `state` (buffering/playing/paused/blocked/error), `time`, `duration`,
   `buffered_pct`; transitions are logged. Simulate a slow network for one path only:
   `curl -X POST "http://localhost:8080/__throttle?kbps=48&match=assets/music"` (`kbps=0` = off).

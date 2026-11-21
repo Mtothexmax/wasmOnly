@@ -1456,6 +1456,7 @@ impl Renderer {
                 GpuVertexAttribute::new(GpuVertexFormat::Float32x3, 0, 0),
                 GpuVertexAttribute::new(GpuVertexFormat::Float32x3, 12, 1),
                 GpuVertexAttribute::new(GpuVertexFormat::Float32x2, 24, 2),
+                GpuVertexAttribute::new(GpuVertexFormat::Unorm8x4, 32, 3),
             ];
             GpuVertexBufferLayout::new(std::mem::size_of::<Vertex>() as u32, &attrs)
         };

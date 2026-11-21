@@ -65,8 +65,10 @@ pub mod prelude {
     pub use crate::audio::{Bus, Fx, MusicOpts, Play, SoundId, SoundState, VoiceId};
     pub use crate::character::{CharacterController, ThirdPersonCamera};
     pub use crate::input::{Input, MouseButton};
+    pub use crate::jobs::{FrameBudget, JobQueue};
     pub use crate::lights::SpotLight;
-    pub use crate::water::Ocean;
+    pub use crate::water::{Ocean, OceanOpts};
+    pub use crate::zfight::NoZCheck;
     pub use crate::panel::{Panel, PanelId, WorldPanel};
     pub use crate::particles::{ParticleEmitter, ParticlePreset, ParticleShape, ParticleSystem};
     pub use crate::physics::{rapier, Body, Physics};

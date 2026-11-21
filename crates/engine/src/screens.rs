@@ -88,6 +88,12 @@ impl Scenes {
                 .unwrap_or(SceneTag(self.current));
             let _ = world.insert_one(e, tag);
         }
+        let removed = std::mem::take(&mut physics.removed_statics);
+        if !removed.is_empty() {
+            for list in self.statics.values_mut() {
+                list.retain(|h| !removed.contains(h));
+            }
+        }
         let new_statics = std::mem::take(&mut physics.new_statics);
         if !new_statics.is_empty() {
             self.statics.entry(self.current).or_default().extend(new_statics);

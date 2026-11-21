@@ -57,6 +57,7 @@ pub struct MeshBuilder {
     current: String,
     stack: Vec<Mat4>,
     uv: UvMode,
+    color: [u8; 4],
 }
 
 impl Default for MeshBuilder {
@@ -130,7 +131,21 @@ pub fn triangulate(poly: &[Vec2]) -> Vec<[usize; 3]> {
 
 impl MeshBuilder {
     pub fn new() -> Self {
-        Self { parts: BTreeMap::new(), current: "default".into(), stack: vec![Mat4::IDENTITY], uv: UvMode::Local }
+        Self { parts: BTreeMap::new(), current: "default".into(), stack: vec![Mat4::IDENTITY], uv: UvMode::Local, color: Vertex::WHITE }
+    }
+
+    /// Vertex colour (sRGB `0xRRGGBB`) for everything added from now on (multiplied with the
+    /// material's base colour; `add` multiplies it with the added mesh's own colours).
+    /// `0xffffff` = none. One material, many colours: per-brick shading without a palette texture.
+    pub fn color(&mut self, rgb: u32) -> &mut Self {
+        self.color = Vertex::rgb(rgb);
+        self
+    }
+
+    /// Like [`MeshBuilder::color`] with alpha (0..255, multiplied with the material alpha).
+    pub fn color_rgba(&mut self, rgba: [u8; 4]) -> &mut Self {
+        self.color = rgba;
+        self
     }
 
     /// World-projected UVs: `tiles_per_m` texture repeats per metre.
@@ -191,7 +206,7 @@ impl MeshBuilder {
         let m = self.m();
         let w = p.map(|q| m.transform_point3(q));
         let n = (w[1] - w[0]).cross(w[2] - w[0]).normalize_or(Vec3::Y);
-        let verts: Vec<Vertex> = (0..3).map(|i| Vertex { pos: w[i].into(), normal: n.into(), uv: self.uv_for(w[i], n, uv[i]) }).collect();
+        let verts: Vec<Vertex> = (0..3).map(|i| Vertex { pos: w[i].into(), normal: n.into(), uv: self.uv_for(w[i], n, uv[i]), color: self.color }).collect();
         let part = self.parts.entry(self.current.clone()).or_default();
         let base = part.vertices.len() as u32;
         part.vertices.extend(verts);
@@ -208,7 +223,7 @@ impl MeshBuilder {
         let m = self.m();
         let w = [a, b, c, d].map(|q| m.transform_point3(q));
         let n = (w[1] - w[0]).cross(w[2] - w[0]).normalize_or((w[2] - w[0]).cross(w[3] - w[0]).normalize_or(Vec3::Y));
-        let verts: Vec<Vertex> = (0..4).map(|i| Vertex { pos: w[i].into(), normal: n.into(), uv: self.uv_for(w[i], n, uv[i]) }).collect();
+        let verts: Vec<Vertex> = (0..4).map(|i| Vertex { pos: w[i].into(), normal: n.into(), uv: self.uv_for(w[i], n, uv[i]), color: self.color }).collect();
         let part = self.parts.entry(self.current.clone()).or_default();
         let base = part.vertices.len() as u32;
         part.vertices.extend(verts);
@@ -221,6 +236,7 @@ impl MeshBuilder {
         let m = self.m();
         let nm = Mat3::from_mat4(m).inverse().transpose();
         let uvm = self.uv;
+        let col = self.color;
         let part = self.parts.entry(self.current.clone()).or_default();
         let base = part.vertices.len() as u32;
         for v in &md.vertices {
@@ -229,11 +245,11 @@ impl MeshBuilder {
             let uv = match uvm {
                 UvMode::Local => v.uv,
                 UvMode::World(_) => {
-                    let tmp = MeshBuilder { parts: BTreeMap::new(), current: String::new(), stack: vec![], uv: uvm };
+                    let tmp = MeshBuilder { parts: BTreeMap::new(), current: String::new(), stack: vec![], uv: uvm, color: Vertex::WHITE };
                     tmp.uv_for(p, n, Vec2::from(v.uv))
                 }
             };
-            part.vertices.push(Vertex { pos: p.into(), normal: n.into(), uv });
+            part.vertices.push(Vertex { pos: p.into(), normal: n.into(), uv, color: Vertex::mul_color(v.color, col) });
         }
         part.indices.extend(md.indices.iter().map(|i| i + base));
         self

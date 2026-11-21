@@ -10,14 +10,14 @@
 //! edge do not count). Skipped: blended / water materials and vertex-displaced meshes (their CPU
 //! shape is not what the GPU draws).
 //!
-//! `engine.call("zfight", {eps?: 0.002, limit?: 50})`.
+//! `engine.call("zfight", {eps?: 0.002, limit?: 50, same_root?: false})`. Opt-out per entity: [`NoZCheck`].
 
 use crate::renderer::{AlphaMode, Renderer};
 use crate::scene::{GlobalTransform, MeshRenderer, Name};
 use glam::{Mat4, Vec2, Vec3};
 use hecs::{Entity, World};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 struct Tri {
     owner: u32, // index into `owners`
@@ -53,18 +53,44 @@ fn overlap_depth(a: &[Vec2; 3], b: &[Vec2; 3]) -> f32 {
     min_pen
 }
 
+/// Leaves an entity (and its children) out of every z-fighting check, automatic and `zfight`
+/// (e.g. decals or overlays that are coplanar on purpose and drawn in a fixed order).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoZCheck;
+
+/// Filters of [`find_with`].
+#[derive(Default)]
+pub struct Filter<'a> {
+    /// Only instances whose bounds touch this sphere (centre, radius).
+    pub near: Option<(Vec3, f32)>,
+    /// Report only pairs with at least one of these; the others are checked only where their
+    /// bounds touch one of these (cheap for a few new entities in a big world).
+    pub involving: Option<&'a [Entity]>,
+    pub exclude: &'a [Entity],
+    /// Skip pairs whose entities share a root (top of the `Parent` chain): parts of one model.
+    pub skip_same_root: bool,
+}
+
 /// Automatic check (debug builds): re-runs a moment after the scene changed (entity count or
 /// pending models) and warns in the log, so every `bridge reload` / `bridge check` surfaces new
-/// z-fighting without anyone asking for it.
+/// z-fighting without anyone asking for it. The first run checks everything within [`Self::RADIUS`]
+/// of the camera; later runs only the drawn entities that are new since the last run, against
+/// whatever their bounds touch (streamed chunks cost their own size, not the world's).
 #[derive(Default)]
 pub struct AutoCheck {
     last_entities: u32,
     last_pending: usize,
     due_ms: Option<f64>,
     last_report: String,
+    checked: HashSet<Entity>,
+    baseline: bool,
     pub runs: u32,
+    /// Runs that only checked new entities.
+    pub incremental_runs: u32,
     pub last_pairs: u32,
-    /// Triangles near the camera at the last skip (0 = not skipped).
+    /// Entities the last run was about (all near the camera, or the new ones).
+    pub last_entities_checked: u32,
+    /// Triangles to check at the last skip (0 = not skipped).
     pub skipped_triangles: u64,
     pub last_ms: f64,
 }
@@ -72,7 +98,7 @@ pub struct AutoCheck {
 impl AutoCheck {
     /// Automatic check radius around the camera (m): big streamed worlds would take seconds.
     pub const RADIUS: f32 = 80.0;
-    /// Above this many triangles near the camera the automatic check is skipped (it is O(n log n)
+    /// Above this many triangles to check the automatic check is skipped (it is O(n log n)
     /// on the CPU and blocks the frame: ~1 s per 100k triangles in a debug build). Run
     /// `zfight {radius}` by hand instead.
     pub const MAX_TRIANGLES: u64 = 150_000;
@@ -92,31 +118,54 @@ impl AutoCheck {
             return;
         }
         self.due_ms = None;
-        // cheap estimate first: triangles of instances whose centre is within the radius
-        if let Some(c) = camera {
-            let mut tris = 0u64;
+        let drawn: HashSet<Entity> = world.query::<(Entity, &MeshRenderer)>().iter().map(|(e, _)| e).collect();
+        // after the first evaluation (run or skipped as too big) only new entities are checked
+        let incremental = self.baseline;
+        self.baseline = true;
+        let fresh: Vec<Entity> = if incremental { drawn.iter().filter(|e| !self.checked.contains(e)).copied().collect() } else { vec![] };
+        self.checked = drawn;
+        if incremental && fresh.is_empty() {
+            return; // only despawns: nothing new can fight
+        }
+        // cheap estimate first: triangles of the instances to check (near the camera / the new ones)
+        let near = camera.map(|c| (c, Self::RADIUS));
+        let tri_count = |mr: &MeshRenderer| renderer.mesh(mr.mesh).map(|m| m.index_count as u64 / 3).unwrap_or(0);
+        let mut tris = 0u64;
+        if incremental {
+            for &e in &fresh {
+                let (Ok(mr), Ok(g)) = (world.get::<&MeshRenderer>(e), world.get::<&GlobalTransform>(e)) else { continue };
+                if camera.is_none_or(|c| g.translation().distance_squared(c) < (Self::RADIUS * 1.2).powi(2)) {
+                    tris += tri_count(&mr);
+                }
+            }
+        } else if let Some(c) = camera {
             for (g, mr) in world.query::<(&GlobalTransform, &MeshRenderer)>().iter() {
                 if g.translation().distance_squared(c) < (Self::RADIUS * 1.2).powi(2) {
-                    tris += renderer.mesh(mr.mesh).map(|m| m.index_count as u64 / 3).unwrap_or(0);
+                    tris += tri_count(mr);
                 }
             }
-            if tris > Self::MAX_TRIANGLES {
-                if self.skipped_triangles == 0 {
-                    crate::log_info!("automatic z-fighting check skipped: {tris} triangles within {} m (limit {}); run engine.call('zfight', {{radius: 20}}) by hand", Self::RADIUS, Self::MAX_TRIANGLES);
-                }
-                self.skipped_triangles = tris;
-                return;
-            }
-            self.skipped_triangles = 0;
         }
+        if tris > Self::MAX_TRIANGLES {
+            if self.skipped_triangles == 0 {
+                crate::log_info!("automatic z-fighting check skipped: {tris} triangles to check (limit {}); run engine.call('zfight', {{radius: 20}}) by hand", Self::MAX_TRIANGLES);
+            }
+            self.skipped_triangles = tris;
+            return;
+        }
+        self.skipped_triangles = 0;
         self.runs += 1;
+        if incremental {
+            self.incremental_runs += 1;
+        }
         let t0 = crate::log::now_ms();
-        let r = find_near(world, renderer, 0.002, 0.002, 3, Mat4::IDENTITY, Vec2::ZERO, camera.map(|c| (c, Self::RADIUS)));
+        let filter = Filter { near, involving: incremental.then_some(fresh.as_slice()), ..Default::default() };
+        let r = find_with(world, renderer, 0.002, 0.002, 3, Mat4::IDENTITY, Vec2::ZERO, &filter);
         let pairs = r["pairs"].as_u64().unwrap_or(0) as u32;
         self.last_pairs = pairs;
+        self.last_entities_checked = if incremental { fresh.len() as u32 } else { r["checked"]["entities"].as_u64().unwrap_or(0) as u32 };
         self.last_ms = crate::log::now_ms() - t0;
         if self.last_ms > 100.0 {
-            crate::log_warn!("automatic z-fighting check blocked the frame for {:.0} ms", self.last_ms);
+            crate::log_warn!("automatic z-fighting check blocked the frame for {:.0} ms ({} entities, {} triangles)", self.last_ms, r["checked"]["entities"], r["checked"]["triangles"]);
         }
         let report = if pairs == 0 {
             String::new()
@@ -125,16 +174,23 @@ impl AutoCheck {
                 .as_array()
                 .map(|w| w.iter().map(|p| format!("{}#{} x {}#{} at {}", p["a"]["name"].as_str().unwrap_or(""), p["a"]["id"], p["b"]["name"].as_str().unwrap_or(""), p["b"]["id"], p["point"])).collect())
                 .unwrap_or_default();
-            format!("z-fighting: {pairs} overlapping coplanar surface pair(s), e.g. {} — engine.call('zfight') for all", worst.join("; "))
+            let what = if incremental { "new " } else { "" };
+            format!("z-fighting: {pairs} {what}overlapping coplanar surface pair(s), e.g. {} — engine.call('zfight') for all", worst.join("; "))
         };
         if report != self.last_report {
             if pairs > 0 {
                 crate::log_warn!("{report}");
-            } else {
+                self.last_report = report;
+            } else if !incremental {
                 crate::log_info!("z-fighting resolved (0 pairs)");
+                self.last_report = report;
             }
-            self.last_report = report;
         }
+    }
+
+    pub fn describe(&self) -> Value {
+        json!({"runs": self.runs, "incremental_runs": self.incremental_runs, "last_pairs": self.last_pairs,
+            "last_entities_checked": self.last_entities_checked, "last_ms": self.last_ms, "skipped_triangles": self.skipped_triangles})
     }
 }
 
@@ -152,17 +208,50 @@ pub fn find_near(world: &World, renderer: &Renderer, eps: f32, tolerance: f32, l
 /// `exclude`: leave these entities out of the check.
 #[allow(clippy::too_many_arguments)]
 pub fn find_filtered(world: &World, renderer: &Renderer, eps: f32, tolerance: f32, limit: usize, view_proj: Mat4, css: Vec2, near: Option<(Vec3, f32)>, involving: Option<&[Entity]>, exclude: &[Entity]) -> Value {
+    find_with(world, renderer, eps, tolerance, limit, view_proj, css, &Filter { near, involving, exclude, skip_same_root: false })
+}
+
+fn root_of(world: &World, mut e: Entity) -> Entity {
+    for _ in 0..64 {
+        match world.get::<&crate::scene::Parent>(e) {
+            Ok(p) => e = p.0,
+            Err(_) => break,
+        }
+    }
+    e
+}
+
+fn opted_out(world: &World, mut e: Entity) -> bool {
+    for _ in 0..64 {
+        if world.get::<&NoZCheck>(e).is_ok() {
+            return true;
+        }
+        match world.get::<&crate::scene::Parent>(e) {
+            Ok(p) => e = p.0,
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
+/// The z-fighting test with every filter (see [`Filter`]).
+#[allow(clippy::too_many_arguments)]
+pub fn find_with(world: &World, renderer: &Renderer, eps: f32, tolerance: f32, limit: usize, view_proj: Mat4, css: Vec2, f: &Filter) -> Value {
     let mut owners: Vec<Entity> = vec![];
     let mut owner_layer: Vec<u32> = vec![];
+    let mut owner_root: Vec<Entity> = vec![];
     let mut tris: Vec<Tri> = vec![];
     let mut skipped: HashMap<&'static str, u32> = HashMap::new();
     // layer masks of every camera (canvas and render textures): surfaces fight only where one
     // camera draws both
     let masks: Vec<u32> = world.query::<&crate::scene::Camera>().iter().map(|c| c.layers).collect();
     let drawn = masks.iter().fold(0u32, |m, l| m | l);
+    let involving: Option<HashSet<Entity>> = f.involving.map(|v| v.iter().copied().collect());
+    // candidates: (entity, model matrix, mesh, layer bit, world bounding sphere)
+    let mut cands = vec![];
     for (e, g, mr) in world.query::<(Entity, &GlobalTransform, &MeshRenderer)>().iter() {
         let Some(mat) = renderer.material(mr.material) else { continue };
-        if exclude.contains(&e) {
+        if f.exclude.contains(&e) {
             *skipped.entry("excluded").or_default() += 1;
             continue;
         }
@@ -180,13 +269,46 @@ pub fn find_filtered(world: &World, renderer: &Renderer, eps: f32, tolerance: f3
             continue;
         }
         let Some(mesh) = renderer.mesh(mr.mesh) else { continue };
-        if let Some((c, r)) = near {
-            let scale = g.0.x_axis.truncate().length().max(g.0.y_axis.truncate().length()).max(g.0.z_axis.truncate().length());
-            if g.0.transform_point3(mesh.bounds_center).distance(c) > r + mesh.bounds_radius * scale {
+        let scale = g.0.x_axis.truncate().length().max(g.0.y_axis.truncate().length()).max(g.0.z_axis.truncate().length());
+        let (c, r) = (g.0.transform_point3(mesh.bounds_center), mesh.bounds_radius * scale);
+        if let Some((nc, nr)) = f.near {
+            if c.distance(nc) > nr + r {
                 *skipped.entry("outside radius").or_default() += 1;
                 continue;
             }
         }
+        if opted_out(world, e) {
+            *skipped.entry("NoZCheck").or_default() += 1;
+            continue;
+        }
+        cands.push((e, g.0, mr.mesh, bit, c, r));
+    }
+    // with `involving`: only entities whose bounds touch an involving one can be in a reported pair
+    if let Some(inv) = &involving {
+        let spheres: Vec<(Vec3, f32)> = cands.iter().filter(|c| inv.contains(&c.0)).map(|c| (c.4, c.5 + eps + tolerance)).collect();
+        let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+        for (c, r) in &spheres {
+            lo = lo.min(*c - *r);
+            hi = hi.max(*c + *r);
+        }
+        let before = cands.len();
+        cands.retain(|c| {
+            if inv.contains(&c.0) {
+                return true;
+            }
+            let (p, r) = (c.4, c.5);
+            if (p + r).cmplt(lo).any() || (p - r).cmpgt(hi).any() {
+                return false;
+            }
+            spheres.iter().any(|(q, qr)| p.distance_squared(*q) <= (r + qr) * (r + qr))
+        });
+        let n = (before - cands.len()) as u32;
+        if n > 0 {
+            *skipped.entry("not near an involved entity").or_default() += n;
+        }
+    }
+    for (e, m, mesh_id, bit, _, _) in cands {
+        let Some(mesh) = renderer.mesh(mesh_id) else { continue };
         let Some(cpu) = &mesh.cpu else {
             *skipped.entry("mesh too large for CPU copy").or_default() += 1;
             continue;
@@ -194,7 +316,7 @@ pub fn find_filtered(world: &World, renderer: &Renderer, eps: f32, tolerance: f3
         let owner = owners.len() as u32;
         owners.push(e);
         owner_layer.push(bit);
-        let m = g.0;
+        owner_root.push(if f.skip_same_root { root_of(world, e) } else { e });
         for t in cpu.1.as_chunks::<3>().0 {
             let p = [0, 1, 2].map(|k| m.transform_point3(Vec3::from(cpu.0[t[k] as usize])));
             let c = (p[1] - p[0]).cross(p[2] - p[0]);
@@ -206,6 +328,7 @@ pub fn find_filtered(world: &World, renderer: &Renderer, eps: f32, tolerance: f3
             tris.push(Tri { owner, n, d: n.dot(p[0]), p });
         }
     }
+    let mut same_root_pairs = 0u32;
 
     // group by quantized normal, sweep by plane distance
     let key = |n: Vec3| ((n.x * 64.0).round() as i32, (n.y * 64.0).round() as i32, (n.z * 64.0).round() as i32);
@@ -227,6 +350,10 @@ pub fn find_filtered(world: &World, renderer: &Renderer, eps: f32, tolerance: f3
                 if ta.owner == tb.owner || ta.n.dot(tb.n) < 0.9995 {
                     continue;
                 }
+                if f.skip_same_root && owner_root[ta.owner as usize] == owner_root[tb.owner as usize] {
+                    same_root_pairs += 1;
+                    continue;
+                }
                 let both = owner_layer[ta.owner as usize] | owner_layer[tb.owner as usize];
                 if !masks.iter().any(|m| m & both == both) {
                     continue;
@@ -236,7 +363,7 @@ pub fn find_filtered(world: &World, renderer: &Renderer, eps: f32, tolerance: f3
                 let v = ta.n.cross(u);
                 let to2 = |p: &[Vec3; 3]| p.map(|q| Vec2::new(q.dot(u), q.dot(v)));
                 if overlap_depth(&to2(&ta.p), &to2(&tb.p)) > tolerance {
-                    if let Some(inv) = involving {
+                    if let Some(inv) = &involving {
                         if !inv.contains(&owners[ta.owner as usize]) && !inv.contains(&owners[tb.owner as usize]) {
                             continue;
                         }
@@ -275,6 +402,7 @@ pub fn find_filtered(world: &World, renderer: &Renderer, eps: f32, tolerance: f3
         "worst": list.into_iter().take(limit).map(|x| x.1).collect::<Vec<_>>(),
         "checked": {"entities": owners.len(), "triangles": tris.len()},
         "skipped": skipped,
+        "same_root_triangle_pairs_skipped": same_root_pairs,
         "eps": eps,
     })
 }

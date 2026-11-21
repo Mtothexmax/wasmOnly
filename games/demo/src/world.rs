@@ -18,7 +18,7 @@ const TOWN_R: f32 = 110.0;
 const RING_R: f32 = 150.0;
 
 /// Registers the demo's generators (idempotent: re-registering replaces them).
-fn register_generators(ctx: &mut Ctx) {
+pub(crate) fn register_generators(ctx: &mut Ctx) {
     let g = &mut ctx.generators;
     g.register("pine", "{height: m}", |p, seed| {
         let h = p["height"].as_f64().unwrap_or(9.0) as f32;
@@ -32,6 +32,18 @@ fn register_generators(ctx: &mut Ctx) {
             r += rad;
         }
         let _ = r;
+        b.finish()
+    });
+    // vertex colours: one material, a colour per brick (MeshBuilder::color)
+    g.register("palette", "{n: bricks}", |p, _| {
+        let n = p["n"].as_u64().unwrap_or(4) as usize;
+        let colors = [0xd01010, 0x10a020, 0x1040d0, 0xf0c000, 0xffffff, 0x202020];
+        let mut b = MeshBuilder::new();
+        b.part("bricks");
+        for i in 0..n {
+            let x = i as f32 * 1.05;
+            b.color(colors[i % colors.len()]).cuboid(Vec3::new(x, 0.0, 0.0), Vec3::new(x + 1.0, 0.6, 1.0));
+        }
         b.finish()
     });
     g.register("lamp", "{height: m}", |p, _| {

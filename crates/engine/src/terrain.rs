@@ -378,7 +378,7 @@ impl Terrain {
                 for i in 0..n {
                     let (x, z) = (x0 + i * step, z0 + j * step);
                     let p = Vec3::new(self.desc.origin.x + x as f32 * e, self.sample(x, z), self.desc.origin.y + z as f32 * e) - center;
-                    md.vertices.push(Vertex { pos: p.into(), normal: normal(x, z).into(), uv: [i as f32 / (n - 1) as f32, j as f32 / (n - 1) as f32] });
+                    md.vertices.push(Vertex { pos: p.into(), normal: normal(x, z).into(), uv: [i as f32 / (n - 1) as f32, j as f32 / (n - 1) as f32], color: Vertex::WHITE });
                 }
             }
             for j in 0..n - 1 {

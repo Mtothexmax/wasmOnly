@@ -483,7 +483,7 @@ impl PlayScreen {
                 for v in &q.vertices {
                     let p = r * Vec3::new(v.pos[0], v.pos[1] + 0.5, v.pos[2]);
                     let n = r * Vec3::from(v.normal);
-                    md.vertices.push(engine::mesh::Vertex { pos: p.into(), normal: [n.x * 0.3, 1.0, n.z * 0.3], uv: v.uv });
+                    md.vertices.push(engine::mesh::Vertex { pos: p.into(), normal: [n.x * 0.3, 1.0, n.z * 0.3], uv: v.uv, color: engine::mesh::Vertex::WHITE });
                 }
                 md.indices.extend(q.indices.iter().map(|i| i + base));
             }
@@ -598,6 +598,7 @@ impl Screen<Data> for PlayScreen {
 
     fn enter(&mut self, ctx: &mut Ctx, data: &mut Data) {
         data.ensure(ctx);
+        world::register_generators(ctx); // `generate` works here too (e.g. "palette")
         data.progress.plays += 1;
         data.save(ctx);
         sky_setup(ctx);

@@ -61,7 +61,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("entities", "List entities. args: {name?: substring, limit?: 200, with?: 'mesh'|'body'|'light'|'label'|'camera'}"),
     ("entity", "Full detail of one entity. args: {id}"),
     ("set", "Modify an entity. args: {id, pos?: [x,y,z], rot?: [deg x,y,z], scale?: [x,y,z], vel?: [x,y,z], color?: '#rrggbb', opacity?: 0..1 (this entity and its children; keeps its shadow), layer?: 0..31 (MeshRenderer::layer, children too)}"),
-    ("spawn", "Spawn a primitive or a glTF model. args: {shape: 'cube'|'sphere', pos, size?: 1, color?: '#rrggbb', body?: 'dynamic'|'fixed'|'kinematic'|'none', name?} or {gltf: 'assets/x.glb', pos, size?: scale, auto_lod?: bool} or {camera: true, pos?, look_at?, fov?, name?, main?: bool} or {water: [x, z], pos, spacing?: 0.25, name?} (bounded water surface)"),
+    ("spawn", "Spawn a primitive or a glTF model. args: {shape: 'cube'|'sphere', pos, size?: 1, color?: '#rrggbb', body?: 'dynamic'|'fixed'|'kinematic'|'none', name?, parent?: id|name (pos is then local), no_zcheck?: true} or {gltf: 'assets/x.glb', pos, size?: scale, auto_lod?: bool} or {camera: true, pos?, look_at?, fov?, name?, main?: bool} or {water: [x, z], pos, spacing?: 0.25, name?} (bounded water surface) or {ocean: y, radius?: 5000, segments?: 256, spacing?} (camera-following sea, returns triangles)"),
     ("despawn", "Remove entity and children. args: {id}"),
     ("pause", "Pause simulation (rendering continues)."),
     ("resume", "Resume simulation."),
@@ -80,7 +80,8 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("ui", "HUD slot contents."),
     ("material", "Materials. Without id: every material (id, name, roughness, metallic, subsurface, clearcoat, bend). args: {id, roughness?, metallic?, subsurface?: 0..1, subsurface_color?: '#rrggbb' | null (= albedo), clearcoat?: 0..1, clearcoat_roughness?} sets them and returns the material."),
     ("bend", "Pushers that bend Material::bend geometry and GPU grass. args: {pushers?: [[x,y,z,radius], ...] (replaces; [] = none), material?: id, bend?: value (sets Material::bend), wind?: [dir_x, dir_z, strength] (shared with GPU grass; strength 0 = still)}. Returns pushers, wind and every material with bend > 0."),
-    ("zfight", "args: {radius?: m around the camera or `center` (use in big worlds), center?: [x,y,z] (default radius 10), entity?: id|name|[...] (only pairs involving these and their children; a name matches every entity with it), exclude?: id|name|[...]}. Find z-fighting: coplanar, same-facing, overlapping triangles of different entities (opaque/masked). args: {eps?: 0.002 plane distance, tolerance?: 0.002 overlap, limit?: 50}. Returns pair count and the worst pairs with entities, world point and screen position."),
+    ("static_collider", "args: {pos: [x,y,z], half?: [x,y,z]} adds a static box collider to the current scene (physics.add_static) -> {handle: [index, generation]}; {remove: [index, generation]} removes one (physics.remove_static, the scene forgets it) -> {removed}."),
+    ("zfight", "args: {radius?: m around the camera or `center` (use in big worlds), center?: [x,y,z] (default radius 10), entity?: id|name|[...] (only pairs involving these and their children; a name matches every entity with it), exclude?: id|name|[...], same_root?: true skips pairs within one hierarchy (parts of one model)}. Entities with the NoZCheck component (and their children) are never checked; `auto` = the automatic check (runs, incremental_runs, last_entities_checked, last_ms). Find z-fighting: coplanar, same-facing, overlapping triangles of different entities (opaque/masked). args: {eps?: 0.002 plane distance, tolerance?: 0.002 overlap, limit?: 50}. Returns pair count and the worst pairs with entities, world point and screen position."),
     ("debug_mode", "Debug mode (also the ` key): logs every key/mouse press and the camera pose once per second to logs/debug-*.log via the dev server, shows a badge. args: {on?: bool}. Returns file, line counts, last camera, last error."),
     ("audio", "Audio state: context state, sounds (ready/loading/failed, plays), active voices with 3D position, last 32 plays with sim step."),
     ("audio_play", "Play a sound by name. args: {sound, volume?: 1, pitch?: 1, pos?: [x,y,z], loop?, lowpass?: hz, highpass?: hz, bandpass?: [hz,q], echo?: [delay_s, feedback, mix?], reverb?: secs | [secs, mix], distort?: drive, pan?: -1..1, detune?: cents, bus?: sfx|voice|ambience|ui}. Returns the voice id."),
@@ -587,6 +588,20 @@ pub(crate) fn handle<G: Game>(
                 }
                 return Ok(json!({"id": e.id(), "main": crate::scene::main_camera(&ctx.world).map(|m| m.id())}));
             }
+            if let Some(y) = a.get("ocean").and_then(|v| v.as_f64()) {
+                let mat = ctx.renderer.add_material(crate::renderer::Material::water(0x0a3d5c, 0x2a9d8f));
+                let mut o = crate::water::OceanOpts::default();
+                if let Some(r) = a.get("radius").and_then(|v| v.as_f64()) {
+                    o.radius = r as f32;
+                }
+                if let Some(n) = a.get("segments").and_then(|v| v.as_u64()) {
+                    o.segments = n as u32;
+                }
+                o.spacing = a.get("spacing").and_then(|v| v.as_f64()).map(|v| v as f32);
+                let e = ctx.spawn_ocean_with(mat, y as f32, o);
+                let tris = ctx.world.get::<&crate::scene::MeshRenderer>(e).ok().and_then(|m| ctx.renderer.mesh(m.mesh).map(|m| m.index_count / 3));
+                return Ok(json!({"id": e.id(), "triangles": tris}));
+            }
             if let Some(size) = a.get("water").and_then(|v| v.as_array()) {
                 let f = |i: usize| size.get(i).and_then(|v| v.as_f64()).unwrap_or(4.0) as f32;
                 let pos = a.get("pos").and_then(v3).unwrap_or(Vec3::ZERO);
@@ -652,6 +667,13 @@ pub(crate) fn handle<G: Game>(
                         .add(&mut ctx.world, e, RigidBodyBuilder::kinematic_position_based(), collider);
                 }
                 _ => {}
+            }
+            if let Some(p) = a.get("parent") {
+                let parent = entity_set(ctx, p)?.into_iter().next().ok_or("parent: no such entity")?;
+                let _ = ctx.world.insert_one(e, crate::scene::Parent(parent));
+            }
+            if a.get("no_zcheck").and_then(|v| v.as_bool()) == Some(true) {
+                let _ = ctx.world.insert_one(e, crate::zfight::NoZCheck);
             }
             crate::scene::propagate_transforms(&mut ctx.world);
             Ok(json!({"id": e.id()}))
@@ -951,6 +973,21 @@ pub(crate) fn handle<G: Game>(
         "gpu_scene" => Ok(ctx.renderer.gpu_scene_info()),
         "collisions" => ctx.collisions_command(a),
         "overlap" => ctx.overlap_command(a),
+        "static_collider" => {
+            use crate::physics::rapier::prelude::{ColliderBuilder, ColliderHandle};
+            if let Some(h) = a["remove"].as_array() {
+                let (i, g) = (h.first().and_then(|x| x.as_u64()).unwrap_or(0), h.get(1).and_then(|x| x.as_u64()).unwrap_or(0));
+                let removed = ctx.physics.remove_static(ColliderHandle::from_raw_parts(i as u32, g as u32));
+                ctx.scenes.tag_new(&mut ctx.world, &mut ctx.physics);
+                return Ok(json!({"removed": removed}));
+            }
+            let pos = v3(&a["pos"]).ok_or("pos: [x,y,z] required (or remove: [index, generation])")?;
+            let half = v3(&a["half"]).unwrap_or(Vec3::splat(0.5));
+            let h = ctx.physics.add_static(ColliderBuilder::cuboid(half.x, half.y, half.z), pos);
+            ctx.scenes.tag_new(&mut ctx.world, &mut ctx.physics);
+            let (i, g) = h.into_raw_parts();
+            Ok(json!({"handle": [i, g], "scene": ctx.scenes.current()}))
+        }
         "trigger" => {
             let pos = v3(&a["pos"]).ok_or("pos: [x,y,z] required")?;
             let half = v3(&a["half"]).unwrap_or(Vec3::ONE);
@@ -1056,7 +1093,10 @@ pub(crate) fn handle<G: Game>(
                 Some(v) => entity_set(ctx, v)?,
                 None => vec![],
             };
-            Ok(crate::zfight::find_filtered(&ctx.world, &ctx.renderer, eps, tol, limit, ctx.renderer.last_view_proj, css, near, involving.as_deref(), &exclude))
+            let filter = crate::zfight::Filter { near, involving: involving.as_deref(), exclude: &exclude, skip_same_root: a["same_root"].as_bool() == Some(true) };
+            let mut r = crate::zfight::find_with(&ctx.world, &ctx.renderer, eps, tol, limit, ctx.renderer.last_view_proj, css, &filter);
+            r["auto"] = ctx.zcheck.describe();
+            Ok(r)
         }
         "debug_mode" => {
             if let Some(on) = a.get("on").and_then(|v| v.as_bool()) {

@@ -102,7 +102,7 @@ const d = await a.requestDevice();
 const info = a.info ? a.info.vendor + ' ' + a.info.architecture : '?';
 line('adapter: ' + info); log('probe', { adapter: info, ua: navigator.userAgent });
 d.onuncapturederror = (e) => log('probe-uncaptured', e.error.message);
-const vbuf = { arrayStride: 32, attributes: [{ format: 'float32x3', offset: 0, shaderLocation: 0 }, { format: 'float32x3', offset: 12, shaderLocation: 1 }, { format: 'float32x2', offset: 24, shaderLocation: 2 }] };
+const vbuf = { arrayStride: 36, attributes: [{ format: 'float32x3', offset: 0, shaderLocation: 0 }, { format: 'float32x3', offset: 12, shaderLocation: 1 }, { format: 'float32x2', offset: 24, shaderLocation: 2 }, { format: 'unorm8x4', offset: 32, shaderLocation: 3 }] };
 const results = [];
 for (const v of V) {
   const t0 = performance.now();

@@ -27,6 +27,7 @@ pub struct Physics {
     pub world: PhysicsWorld,
     /// Static colliders added since the last scene tagging (see `screens::Scenes`).
     pub(crate) new_statics: Vec<ColliderHandle>,
+    pub(crate) removed_statics: Vec<ColliderHandle>,
     /// Pairs touching after the last step, keyed by (collider, collider) in a fixed order.
     touching: BTreeMap<(u64, u64), Touch>,
     /// Events of the fixed steps of the current frame.
@@ -107,7 +108,7 @@ impl Physics {
     pub fn new() -> Self {
         let mut world = PhysicsWorld::new();
         world.gravity = Vec3::new(0.0, -9.81, 0.0);
-        Self { world, new_statics: vec![], touching: BTreeMap::new(), events: vec![], history: VecDeque::new(), probe_hits: vec![], steps: 0 }
+        Self { world, new_statics: vec![], removed_statics: vec![], touching: BTreeMap::new(), events: vec![], history: VecDeque::new(), probe_hits: vec![], steps: 0 }
     }
 
     pub fn set_gravity(&mut self, g: Vec3) {
@@ -141,6 +142,19 @@ impl Physics {
         let h = self.world.colliders.insert(collider.translation(at).build());
         self.new_statics.push(h);
         h
+    }
+
+    /// Removes a static collider from [`Physics::add_static`] / [`Physics::add_static_trigger`]
+    /// before its scene unloads (e.g. a streamed chunk rebuilt in place); the scene forgets it too.
+    /// Returns false when the handle is unknown (already removed). Prefer this over
+    /// `physics.world.remove_collider`, which leaves the handle in the scene's list.
+    pub fn remove_static(&mut self, h: ColliderHandle) -> bool {
+        if let Some(i) = self.new_statics.iter().position(|x| *x == h) {
+            self.new_statics.swap_remove(i);
+        } else {
+            self.removed_statics.push(h);
+        }
+        self.world.remove_collider(h).is_some()
     }
 
     /// Trigger zone on `entity`: a sensor that follows the entity's `Transform` (kinematic body). It

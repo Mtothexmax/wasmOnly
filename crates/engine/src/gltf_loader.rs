@@ -219,6 +219,15 @@ async fn parse(url: &str, bytes: Vec<u8>) -> Result<Parsed, String> {
             let normals: Option<Vec<[f32; 3]>> = reader.read_normals().map(|n| n.collect());
             let uvs: Option<Vec<[f32; 2]>> =
                 reader.read_tex_coords(0).map(|t| t.into_f32().collect());
+            // COLOR_0 is linear: stored as sRGB bytes like every other vertex colour
+            let colors: Option<Vec<[u8; 4]>> = reader.read_colors(0).map(|c| {
+                c.into_rgba_f32()
+                    .map(|c| {
+                        let s = |x: f32| (if x <= 0.0031308 { x * 12.92 } else { 1.055 * x.powf(1.0 / 2.4) - 0.055 }).clamp(0.0, 1.0);
+                        [(s(c[0]) * 255.0).round() as u8, (s(c[1]) * 255.0).round() as u8, (s(c[2]) * 255.0).round() as u8, (c[3].clamp(0.0, 1.0) * 255.0).round() as u8]
+                    })
+                    .collect()
+            });
             let indices: Vec<u32> = reader
                 .read_indices()
                 .map(|i| i.into_u32().collect())
@@ -239,6 +248,7 @@ async fn parse(url: &str, bytes: Vec<u8>) -> Result<Parsed, String> {
                             .and_then(|u| u.get(i))
                             .copied()
                             .unwrap_or([0.0, 0.0]),
+                        color: colors.as_ref().and_then(|c| c.get(i)).copied().unwrap_or(Vertex::WHITE),
                     })
                     .collect(),
                 indices,
