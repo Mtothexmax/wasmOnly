@@ -208,9 +208,21 @@ fn classify(model: &Mat4, mr: &MeshRenderer, mat: &Material, shadows_on: bool) -
     let alpha = if faded { -1.0 } else { cast_alpha };
     // Normal matrix = inverse transpose of the upper 3x3 (the shaders only use that part).
     let normal = Mat4::from_mat3(glam::Mat3::from_mat4(*model).inverse().transpose());
+    // the shaders use only its 3x3: column 3 and the w row carry plastic parameters
+    // (col 3 = subsurface colour (r < 0: albedo) + amount, [0].w = clear coat, [1].w = coat roughness)
+    let mut normal = normal.to_cols_array_2d();
+    let plastic = !mat.terrain && !mat.water && !mat.ui && !mat.unlit;
+    let (ss, cc) = if plastic { (mat.subsurface.clamp(0.0, 1.0), mat.clearcoat.clamp(0.0, 1.0)) } else { (0.0, 0.0) };
+    normal[3] = match mat.subsurface_color {
+        Some(c) => [c.x, c.y, c.z, ss],
+        None => [-1.0, 0.0, 0.0, ss],
+    };
+    normal[0][3] = cc;
+    normal[1][3] = mat.clearcoat_roughness.clamp(0.02, 1.0);
+    normal[2][3] = 0.0;
     let raw = InstanceRaw {
         model: model.to_cols_array_2d(),
-        normal: normal.to_cols_array_2d(),
+        normal,
         base_color: (mat.base_color * Vec4::new(1.0, 1.0, 1.0, if faded { mr.opacity.max(0.0) } else { 1.0 })).into(),
         emissive_metallic: if mat.terrain {
             mat.terrain_params
@@ -352,6 +364,16 @@ pub struct Material {
     /// above the instance origin at full push (1 = 45°, capped at 0.85). Tall grass, tufts, reeds,
     /// bushes. Vertex shader only: no CPU upload per frame; shadows and culling bounds stay unbent.
     pub bend: f32,
+    /// Cheap subsurface look (0..1, lit materials): wrap diffuse (the sun's terminator softens
+    /// and light reaches a bit into the shade) plus thin back-light translucency. ALU only.
+    pub subsurface: f32,
+    /// Colour of the light scattered through (default: the albedo; darker/saturated for ABS).
+    pub subsurface_color: Option<Vec3>,
+    /// Clear coat (0..1): a second, sharp GGX lobe (F0 0.04) over the base, e.g. ABS plastic or
+    /// lacquer. Also reflects the sky in `render.ambient_specular`.
+    pub clearcoat: f32,
+    /// Roughness of the coat (default 0.06).
+    pub clearcoat_roughness: f32,
 }
 
 /// Transparency of a material (glTF semantics).
@@ -399,6 +421,10 @@ impl Default for Material {
             terrain_params: [0.0, 0.0, 1.0, 0.0],
             terrain_tiling: [6.0; 4],
             bend: 0.0,
+            subsurface: 0.0,
+            subsurface_color: None,
+            clearcoat: 0.0,
+            clearcoat_roughness: 0.06,
         }
     }
 }

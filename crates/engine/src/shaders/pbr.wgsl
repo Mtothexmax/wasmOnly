@@ -158,6 +158,31 @@ fn brdf(n: vec3f, v: vec3f, l: vec3f, albedo: vec3f, metallic: f32, rough: f32) 
     return (kd * albedo / PI + spec) * n_l;
 }
 
+// brdf with Material::subsurface (wrap diffuse: wrap = sss / 2) and Material::clearcoat (second GGX
+// lobe, F0 0.04, over the base, which loses what the coat reflects).
+fn brdf_plastic(n: vec3f, v: vec3f, l: vec3f, albedo: vec3f, metallic: f32, rough: f32, sss: f32, coat: f32, coat_rough: f32) -> vec3f {
+    let h = normalize(v + l);
+    let nl_raw = dot(n, l);
+    let n_l = max(nl_raw, 0.0);
+    let wrap = sss * 0.5;
+    let n_l_w = clamp((nl_raw + wrap) / (1.0 + wrap), 0.0, 1.0);
+    let n_v = max(dot(n, v), 1e-4);
+    let n_h = max(dot(n, h), 0.0);
+    let v_h = max(dot(v, h), 0.0);
+    let a = rough * rough;
+    let f0 = mix(vec3f(0.04), albedo, metallic);
+    let f = f_schlick(f0, v_h);
+    let spec = d_ggx(n_h, a) * v_smith(n_v, n_l, a) * f;
+    let kd = (vec3f(1.0) - f) * (1.0 - metallic);
+    var c = kd * albedo / PI * n_l_w + spec * n_l;
+    if (coat > 0.0) {
+        let ac = coat_rough * coat_rough;
+        let fc = f_schlick(vec3f(0.04), v_h).x * coat;
+        c = c * (1.0 - fc) + d_ggx(n_h, ac) * v_smith(n_v, n_l, ac) * fc * n_l;
+    }
+    return c;
+}
+
 // Shadow-map coordinate of `world` in cascade k: (u, v, depth, 1) or w = 0 outside the map.
 // No texture access here: it may be called from several places (see shadow_factor).
 // p0 / n0: position and normal in cascade 0's light space (current set).
@@ -416,8 +441,9 @@ fn shade(i: VsOut, front: bool, d: Deriv, face_n: vec3f) -> Surface {
     // The sun term is brdf * n_l * shadow: surfaces facing away from the sun (n_l = 0) and unlit / UI
     // surfaces never use the shadow term, so they skip the shadow-map taps (debug view 2 shows it).
     let l_sun = normalize(-g.sun_dir.xyz);
+    let sss = select(0.0, inst.normal[3].w, !is_terrain); // Material::subsurface
     var shadow = 1.0;
-    if (g.counts.y == 1u && ((dot(n, l_sun) > 0.0 && inst.params.z < 0.5) || g.counts.z == 2u)) {
+    if (g.counts.y == 1u && ((dot(n, l_sun) > -0.5 * sss && inst.params.z < 0.5) || g.counts.z == 2u)) {
         shadow = shadow_factor(i.world, n, i.clip.xy);
     }
 
@@ -430,11 +456,26 @@ fn shade(i: VsOut, front: bool, d: Deriv, face_n: vec3f) -> Surface {
     if (inst.params.z <= 0.5) {
         let metallic = select(inst.emissive_metallic.a, 0.0, is_terrain);
         let rough = clamp(inst.params.x, 0.04, 1.0);
-        color = brdf(n, v, l_sun, albedo, metallic, rough) * g.sun_color.rgb * g.sun_dir.w * shadow;
+        let coat = select(0.0, inst.normal[0].w, !is_terrain);   // Material::clearcoat
+        let coat_rough = inst.normal[1].w;
+        let sun = g.sun_color.rgb * g.sun_dir.w;
+        if (sss > 0.0 || coat > 0.0) {
+            color = brdf_plastic(n, v, l_sun, albedo, metallic, rough, sss, coat, coat_rough) * sun * shadow;
+            if (sss > 0.0) { // thin back-light translucency (unshadowed: back faces would self-shadow)
+                let sc = select(inst.normal[3].rgb, albedo, inst.normal[3].r < 0.0);
+                let back = pow(clamp(dot(v, -normalize(l_sun + n * 0.3)), 0.0, 1.0), 4.0) * sss * 0.25;
+                color += back * sc * sun;
+            }
+        } else {
+            color = brdf(n, v, l_sun, albedo, metallic, rough) * sun * shadow;
+        }
         color += cluster_lights(i.clip, i.world, n, v, albedo, metallic, rough);
         let hemi = mix(g.ground_color.rgb, g.sky_color.rgb, n.y * 0.5 + 0.5);
         color += hemi * albedo * (1.0 - metallic * 0.6);
-        if (g.push.w > 0.0) { color += ambient_specular(n, n_geo, v, albedo, metallic, rough) * g.push.w; }
+        if (g.push.w > 0.0) {
+            color += ambient_specular(n, n_geo, v, albedo, metallic, rough) * g.push.w;
+            if (coat > 0.0) { color += ambient_specular(n, n_geo, v, vec3f(0.04), 0.0, coat_rough) * g.push.w * coat; }
+        }
         if (!is_terrain) { color += inst.emissive_metallic.rgb; }
     }
     return Surface(vec4f(finish(color, i.world), alpha), n, shadow);

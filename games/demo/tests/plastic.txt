@@ -1,0 +1,25 @@
+# Plastic material options: subsurface (wrap + back light), clear coat, material API.
+#   node tools/bridge.mjs run games/demo/tests/plastic.txt
+
+reload
+screen play
+pause
+call spawn {"shape":"sphere","pos":[0.9,1.6,11.5],"name":"plasticS","body":"none","color":"#d02020"}
+step 1
+call material {"id": 0}
+expect material{"id": 0}.clearcoat == 0
+expect material{"id": 0}.clearcoat_roughness ~= 0.06
+call render {"ambient_specular": 1}
+# sets the new fields on a material and reads them back (shader compile is checked by the reload)
+call material {"id": 1, "subsurface": 0.3, "subsurface_color": "#802020", "clearcoat": 1, "clearcoat_roughness": 0.05}
+expect material{"id": 1}.subsurface ~= 0.3
+expect material{"id": 1}.clearcoat == 1
+expect material{"id": 1}.subsurface_color.0 > 0
+call material {"id": 1, "subsurface_color": null}
+expect material{"id": 1}.subsurface_color == null
+expect material.materials.1.clearcoat == 1
+frames 3
+expect logs{"level": "error"}.entries.length == 0
+call material {"id": 1, "subsurface": 0, "clearcoat": 0}
+call render {"ambient_specular": 0}
+call despawn {"name":"plasticS"}

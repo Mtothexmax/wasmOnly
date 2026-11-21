@@ -232,6 +232,13 @@ normal `cargo` output above it.
 - **Plastic / glossy look:** `render {ambient_specular: 0..1}` (default 0) adds the ambient sky/ground colours reflected
   with a split-sum fresnel (F0 0.04, albedo for metals) on lit opaque materials, fading with roughness and occluded
   below the surface's horizon: rims and sky sheen outside the sun's highlight (roughness ~0.2 reads as plastic).
+  Per material (lit, ALU only, no extra pass): `Material::clearcoat` (0..1) + `clearcoat_roughness` (0.06) = a second
+  sharp GGX lobe (F0 0.04) over the base, also in the ambient specular; `Material::subsurface` (0..1) +
+  `subsurface_color` (None = albedo) = wrap diffuse for the sun (softer terminator, light into the shade) plus
+  unshadowed thin back-light translucency (clustered lights stay plain). LEGO-like: roughness 0.3, clearcoat 1,
+  subsurface 0.3. They ride in the unused part of the instance's normal matrix (no layout change). API: `material`
+  lists every material; `material {id, roughness, metallic, subsurface, subsurface_color, clearcoat,
+  clearcoat_roughness}` sets them. Test: `games/demo/tests/plastic.txt`.
 - **Input lag on a GPU-bound device:** without a limit Chrome queues frames and the screen shows one that is
   up to a second old (desktop repro: 320vw canvas, 7 frames in flight, 1 s latency). `render {max_frames_in_flight}`
   (default 2) skips rendering a frame (simulation and input still run) while `gpu_latency_ms` > 6 frame intervals (min

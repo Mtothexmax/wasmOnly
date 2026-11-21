@@ -76,6 +76,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("raycast", "Physics ray cast. args: {origin, dir, max?: 1000, exclude?: id|name|[...] (ignore these bodies, e.g. the caster)}"),
     ("pick", "Entity under a canvas point (CSS px). args: {x, y, mesh?: true = test rendered meshes instead of physics colliders; also returns depth_ties (z-fighting partners)}"),
     ("ui", "HUD slot contents."),
+    ("material", "Materials. Without id: every material (id, name, roughness, metallic, subsurface, clearcoat, bend). args: {id, roughness?, metallic?, subsurface?: 0..1, subsurface_color?: '#rrggbb' | null (= albedo), clearcoat?: 0..1, clearcoat_roughness?} sets them and returns the material."),
     ("bend", "Pushers that bend Material::bend geometry and GPU grass. args: {pushers?: [[x,y,z,radius], ...] (replaces; [] = none), material?: id, bend?: value (sets Material::bend), wind?: [dir_x, dir_z, strength] (shared with GPU grass; strength 0 = still)}. Returns pushers, wind and every material with bend > 0."),
     ("zfight", "args: {radius?: m around the camera or `center` (use in big worlds), center?: [x,y,z] (default radius 10), entity?: id|name|[...] (only pairs involving these and their children; a name matches every entity with it), exclude?: id|name|[...]}. Find z-fighting: coplanar, same-facing, overlapping triangles of different entities (opaque/masked). args: {eps?: 0.002 plane distance, tolerance?: 0.002 overlap, limit?: 50}. Returns pair count and the worst pairs with entities, world point and screen position."),
     ("debug_mode", "Debug mode (also the ` key): logs every key/mouse press and the camera pose once per second to logs/debug-*.log via the dev server, shows a badge. args: {on?: bool}. Returns file, line counts, last camera, last error."),
@@ -939,6 +940,32 @@ pub(crate) fn handle<G: Game>(
                 ctx.begin_scene(n);
             }
             Ok(ctx.scenes.describe(&ctx.world))
+        }
+        "material" => {
+            use crate::renderer::MaterialId;
+            let Some(id) = a.get("id").and_then(|v| v.as_u64()) else {
+                let list: Vec<Value> = (0..ctx.renderer.material_count() as u32)
+                    .filter_map(|i| ctx.renderer.material(MaterialId(i)).map(|m| json!({"id": i, "name": m.name, "roughness": m.roughness, "metallic": m.metallic,
+                        "subsurface": m.subsurface, "clearcoat": m.clearcoat, "bend": m.bend})))
+                    .collect();
+                return Ok(json!({"materials": list}));
+            };
+            let m = ctx.renderer.material_mut(MaterialId(id as u32)).ok_or("unknown material")?;
+            let f = |k: &str| a.get(k).and_then(|v| v.as_f64()).map(|v| v as f32);
+            if let Some(v) = f("roughness") { m.roughness = v; }
+            if let Some(v) = f("metallic") { m.metallic = v; }
+            if let Some(v) = f("subsurface") { m.subsurface = v; }
+            if let Some(v) = f("clearcoat") { m.clearcoat = v; }
+            if let Some(v) = f("clearcoat_roughness") { m.clearcoat_roughness = v; }
+            match a.get("subsurface_color") {
+                Some(Value::Null) => m.subsurface_color = None,
+                Some(v) => {
+                    let c = v.as_str().and_then(parse_color).ok_or("subsurface_color: '#rrggbb' or null")?;
+                    m.subsurface_color = Some(crate::renderer::srgb_hex(c).truncate());
+                }
+                None => {}
+            }
+            Ok(json!(m))
         }
         "bend" => {
             if let Some(list) = a.get("pushers").and_then(|v| v.as_array()) {
