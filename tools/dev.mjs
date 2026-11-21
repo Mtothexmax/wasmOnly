@@ -2,8 +2,6 @@
 // Build + serve + watch for the wasmOnly engine. Zero npm dependencies (Node >= 22).
 //
 //   node tools/dev.mjs build [--game demo] [--release] [--threads]   -> dist/
-//   --wasm-opt (with --release): run wasm-opt -O3 (opt-in; or [package.metadata.wasmonly] wasm-opt = true in the game's Cargo.toml)
-//   --install-wasm-opt: --wasm-opt + cargo-installs the pinned wasm-opt CLI when it is missing (no binaryen download)
 //   --out <dir> builds/serves another folder instead of dist/ (set CARGO_TARGET_DIR too when another watcher builds the same game)
 //     --threads: threads backend (Web Worker pool, shared memory, atomics). Uses the pinned nightly
 //     from Cargo.toml [workspace.metadata.wasmonly] threads-toolchain + build-std; output in target/threads.
@@ -63,54 +61,6 @@ const THREAD_RUSTFLAGS = [
   '-C', 'link-arg=--export=__tls_align', '-C', 'link-arg=--export=__tls_base',
 ].join(' ');
 const port = Number(opt('--port', 8080));
-
-function which(bin) {
-  const r = spawnSync(process.platform === 'win32' ? 'where' : 'which', [bin], { encoding: 'utf8' });
-  return r.status === 0 ? r.stdout.split(/\r?\n/)[0].trim() : null;
-}
-
-// wasm-opt (binaryen) for release builds. `WASM_OPT` = path to a binary, else PATH (cargo install puts it in
-// ~/.cargo/bin). The pinned crate version builds binaryen from source: no 111 MB release archive.
-function wasmOptVersion() {
-  const m = fs.readFileSync(path.join(ROOT, 'Cargo.toml'), 'utf8').match(/^wasm-opt\s*=\s*"([^"]+)"/m);
-  return m ? m[1] : null;
-}
-/** wasm-opt is opt-in: after gzip it saves little (Brickhollow: 1.88 -> 1.87 MB) and doubles the release build. */
-function wasmOptWanted() {
-  if (flag('--wasm-opt') || flag('--install-wasm-opt')) return true;
-  const toml = path.join(GAME_SRC, 'Cargo.toml');
-  if (!fs.existsSync(toml)) return false;
-  const t = fs.readFileSync(toml, 'utf8');
-  const sec = t.match(/\[package\.metadata\.wasmonly\]([^\[]*)/);
-  return !!(sec && /^\s*wasm-opt\s*=\s*true/m.test(sec[1]));
-}
-function wasmOpt(out) {
-  if (!wasmOptWanted()) { console.log('(wasm-opt off: --wasm-opt, or wasm-opt = true under [package.metadata.wasmonly] in the game Cargo.toml)'); return true; }
-  let bin = process.env.WASM_OPT || which('wasm-opt');
-  const ver = wasmOptVersion();
-  const install = `cargo install wasm-opt --version ${ver} --locked`;
-  if (!bin && flag('--install-wasm-opt')) {
-    console.log(`> ${install}   (builds binaryen from C++ source: needs a C++ compiler + CMake, takes a few minutes)`);
-    const r = spawnSync('cargo', ['install', 'wasm-opt', '--version', ver, '--locked'], { stdio: 'inherit' });
-    if (r.status !== 0) { console.log('(wasm-opt install failed — see the cargo output above)'); return false; }
-    bin = which('wasm-opt');
-    if (!bin) { console.log('(wasm-opt installed but not on PATH — add ~/.cargo/bin or set WASM_OPT)'); return false; }
-  }
-  if (!bin) {
-    console.log(`(wasm-opt not found — skipping. Smaller release builds: --install-wasm-opt, or ${install})`);
-    return true;
-  }
-  const before = fs.statSync(out).size;
-  // features the Rust 1.99 wasm32 target emits by default (+ simd128 from .cargo/config, threads backend)
-  const feats = ['--enable-simd', '--enable-bulk-memory', '--enable-nontrapping-float-to-int', '--enable-sign-ext',
-    '--enable-mutable-globals', '--enable-reference-types', '--enable-multivalue'];
-  if (threads) feats.push('--enable-threads');
-  console.log(`> wasm-opt -O3 (${bin})`);
-  const r = spawnSync(bin, ['-O3', ...feats, '-o', out, out], { stdio: 'inherit' });
-  if (r.status !== 0) { console.log('(wasm-opt failed — see its output above)'); return false; }
-  console.log(`(wasm-opt: ${before} -> ${fs.statSync(out).size} bytes)`);
-  return true;
-}
 
 function copyDir(src, dst) {
   if (!fs.existsSync(src)) return;
@@ -177,10 +127,6 @@ export function build() {
     return false;
   }
   const out = path.join(pkg, 'game_bg.wasm');
-  if (release && !wasmOpt(out)) {
-    console.log(JSON.stringify({ build: 'error', stage: 'wasm-opt', game, profile }));
-    return false;
-  }
   const page = [path.join(GAME_SRC, 'web', 'index.html'), path.join(ROOT, 'web', 'index.html')].find((p) => fs.existsSync(p));
   fs.copyFileSync(page, path.join(DIST, 'index.html'));
   copyDir(path.join(GAME_SRC, 'assets'), path.join(DIST, 'assets'));
