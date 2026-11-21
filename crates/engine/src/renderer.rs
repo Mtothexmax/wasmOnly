@@ -724,6 +724,10 @@ pub struct RenderSettings {
     pub frame_budget_ms: f32,
     /// Lowest scale the adaptive resolution may pick.
     pub min_render_scale: f32,
+    /// Without GPU timestamps (PowerVR, some mobile drivers) `auto_resolution` judges the GPU by the
+    /// submit -> done latency instead; once `render_scale` sits at `min_render_scale` and the GPU still
+    /// falls behind, this lets it draw on one more display refresh per frame (`stats.render.auto_frame_step`).
+    pub auto_frame_cap: bool,
     /// Multiplies every LOD switch distance (2 = keep detail twice as far; top-down cameras far
     /// from small models want > 1). Also lowers itself never: set it per game.
     pub lod_bias: f32,
@@ -819,6 +823,7 @@ impl Default for RenderSettings {
             auto_resolution: true,
             frame_budget_ms: 11.0,
             min_render_scale: 0.5,
+            auto_frame_cap: true,
             lod_bias: 1.0,
         }
     }
@@ -852,6 +857,14 @@ pub struct FrameStats {
     pub solid_fade_draws: u32,
     /// Frames not rendered because `max_frames_in_flight` was reached (total).
     pub frames_skipped: u64,
+    /// Frames whose GPU work finished later than the latency limit (`latency_limit_ms`), total. Chrome
+    /// presents a frame whose GPU work is that late after its target refresh (or drops it): motion jumps.
+    pub late_presents: u64,
+    /// Latency above which a frame counts as late: 3 drawn-frame intervals + 2 refreshes (Chrome resolves
+    /// `onSubmittedWorkDone` 1-2 refreshes after the GPU is done).
+    pub latency_limit_ms: f32,
+    /// Extra display refreshes per drawn frame chosen by the latency fallback of `auto_resolution` (0 = none).
+    pub auto_frame_step: u32,
     /// Per cascade of the current set: re-rendered this frame (false = cached map reused).
     pub shadow_cascades_rendered: Vec<bool>,
     /// Hi-Z occlusion culling ran this frame (off: too little geometry, or auto off).
@@ -1168,6 +1181,20 @@ pub struct Renderer {
     frames_skipped: u64,
     /// Smoothed rAF interval (ms), the yardstick for a GPU backlog.
     frame_interval_ms: f32,
+    /// Display refresh interval measured by the frame pacer (ms; 0 = unknown).
+    pub(crate) vsync_ms: f32,
+    /// Extra refreshes per drawn frame added to the frame cap (latency fallback, `auto_frame_cap`).
+    pub(crate) auto_frame_step: u32,
+    /// Refreshes per drawn frame the pacer uses now (cap + `auto_frame_step`).
+    pub(crate) paced_interval: u32,
+    late_presents: Rc<Cell<u64>>,
+    /// Latency fallback: (sum, count) this window, overloaded windows in a row, healthy since,
+    /// last step back up, wait before the next step back up (ms).
+    lat_window: (f32, u32),
+    lat_over: u32,
+    lat_ok_since: Option<f64>,
+    lat_last_up: f64,
+    lat_wait_ms: f64,
     /// When frames started being skipped (a promise that never resolves must not stop rendering).
     skip_since: Option<f64>,
     /// `copyExternalImageToTexture` works on this device (PowerVR B-Series writes zeros); if not,
@@ -1236,7 +1263,14 @@ impl Renderer {
             .to_lowercase();
         let immediate_gpu = matches!(vendor.as_str(), "amd" | "nvidia" | "intel");
         let gpu_cull_supported = adapter.features().has(crate::gpu_cull::FEATURE);
-        let timing_supported = adapter.features().has(crate::gpu_timing::FEATURE);
+        // `?gpu_timing=0` in the page URL: behave like a device without timestamp queries (tests of the
+        // latency fallback of auto_resolution)
+        let no_timing = js_sys::Reflect::get(&js_sys::global(), &"location".into())
+            .and_then(|l| js_sys::Reflect::get(&l, &"search".into()))
+            .ok()
+            .and_then(|q| q.as_string())
+            .is_some_and(|q| q.contains("gpu_timing=0"));
+        let timing_supported = adapter.features().has(crate::gpu_timing::FEATURE) && !no_timing;
         let dd = GpuDeviceDescriptor::new();
         let mut features = vec![];
         if gpu_cull_supported {
@@ -1735,6 +1769,15 @@ impl Renderer {
             in_flight: Rc::new(Cell::new((0, 0.0))),
             frames_skipped: 0,
             frame_interval_ms: 0.0,
+            vsync_ms: 0.0,
+            auto_frame_step: 0,
+            paced_interval: 1,
+            late_presents: Rc::new(Cell::new(0)),
+            lat_window: (0.0, 0),
+            lat_over: 0,
+            lat_ok_since: None,
+            lat_last_up: -1e9,
+            lat_wait_ms: 20000.0,
             skip_since: None,
             external_copy_ok,
             meshes: vec![],
@@ -2652,7 +2695,12 @@ impl Renderer {
         if !self.settings.auto_resolution {
             self.adapt_rendered = 0;
             self.adapt = (0.0, 0.0, 0);
+            self.auto_frame_step = 0;
             return;
+        }
+        if self.stats.gpu_latency_ms > 0.0 {
+            self.lat_window.0 += self.stats.gpu_latency_ms;
+            self.lat_window.1 += 1;
         }
         let gpu = self.stats.gpu_ms.filter(|g| g.samples > 0).map(|g| if g.frame > 0.0 { g.frame } else { g.total });
         self.adapt.0 += gpu.unwrap_or(0.0);
@@ -2716,6 +2764,15 @@ impl Renderer {
                     best.min(1.0)
                 }
             }
+            // no timestamp queries, but the submit -> done latency is known: judge the GPU by it
+            None if self.lat_window.1 > 0 => {
+                let avg_lat = self.lat_window.0 / self.lat_window.1 as f32;
+                self.lat_window = (0.0, 0);
+                if self.latency_step(avg_lat, s, lo, since, now) {
+                    return;
+                }
+                s
+            }
             // no timestamp queries: interval between *rendered* frames (vsync-bound, coarse; frames the
             // limiter skipped do not count as cheap ones)
             None => {
@@ -2736,6 +2793,77 @@ impl Renderer {
             self.adapt_last_change = now;
             crate::log_info!("adaptive resolution: scale {:.2} -> {:.2} (gpu frame {:.1} ms, interval {:.1} ms, rendered every {:.1} ms, budget {:.1} ms)", s, next, avg_gpu, avg_frame, render_interval, budget);
         }
+    }
+
+    /// Drawn frames still arrive at the paced rate (rAF does not see the GPU backlog: frames queue in
+    /// the compositor). Only then does one more refresh per frame help; a GPU that is slower than even
+    /// that already slows rAF down, and only resolution helps.
+    fn paced_on_time(&self) -> bool {
+        self.vsync_ms > 0.0 && self.frame_interval_ms < (self.paced_interval as f32 + 0.5) * self.vsync_ms
+    }
+
+    /// Latency limits for the drawn-frame interval: (late / overloaded above, healthy below), ms.
+    fn latency_limits(&self) -> (f32, f32) {
+        let v = if self.vsync_ms > 0.0 { self.vsync_ms } else { 16.7 };
+        let p = self.frame_interval_ms.max(v);
+        (3.0 * p + 2.0 * v, 1.5 * p + 2.0 * v)
+    }
+
+    /// Latency fallback of `auto_resolution` (no GPU timestamps), once per 30-frame window. Overloaded
+    /// (latency over 3 frame intervals + 2 refreshes for 2 windows): lower `render_scale` by 15 %, at
+    /// `min_render_scale` add a refresh per drawn frame. Healthy (under 1.5 intervals + 2 refreshes) for
+    /// `lat_wait_ms` (20 s, doubled up to 5 min when the GPU fell behind again within a minute of a step
+    /// back up): take the extra refresh back, then raise the scale by 0.05. Returns true when it decided.
+    fn latency_step(&mut self, avg_lat: f32, s: f32, lo: f32, since: f64, now: f64) -> bool {
+        let (over, ok) = self.latency_limits();
+        if avg_lat > over {
+            self.lat_ok_since = None;
+            self.lat_over += 1;
+            if self.lat_over < 2 {
+                return true;
+            }
+            self.lat_over = 0;
+            if now - self.lat_last_up < 60000.0 {
+                self.lat_wait_ms = (self.lat_wait_ms * 2.0).min(300000.0);
+            }
+            if s > lo + 1e-3 {
+                if since < 4000.0 && avg_lat < over * 2.0 {
+                    return true;
+                }
+                let next = ((s * 0.85 / 0.05).floor() * 0.05).min(s - 0.05).max(lo);
+                crate::log_info!("adaptive resolution (latency): scale {s:.2} -> {next:.2} (gpu latency {avg_lat:.0} ms > {over:.0} ms)");
+                self.settings.render_scale = next;
+                self.adapt_last_change = now;
+            } else if self.settings.auto_frame_cap && self.auto_frame_step < 3 && since >= 1500.0 && self.paced_on_time() {
+                self.auto_frame_step += 1;
+                self.adapt_last_change = now;
+                crate::log_info!("adaptive frame cap: +{} refresh per frame (gpu latency {avg_lat:.0} ms > {over:.0} ms at scale {s:.2})", self.auto_frame_step);
+            }
+            return true;
+        }
+        self.lat_over = 0;
+        if avg_lat >= ok {
+            self.lat_ok_since = None;
+            return true;
+        }
+        let ok_since = *self.lat_ok_since.get_or_insert(now);
+        if now - ok_since < self.lat_wait_ms || since < 4000.0 {
+            return true;
+        }
+        if self.auto_frame_step > 0 {
+            self.auto_frame_step -= 1;
+            crate::log_info!("adaptive frame cap: back to +{} (gpu latency {avg_lat:.0} ms < {ok:.0} ms)", self.auto_frame_step);
+        } else if s < 1.0 {
+            let next = (s + 0.05).min(1.0);
+            crate::log_info!("adaptive resolution (latency): scale {s:.2} -> {next:.2} (gpu latency {avg_lat:.0} ms < {ok:.0} ms)");
+            self.settings.render_scale = next;
+        } else {
+            return true;
+        }
+        self.adapt_last_change = now;
+        self.lat_last_up = now;
+        self.lat_ok_since = Some(now);
+        true
     }
 
     fn resize_targets(&mut self, w: u32, h: u32) {
@@ -4252,12 +4380,20 @@ impl Renderer {
             stats.frames_in_flight = fl + 1;
             stats.gpu_latency_ms = lat;
             stats.frames_skipped = self.frames_skipped;
+            let (limit, _) = self.latency_limits();
+            stats.latency_limit_ms = limit;
+            stats.late_presents = self.late_presents.get();
+            stats.auto_frame_step = self.auto_frame_step;
+            let late = self.late_presents.clone();
             let t0 = crate::log::now_ms();
             let done = self.queue.on_submitted_work_done();
             wasm_bindgen_futures::spawn_local(async move {
                 let _ = wasm_bindgen_futures::JsFuture::from(done).await;
                 let (fl, lat) = cell.get();
                 let ms = (crate::log::now_ms() - t0) as f32;
+                if ms > limit {
+                    late.set(late.get() + 1);
+                }
                 // rises slowly (a real backlog builds up), drops at once when the GPU caught up
                 // (a startup spike from shader compiles must not keep skipping frames)
                 cell.set((fl.saturating_sub(1), if lat == 0.0 || ms < lat { ms } else { lat * 0.9 + ms * 0.1 }));

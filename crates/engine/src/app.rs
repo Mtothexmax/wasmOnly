@@ -552,7 +552,7 @@ struct Pacer {
 }
 
 impl Pacer {
-    fn due(&mut self, ts: f64, last_drawn: Option<f64>, max_fps: f32) -> bool {
+    fn due(&mut self, ts: f64, last_drawn: Option<f64>, max_fps: f32, extra: u32) -> bool {
         if let Some(p) = self.prev {
             let d = ts - p;
             if d > 2.0 && d < 100.0 {
@@ -572,6 +572,9 @@ impl Pacer {
         } else {
             1
         };
+        if self.vsync_ms > 0.0 && self.raw.len() >= 8 {
+            self.interval += extra; // latency fallback of auto_resolution (GPU behind, no timestamps)
+        }
         match last_drawn {
             Some(l) if self.interval > 1 => ((ts - l) / self.vsync_ms).round() as u32 >= self.interval,
             _ => true,
@@ -737,8 +740,11 @@ async fn start<G: Game>(game: G, mut config: crate::renderer::RenderConfig) -> R
     let mut last_ts: Option<f64> = None;
     let mut pacer = Pacer::default();
     *g.borrow_mut() = Some(Closure::new(move |ts: f64| {
-        let max_fps = ctx.borrow().renderer.settings.max_fps;
-        if !pacer.due(ts, last_ts, max_fps) {
+        let (max_fps, extra) = {
+            let c = ctx.borrow();
+            (c.renderer.settings.max_fps, c.renderer.auto_frame_step)
+        };
+        if !pacer.due(ts, last_ts, max_fps, extra) {
             // skipped refresh (frame cap): nothing runs, the next drawn frame catches up
             if let Some(cb) = f.borrow().as_ref() {
                 let _ = web_sys::window().unwrap().request_animation_frame(cb.as_ref().unchecked_ref());
@@ -761,6 +767,8 @@ async fn start<G: Game>(game: G, mut config: crate::renderer::RenderConfig) -> R
             c.time.refresh_hz = pacer.refresh_hz();
             c.time.frame_interval = pacer.interval;
             c.time.frame_dt_raw = raw;
+            c.renderer.vsync_ms = pacer.vsync_ms as f32;
+            c.renderer.paced_interval = pacer.interval;
             if lock && pacer.vsync_ms > 0.0 {
                 let frame_s = (pacer.interval as f64 * pacer.vsync_ms / 1000.0) as f32;
                 let nominal = c.time.nominal_fixed_dt.max(1e-4);

@@ -150,6 +150,16 @@ normal `cargo` output above it.
 - **Resolution:** `render {render_scale}` (0.25..1; the canvas backing store has the scene size too, the browser scales it), `auto_resolution` (default on) adapts it to
   `frame_budget_ms` of whole-frame GPU time (`gpu_ms.frame`); every change reallocates the targets (a 20-35 ms
   hitch at 4K), so it jumps once to a scale that fits and changes at most every 4 s; `stats.render` has `width/height` (scene) and `canvas`.
+  **Without GPU timestamps** (PowerVR and other mobile drivers; emulate with the page URL `?gpu_timing=0`) it judges the
+  GPU by the submit -> done latency (`gpu_latency_ms`) against the drawn-frame interval P and the refresh v: above
+  `3P + 2v` (`stats.render.latency_limit_ms`; Chrome resolves 1-2 refreshes late) for 2 windows of 30 frames it lowers
+  `render_scale` by 15 %; at `min_render_scale` (`render {auto_frame_cap}`, default on) it draws on one more refresh per
+  frame (`stats.render.auto_frame_step`, max +3, added to the `max_fps` divisor), but only while drawn frames still
+  arrive at the paced rate (a GPU slower than that already slows rAF: only resolution helps). Under `1.5P + 2v` for
+  20 s it steps back (first the extra refresh, then +0.05 scale); falling behind again within a minute of a step back
+  doubles the wait (max 5 min). Logged as `adaptive frame cap` / `adaptive resolution (latency)`.
+  `stats.render.late_presents` counts frames whose latency exceeded the limit (total; reloads and shader compiles add
+  some, so compare before/after).
 - **Render settings:** `call render` lists every setting; set any by name (sky, fog_*, bloom*, exposure,
   depth_darkening, vignette, saturation, particles, shadows, ...). Unknown names are an error.
 - **Colour grading / looks** (composite pass, no extra pass; defaults neutral = no change): `render {grade: {preset,
