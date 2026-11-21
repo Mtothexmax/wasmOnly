@@ -1,0 +1,18 @@
+# Automatic frame pacing: extra GPU work (gpu_slow_ms) drops the cadence to every 2nd/3rd refresh,
+# removing it brings the full rate back. Runs in either mode: with timestamps (desktop) or without
+# (open the page with ?gpu_timing=0 first, as on PowerVR phones).
+#   node tools/bridge.mjs run games/demo/tests/pacing_auto.txt
+reload
+screen play
+call render {"max_fps": 0, "auto_frame_cap": true, "min_render_scale": 1}
+wait 4000
+expect stats.render.pacing.interval == 1
+# 2.5 refresh slots of GPU work per frame: no cadence below 3 fits
+call render {"gpu_slow_ms": 40}
+wait_for stats.render.pacing.interval >= 3 15000
+expect stats.render.pacing.steps_down >= 1
+expect stats.render.pacing.queued <= 3
+call render {"gpu_slow_ms": 0}
+wait_for stats.render.pacing.interval == 1 30000
+expect stats.render.pacing.steps_up >= 1
+call render {"min_render_scale": 0.5}

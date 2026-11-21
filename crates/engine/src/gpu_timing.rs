@@ -18,7 +18,9 @@ pub(crate) const BLEND: usize = 3;
 pub(crate) const HIZ: usize = 4;
 /// Bloom + composite (begin on the first post pass, end on the last).
 pub(crate) const POST: usize = 5;
-const N: usize = 6;
+/// gpu_slow test pass (`render {gpu_slow_ms}`).
+pub(crate) const SLOW: usize = 6;
+const N: usize = 7;
 
 #[derive(Clone, Copy, Debug, Default, Serialize)]
 pub struct GpuTimes {
@@ -29,6 +31,8 @@ pub struct GpuTimes {
     pub hiz: f32,
     /// Bloom + depth darkening + tonemap.
     pub post: f32,
+    /// gpu_slow test pass (`render {gpu_slow_ms}`; 0 = off).
+    pub slow: f32,
     /// Sum of the measured passes (ms).
     pub total: f32,
     /// First pass begin to last pass end (ms): also contains what runs between the timed passes
@@ -37,7 +41,7 @@ pub struct GpuTimes {
     /// Begin and end of each pass in ms since the first pass began, in the order cull, shadow,
     /// opaque, blend, hiz, post (latest measurement, not smoothed; 0 = pass not timed). Gaps
     /// between one pass's end and the next one's begin are untimed GPU work.
-    pub timeline: [[f32; 2]; 6],
+    pub timeline: [[f32; 2]; 7],
     /// Number of completed measurements so far.
     pub samples: u32,
 }
@@ -153,7 +157,8 @@ impl GpuTiming {
                     l.blend = mix(l.blend, ms[BLEND]);
                     l.hiz = mix(l.hiz, ms[HIZ]);
                     l.post = mix(l.post, ms[POST]);
-                    l.total = l.cull + l.shadow + l.opaque + l.blend + l.hiz + l.post;
+                    l.slow = if used[SLOW] { mix(l.slow, ms[SLOW]) } else { 0.0 };
+                    l.total = l.cull + l.shadow + l.opaque + l.blend + l.hiz + l.post + l.slow;
                     l.frame = mix(l.frame, span);
                     for slot in 0..N {
                         let (a, b) = (ts(slot * 2), ts(slot * 2 + 1));

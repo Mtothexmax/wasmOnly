@@ -549,10 +549,13 @@ struct Pacer {
     prev: Option<f64>,
     vsync_ms: f64,
     interval: u32,
+    /// Interval from `max_fps` alone.
+    cap: u32,
 }
 
 impl Pacer {
-    fn due(&mut self, ts: f64, last_drawn: Option<f64>, max_fps: f32, extra: u32) -> bool {
+    fn due(&mut self, ts: f64, last_drawn: Option<f64>, max_fps: f32, auto: u32) -> bool {
+        let extra = auto;
         if let Some(p) = self.prev {
             let d = ts - p;
             if d > 2.0 && d < 100.0 {
@@ -572,8 +575,9 @@ impl Pacer {
         } else {
             1
         };
+        self.cap = self.interval;
         if self.vsync_ms > 0.0 && self.raw.len() >= 8 {
-            self.interval += extra; // latency fallback of auto_resolution (GPU behind, no timestamps)
+            self.interval = self.interval.max(extra); // automatic cadence (crate::pacing)
         }
         match last_drawn {
             Some(l) if self.interval > 1 => ((ts - l) / self.vsync_ms).round() as u32 >= self.interval,
@@ -742,7 +746,7 @@ async fn start<G: Game>(game: G, mut config: crate::renderer::RenderConfig) -> R
     *g.borrow_mut() = Some(Closure::new(move |ts: f64| {
         let (max_fps, extra) = {
             let c = ctx.borrow();
-            (c.renderer.settings.max_fps, c.renderer.auto_frame_step)
+            (c.renderer.settings.max_fps, c.renderer.pacing.divisor)
         };
         if !pacer.due(ts, last_ts, max_fps, extra) {
             // skipped refresh (frame cap): nothing runs, the next drawn frame catches up
@@ -767,8 +771,8 @@ async fn start<G: Game>(game: G, mut config: crate::renderer::RenderConfig) -> R
             c.time.refresh_hz = pacer.refresh_hz();
             c.time.frame_interval = pacer.interval;
             c.time.frame_dt_raw = raw;
-            c.renderer.vsync_ms = pacer.vsync_ms as f32;
-            c.renderer.paced_interval = pacer.interval;
+            c.renderer.pacing.vsync_ms = pacer.vsync_ms as f32;
+            c.renderer.pacing.cap = pacer.cap.max(1);
             if lock && pacer.vsync_ms > 0.0 {
                 let frame_s = (pacer.interval as f64 * pacer.vsync_ms / 1000.0) as f32;
                 let nominal = c.time.nominal_fixed_dt.max(1e-4);
@@ -991,6 +995,7 @@ fn frame<G: Game>(c: &mut Ctx, game: &mut G, dt: f32) {
     }
     let t_render = log::now_ms();
     c.renderer.adapt_resolution(c.time.frame_dt);
+    c.renderer.pace();
     let vp = c.renderer.last_view_proj;
     let (cw, ch) = (
         c.canvas.client_width() as f32,

@@ -150,19 +150,7 @@ normal `cargo` output above it.
 - **Resolution:** `render {render_scale}` (0.25..1; the canvas backing store has the scene size too, the browser scales it), `auto_resolution` (default on) adapts it to
   `frame_budget_ms` of whole-frame GPU time (`gpu_ms.frame`); every change reallocates the targets (a 20-35 ms
   hitch at 4K), so it jumps once to a scale that fits and changes at most every 4 s; `stats.render` has `width/height` (scene) and `canvas`.
-  **Without GPU timestamps** (PowerVR and other mobile drivers; emulate with the page URL `?gpu_timing=0`) it judges the
-  GPU by the submit -> done latency (`gpu_latency_ms`) against the drawn-frame interval P and the refresh v: above
-  `3P + 2v` (`stats.render.latency_limit_ms`; Chrome resolves 1-2 refreshes late) for 2 windows of 30 frames it lowers
-  `render_scale` by 15 %; at `min_render_scale` (`render {auto_frame_cap}`, default on) it draws on one more refresh per
-  frame (`stats.render.auto_frame_step`, max +3, added to the `max_fps` divisor), but only while drawn frames still
-  arrive at the paced rate (a GPU slower than that already slows rAF: only resolution helps). Under `1.5P + 2v` for
-  20 s it steps back (first the extra refresh, then +0.05 scale); falling behind again within a minute of a step back
-  doubles the wait (max 5 min). The extra refresh is only taken back when the latency already fits the faster frame
-  time (< its frame time + v) *and* the drawn triangles (`stats.render.triangles`, window average) are below 70 % of
-  the load the faster cadence failed at (remembered per level for the session): latency at the slow cadence cannot
-  show whether the GPU makes the fast one, and a failed step back is a visible hitch. Logged as `adaptive frame cap` / `adaptive resolution (latency)`.
-  `stats.render.late_presents` counts frames whose latency exceeded the limit (total; reloads and shader compiles add
-  some, so compare before/after).
+  Without GPU timestamps (PowerVR; emulate with the page URL `?gpu_timing=0`) frame pacing decides the scale (below).
 - **Render settings:** `call render` lists every setting; set any by name (sky, fog_*, bloom*, exposure,
   depth_darkening, vignette, saturation, particles, shadows, ...). Unknown names are an error.
 - **Colour grading / looks** (composite pass, no extra pass; defaults neutral = no change): `render {grade: {preset,
@@ -267,18 +255,38 @@ normal `cargo` output above it.
   (smooth / gpu-bound / cpu-bound / stutter). `--profile [--top 40]` adds a CDP CPU profile (`top_self` functions).
   Live values: `stats.time.phases`, `stats.render.gpu_ms`. When the *user* sees low fps, ask them to press ` while
   it happens: debug mode writes a `"kind":"perf"` line per second (p50/p95/max, slow frames, phases, GPU) into the log.
-- **Frame cap / even cadence:** `render {max_fps}` (0 = off) draws on every Nth display refresh, N the smallest whole
-  divisor keeping the rate <= max_fps (45 on 90 Hz = every 2nd, 30 on 60 Hz = every 2nd, 45 on 120 Hz = 40). It is
-  phase-locked to the refresh measured from rAF, so a device that *almost* makes the full rate (frames alternating 1/2
-  vsyncs = judder, high `speed_jitter_pct`) gets an even cadence. Skipped refreshes run nothing; the simulation catches
-  up in fixed steps and is drawn interpolated. `stats.time.refresh_hz`, `frame_interval`; `bridge perf` counts only drawn
-  frames. While capped the sim clock advances whole refreshes x the measured vsync (`time.frame_dt`; the rAF delta is
-  `frame_dt_raw`), so jitter cannot slip a step. Fixed steps still beat against the drawn rate (60 Hz steps at 45.9 fps
-  = 1,1,2 per frame: walk cycles and game-moved Transforms judder); `ctx.time.lock_fixed_to_frames = true` (API `time
-  {lock_fixed_to_frames, nominal_fixed_dt}`) sets `fixed_dt = frame_time / k` every frame, `k` = fewest steps no longer
-  than `nominal_fixed_dt` (1/60): 45.9 fps -> 2 x 10.9 ms steps, the same count every frame (`time.steps_per_frame`;
-  a late frame runs the steps for its extra refreshes). The step length then follows the display (uncapped 120 Hz =
-  120 Hz simulation), so read `ctx.time.fixed_dt` instead of assuming 1/60. Test: `games/demo/tests/pacing.txt`.
+- **Frame pacing** (`crates/engine/src/pacing.rs`, one engine responsibility; `stats.render.pacing`): frames are drawn on
+  every Nth display refresh. The controller starts at the full rate and, per ~0.5 s window, steps down as soon as frames
+  miss their slot (late completions or back-pressure skips > 8 %, or with timestamps GPU frame > 92 % of the slot),
+  straight to the cadence the GPU time needs; it steps up only with evidence: timestamps (GPU < 85 % of the faster
+  slot, jumps to the fastest that fits), else the median submit -> done latency (an upper bound of the GPU time) under
+  85 % of the faster slot, or the drawn triangles below 70 % of the load that cadence failed at (remembered per cadence
+  for the session). Healthy for `wait_s` (5 s, doubled up to 2 min when a step up fails within 4 s) before a step up;
+  1 s after any change is not judged (target reallocation). Without timestamps resolution is the second lever: before
+  the cadence would drop below `render {pacing_min_fps}` (30) it lowers `render_scale` (to ~90 % of the slot in one
+  step), and raises it again at the full rate as far as the latency bound predicts. `render {auto_frame_cap: false}` =
+  cadence from `max_fps` only. `render {max_fps}` (0 = off) stays an optional upper limit: N >= the smallest whole
+  divisor keeping the rate <= max_fps (45 on 90 Hz = every 2nd). Phase-locked to the refresh measured from rAF (even
+  cadence, no 1/2 vsync judder); skipped refreshes run nothing, the simulation catches up in fixed steps, drawn
+  interpolated. **Back-pressure:** a frame is not submitted while the oldest unfinished one is more than
+  `max_frames_in_flight - 1` slots (default 2 -> 1 slot) behind its expected completion = baseline (lowest latency of 10 s:
+  GPU + Chrome's 1-2 refresh resolve delay) + learned jitter (75th percentile in healthy windows); simulation and input
+  still run. So the GPU / compositor queue never grows (no 100-230 ms latency, no dropped "teleport" frames).
+  `stats.render.pacing`: `mode` (timestamps / latency / off), `interval` (= max(`cap_interval`, `auto_interval`)),
+  `gpu_frame_ms` (timestamps, or completion-to-completion while GPU-bound; 0 = fits), `baseline_ms`, `jitter_ms`,
+  `queue_ms`, `queued`, `late`, `skipped`, `window_miss_pct`, `steps_down/up`, `wait_s`, `failed_triangles` (per
+  cadence). Log lines: `frame pacing: every N refreshes (X fps) - Y% missed at Z fps, gpu ~G ms, Tk triangles`, `frame
+  pacing: back to every N refreshes (...) - <evidence>`, `frame pacing: scale a -> b (...)`. Test switch: `render
+  {gpu_slow_ms}` / URL `?gpu_slow=N` adds N ms of GPU work per frame (compute loop, calibrated with timestamps, hidden
+  ones too; counts as 100k triangles per ms in the load memory). Tests: `games/demo/tests/pacing_auto.txt` (in both
+  modes: open `?gpu_timing=0` first for the latency path), `pacing.txt`. `stats.time.refresh_hz`, `frame_interval`;
+  `bridge perf` counts only drawn frames. While the interval is > 1 the sim clock advances whole refreshes x the
+  measured vsync (`time.frame_dt`; the rAF delta is `frame_dt_raw`), so jitter cannot slip a step. Fixed steps still beat
+  against the drawn rate (60 Hz steps at 45.9 fps = 1,1,2 per frame: walk cycles and game-moved Transforms judder);
+  `ctx.time.lock_fixed_to_frames = true` (API `time {lock_fixed_to_frames, nominal_fixed_dt}`) sets `fixed_dt =
+  frame_time / k` every frame (it follows the chosen cadence), `k` = fewest steps no longer than `nominal_fixed_dt`
+  (1/60): 45.9 fps -> 2 x 10.9 ms steps, the same count every frame (`time.steps_per_frame`; a late frame runs the steps
+  for its extra refreshes). The step length then follows the display, so read `ctx.time.fixed_dt` instead of assuming 1/60.
 - **Plastic / glossy look:** `render {ambient_specular: 0..1}` (default 0) adds the ambient sky/ground colours reflected
   with a split-sum fresnel (F0 0.04, albedo for metals) on lit opaque materials, fading with roughness and occluded
   below the surface's horizon: rims and sky sheen outside the sun's highlight (roughness ~0.2 reads as plastic).
@@ -290,12 +298,9 @@ normal `cargo` output above it.
   lists every material; `material {id, roughness, metallic, subsurface, subsurface_color, clearcoat,
   clearcoat_roughness}` sets them. Test: `games/demo/tests/plastic.txt`.
 - **Input lag on a GPU-bound device:** without a limit Chrome queues frames and the screen shows one that is
-  up to a second old (desktop repro: 320vw canvas, 7 frames in flight, 1 s latency). `render {max_frames_in_flight}`
-  (default 2) skips rendering a frame (simulation and input still run) while `gpu_latency_ms` > 6 frame intervals (min
-  150 ms) or `frames_in_flight` >= 64. Desktop Chrome resolves `onSubmittedWorkDone` late (up to 5 in flight,
-  30-110 ms without any backlog), so tighter rules drop frames on a smooth desktop. It skips until
-  the GPU catches up. `stats.render`: `frames_in_flight`, `gpu_latency_ms` (submit -> GPU done, about in-flight x GPU
-  frame time), `frames_skipped`.
+  up to a second old (desktop repro: 320vw canvas, 7 frames in flight, 1 s latency). The back-pressure of frame pacing
+  (`render {max_frames_in_flight}`, default 2; 0 = off; 64 queued = hard cap) prevents it. `stats.render`:
+  `frames_in_flight`, `gpu_latency_ms` (last submit -> done), `frames_skipped`, `late_presents`, `pacing.queue_ms`.
 - **GPU time, the honest number:** `gpu_ms.frame` = first pass begin to last pass end. It is larger than `total`
   (the sum of the passes) because clears, MSAA resolves and copies run *between* the timed passes;
   `gpu_ms.timeline` has begin/end per pass (cull, shadow, opaque, blend, hiz, post), so the gaps show them.

@@ -26,6 +26,7 @@ pub mod lights;
 pub mod log;
 pub mod mesh;
 pub mod panel;
+pub mod pacing;
 pub mod particles;
 pub mod physics;
 pub(crate) mod post;
