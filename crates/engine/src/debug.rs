@@ -761,16 +761,38 @@ pub(crate) fn handle<G: Game>(
             // any RenderSettings field by name (unknown names are an error, types are checked)
             if let Some(obj) = a.as_object().filter(|o| !o.is_empty()) {
                 let mut cur = json!(ctx.renderer.settings);
+                let hex = |v: &Value| -> Option<Value> {
+                    let c = v.as_str().and_then(parse_color)?;
+                    Some(json!([((c >> 16) & 255) as f32 / 255.0, ((c >> 8) & 255) as f32 / 255.0, (c & 255) as f32 / 255.0]))
+                };
                 for (k, v) in obj {
                     if cur.get(k).is_none() {
                         return Err(format!("unknown render setting '{k}'; known: {:?}", cur.as_object().map(|o| o.keys().cloned().collect::<Vec<_>>())));
                     }
-                    cur[k] = v.clone();
+                    if k == "grade" && v.is_object() {
+                        // merged field by field; `preset` first resets to that look; colours may be '#rrggbb'
+                        if let Some(name) = v.get("preset").and_then(|p| p.as_str()) {
+                            let g = crate::post::Grade::preset(name).ok_or_else(|| format!("unknown grade preset '{name}'; known: {:?}", crate::post::Grade::PRESETS))?;
+                            cur["grade"] = json!(g);
+                        }
+                        for (gk, gv) in v.as_object().unwrap() {
+                            if gk == "preset" {
+                                continue;
+                            }
+                            if cur["grade"].get(gk).is_none() {
+                                return Err(format!("unknown grade field '{gk}'; known: {:?}", cur["grade"].as_object().map(|o| o.keys().cloned().collect::<Vec<_>>())));
+                            }
+                            cur["grade"][gk] = hex(gv).unwrap_or_else(|| gv.clone());
+                        }
+                        continue;
+                    }
+                    cur[k] = if k == "vignette_color" { hex(v).unwrap_or_else(|| v.clone()) } else { v.clone() };
                 }
                 ctx.renderer.settings = serde_json::from_value(cur).map_err(|e| format!("render: {e}"))?;
             }
             let mut out = json!(ctx.renderer.settings);
             out["gpu_culling_supported"] = json!(ctx.renderer.gpu_culling_supported);
+            out["grade_presets"] = json!(crate::post::Grade::PRESETS);
             Ok(out)
         }
         "camera" => {

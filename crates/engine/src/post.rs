@@ -25,6 +25,76 @@ pub(crate) struct PostParams {
     pub c: [f32; 4],
     pub d: [f32; 4],
     pub e: [f32; 4],
+    /// Colour grading, vignette shape, grain (composite only; see `fs_composite`).
+    pub g: [[f32; 4]; 8],
+}
+
+/// Colour grading in display space, after tonemapping (`RenderSettings::grade`). Default = neutral
+/// (costs nothing). Order: white balance -> lift/gamma/gain -> contrast -> split toning ->
+/// saturation. [`Grade::preset`] gives looks ("warm", "cool", "fade", "vivid", "noir", "night",
+/// "golden"); API `render {grade: {preset: "warm", temperature: 0.2, ..}}`.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Grade {
+    /// White balance: -1 blue .. 1 yellow.
+    pub temperature: f32,
+    /// -1 green .. 1 magenta.
+    pub tint: f32,
+    /// Added to the shadows (0 = neutral): `c = gain * (c + lift * (1 - c))`.
+    pub lift: [f32; 3],
+    /// Midtone power (1 = neutral; > 1 brightens).
+    pub gamma: [f32; 3],
+    /// Highlights multiplier (1 = neutral).
+    pub gain: [f32; 3],
+    /// Contrast around `pivot` (1 = neutral).
+    pub contrast: f32,
+    pub pivot: f32,
+    /// Split toning: colours soft-light blended into the shadows / highlights (display-space
+    /// RGB 0..1; 0.5 grey = neutral; the API also takes "#rrggbb").
+    pub split_shadows: [f32; 3],
+    pub split_highlights: [f32; 3],
+    /// -1 (more shadows) .. 1 (more highlights).
+    pub split_balance: f32,
+    /// Multiplies `RenderSettings::saturation`.
+    pub saturation: f32,
+}
+
+impl Default for Grade {
+    fn default() -> Self {
+        Self {
+            temperature: 0.0,
+            tint: 0.0,
+            lift: [0.0; 3],
+            gamma: [1.0; 3],
+            gain: [1.0; 3],
+            contrast: 1.0,
+            pivot: 0.5,
+            split_shadows: [0.5; 3],
+            split_highlights: [0.5; 3],
+            split_balance: 0.0,
+            saturation: 1.0,
+        }
+    }
+}
+
+impl Grade {
+    pub const PRESETS: [&'static str; 8] = ["neutral", "warm", "cool", "fade", "vivid", "noir", "night", "golden"];
+
+    /// A named look (see [`Grade::PRESETS`]).
+    pub fn preset(name: &str) -> Option<Self> {
+        let n = Self::default();
+        Some(match name {
+            "neutral" => n,
+            "warm" => Self { temperature: 0.35, tint: 0.05, gain: [1.03, 1.0, 0.96], contrast: 1.05, ..n },
+            "cool" => Self { temperature: -0.35, lift: [0.0, 0.01, 0.03], contrast: 1.03, ..n },
+            "fade" => Self { lift: [0.08, 0.08, 0.09], gain: [0.96, 0.96, 0.95], contrast: 0.85, saturation: 0.8, ..n },
+            "vivid" => Self { contrast: 1.15, saturation: 1.3, split_shadows: [0.45, 0.5, 0.58], split_highlights: [0.58, 0.54, 0.46], ..n },
+            "noir" => Self { contrast: 1.3, lift: [0.02; 3], saturation: 0.0, ..n },
+            "night" => Self { temperature: -0.5, lift: [0.0, 0.01, 0.04], gain: [0.92, 0.95, 1.05], saturation: 0.85, ..n },
+            "golden" => Self { temperature: 0.5, split_highlights: [0.65, 0.55, 0.4], split_shadows: [0.48, 0.47, 0.52], contrast: 1.05, ..n },
+            _ => return None,
+        })
+    }
 }
 
 /// Size-dependent resources of one render target (the canvas, or one render texture).
@@ -53,6 +123,8 @@ pub(crate) struct Post {
     pub sky_pipeline: GpuRenderPipeline,
     /// Exposure multiplier from the day/night cycle (set by the renderer each frame).
     pub exposure_mul: f32,
+    /// Frame counter for the animated film grain.
+    pub grain_frame: u32,
     /// Lens flare for the next composite: (sun uv x, y, strength, disk radius in uv height) and
     /// (sun colour rgb, expected disk luminance). Set by the renderer per view; strength 0 = off.
     pub flare: ([f32; 4], [f32; 4]),
@@ -245,6 +317,7 @@ impl Post {
         Ok(Self {
             sky_pipeline,
             exposure_mul: 1.0,
+            grain_frame: 0,
             flare: ([0.0; 4], [0.0; 4]),
             particle_additive,
             particle_alpha,
@@ -378,6 +451,26 @@ impl Post {
                 c: [s.vignette, s.saturation, if transparent { 1.0 } else { 0.0 }, t.size.0 as f32 / t.size.1.max(1) as f32],
                 d: if s.debug_view == 0 { self.flare.0 } else { [0.0; 4] },
                 e: self.flare.1,
+                g: {
+                    let gr = &s.grade;
+                    let on = gr != &Grade::default() && s.debug_view == 0;
+                    let [lr, lg, lb] = gr.lift;
+                    let [gmr, gmg, gmb] = gr.gamma;
+                    let [gnr, gng, gnb] = gr.gain;
+                    let [sr, sg, sb] = gr.split_shadows;
+                    let [hr, hg, hb] = gr.split_highlights;
+                    let [vr, vg, vb] = s.vignette_color;
+                    [
+                        [gr.temperature, gr.tint, gr.contrast, gr.pivot],
+                        [lr, lg, lb, gr.split_balance],
+                        [gmr.max(0.01), gmg.max(0.01), gmb.max(0.01), if s.debug_view == 0 { s.grain.max(0.0) } else { 0.0 }],
+                        [gnr, gng, gnb, s.grain_size.max(0.5)],
+                        [sr, sg, sb, s.vignette_radius.max(0.0)],
+                        [hr, hg, hb, s.vignette_softness.max(0.001)],
+                        [vr, vg, vb, s.vignette_roundness.clamp(0.0, 1.0)],
+                        [(self.grain_frame % 4096) as f32, if on { 1.0 } else { 0.0 }, gr.saturation.max(0.0), 0.0],
+                    ]
+                },
             },
         );
         queue.write_buffer_with_u32_and_u8_slice(&t.params, 0, &data).map_err(js_err)?;

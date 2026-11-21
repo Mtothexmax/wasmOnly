@@ -683,8 +683,22 @@ pub struct RenderSettings {
     pub depth_darkening_radius: f32,
     /// Depth differences beyond this (m) are silhouettes, not creases.
     pub depth_darkening_range: f32,
+    /// Vignette strength. With `vignette_radius` 0 the classic radial darkening; with a radius > 0 a
+    /// masking vignette: `vignette_color` blended in beyond `radius` (fraction of the half height)
+    /// over `softness`; `roundness` 1 = circular on any aspect, 0 = follows the screen rectangle.
     pub vignette: f32,
+    pub vignette_color: [f32; 3],
+    pub vignette_radius: f32,
+    pub vignette_softness: f32,
+    pub vignette_roundness: f32,
     pub saturation: f32,
+    /// Colour grading after tonemapping (white balance, lift/gamma/gain, contrast, split toning,
+    /// presets). Default neutral.
+    pub grade: crate::post::Grade,
+    /// Film grain (0 = off, ~0.3 subtle): animated per frame, stronger in the darks.
+    pub grain: f32,
+    /// Grain size in screen pixels.
+    pub grain_size: f32,
     /// Draw particle systems.
     pub particles: bool,
     /// Draw GPU grass (needs a terrain; tune with the `grass` command / `renderer.grass_settings()`).
@@ -778,7 +792,14 @@ impl Default for RenderSettings {
             depth_darkening_radius: 30.0,
             depth_darkening_range: 1.5,
             vignette: 0.15,
+            vignette_color: [0.0; 3],
+            vignette_radius: 0.0,
+            vignette_softness: 0.5,
+            vignette_roundness: 1.0,
             saturation: 1.05,
+            grade: crate::post::Grade::default(),
+            grain: 0.0,
+            grain_size: 1.0,
             particles: true,
             grass: true,
             render_scale: 1.0,
@@ -4035,6 +4056,9 @@ impl Renderer {
 
         // --- Post: bloom + depth darkening + tonemap -> canvas ------------------------------
         self.post.exposure_mul = self.sky.exposure_mul;
+        if main && !self.settings.freeze_time {
+            self.post.grain_frame = self.post.grain_frame.wrapping_add(1);
+        }
         self.post.flare = if main { self.lens_flare(view_proj, cam_pos) } else { ([0.0; 4], [0.0; 4]) };
         {
             let ts = self.timing.as_mut().filter(|_| main).and_then(|t| t.split_writes(crate::gpu_timing::POST));

@@ -1,0 +1,23 @@
+# Colour grading, presets, masking vignette, film grain (composite pass).
+#   node tools/bridge.mjs run games/demo/tests/grade.txt
+
+reload
+screen play
+frames 10
+expect render.grade.contrast == 1
+expect render.grain == 0
+expect render.grade_presets contains "noir"
+call render {"grade": {"preset": "warm"}}
+expect render.grade.temperature ~= 0.35
+# fields merge over the preset; colours as '#rrggbb'
+call render {"grade": {"tint": -0.2, "split_shadows": "#4060a0"}}
+expect render.grade.temperature ~= 0.35
+expect render.grade.tint ~= -0.2
+expect render.grade.split_shadows.2 ~= 0.627
+call render {"vignette": 0.8, "vignette_radius": 0.7, "vignette_softness": 0.5, "vignette_color": "#102040", "grain": 0.3, "grain_size": 1.5}
+expect render.vignette_color.0 ~= 0.063
+frames 3
+expect logs{"level": "error"}.entries.length == 0
+expect render.grade.temperature ~= 0.35
+call render {"grade": {"preset": "neutral"}, "vignette": 0.15, "vignette_radius": 0, "vignette_color": [0,0,0], "grain": 0, "grain_size": 1}
+expect render.grade.temperature == 0

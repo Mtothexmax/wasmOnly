@@ -151,6 +151,15 @@ normal `cargo` output above it.
   hitch at 4K), so it jumps once to a scale that fits and changes at most every 4 s; `stats.render` has `width/height` (scene) and `canvas`.
 - **Render settings:** `call render` lists every setting; set any by name (sky, fog_*, bloom*, exposure,
   depth_darkening, vignette, saturation, particles, shadows, ...). Unknown names are an error.
+- **Colour grading / looks** (composite pass, no extra pass; defaults neutral = no change): `render {grade: {preset,
+  temperature, tint, lift:[r,g,b], gamma, gain, contrast, pivot, split_shadows:'#rrggbb', split_highlights,
+  split_balance, saturation}}` in display space after tonemapping (white balance -> lift/gamma/gain -> contrast ->
+  split toning -> saturation). Fields merge over the current grade; `preset` (`render` lists `grade_presets`: neutral,
+  warm, cool, fade, vivid, noir, night, golden) resets to that look first. Game code: `settings.grade =
+  Grade::preset("night").unwrap()` and tweak fields. Masking vignette: `vignette_radius` > 0 (fraction of the half
+  height) + `vignette_softness`, `vignette_color`, `vignette_roundness` (1 = circle on any aspect); radius 0 = the classic
+  darkening. Film grain: `grain` (~0.3 subtle), `grain_size` px, animated per frame, stronger in the darks (frozen
+  with `freeze_time`). No 3D LUT yet. Test: `games/demo/tests/grade.txt`.
 - **Visual checks:** `render '{"debug_view":1}'` = normals, `2` = shadow term, `0` = lit.
 - **3D UI:** `call panels` gives every world-panel widget with its on-screen centre (`screen`, CSS px);
   click it for real with `input {x,y}` + `input {button:0}`, or directly with `panel_click {id, widget}`.

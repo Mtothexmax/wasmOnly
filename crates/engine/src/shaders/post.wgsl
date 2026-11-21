@@ -11,6 +11,41 @@ struct Params {
     c: vec4f,
     d: vec4f,
     e: vec4f,
+    // grading: g[0] = (temperature, tint, contrast, pivot), g[1] = (lift rgb, split balance),
+    // g[2] = (gamma rgb, grain), g[3] = (gain rgb, grain size px), g[4] = (split shadows rgb, vignette
+    // radius), g[5] = (split highlights rgb, vignette softness), g[6] = (vignette colour rgb,
+    // roundness), g[7] = (frame, grading on, grade saturation, -)
+    g: array<vec4f, 8>,
+}
+
+fn soft_light(a: vec3f, b: vec3f) -> vec3f { // Pegtop: b = 0.5 leaves a unchanged
+    return (1.0 - 2.0 * b) * a * a + 2.0 * b * a;
+}
+
+// Colour grading in display space (0..1), see post::Grade.
+fn grade(c0: vec3f) -> vec3f {
+    var c = c0;
+    // white balance: warm/cool and green/magenta gains, luminance kept
+    let t = p.g[0].x;
+    let tn = p.g[0].y;
+    let wb = vec3f(1.0 + 0.2 * t, 1.0 - 0.2 * tn, 1.0 - 0.2 * t);
+    c *= wb / max(luma(wb), 1e-3);
+    // lift / gamma / gain
+    c = p.g[3].rgb * (c + p.g[1].rgb * (1.0 - c));
+    c = pow(max(c, vec3f(0.0)), 1.0 / p.g[2].rgb);
+    // contrast around the pivot
+    c = (c - p.g[0].w) * p.g[0].z + p.g[0].w;
+    c = clamp(c, vec3f(0.0), vec3f(1.0));
+    // split toning: shadows / highlights colour, soft light
+    let w = smoothstep(0.0, 1.0, clamp(luma(c) + p.g[1].w * 0.5, 0.0, 1.0));
+    c = soft_light(c, mix(p.g[4].rgb, p.g[5].rgb, w));
+    return c;
+}
+
+fn grain_hash(q: vec2f) -> f32 {
+    var h = fract(vec3f(q.xyx) * vec3f(0.1031, 0.1030, 0.0973));
+    h += dot(h, h.yzx + 33.33);
+    return fract((h.x + h.y) * h.z);
 }
 
 @group(0) @binding(0) var src: texture_2d<f32>;
@@ -306,12 +341,30 @@ fn fs_composite(i: CompOut) -> @location(0) vec4f {
         c += lens_flare(i.uv, i.sun_vis);
     }
     var mapped = aces(c * p.a.x);
+    var sat = p.c.y;
+    if (p.g[7].y > 0.5) {
+        mapped = grade(mapped);
+        sat *= p.g[7].z;
+    }
     // saturation
     let l = luma(mapped);
-    mapped = clamp(mix(vec3f(l), mapped, p.c.y), vec3f(0.0), vec3f(1.0));
-    // vignette
+    mapped = clamp(mix(vec3f(l), mapped, sat), vec3f(0.0), vec3f(1.0));
+    // vignette: classic radial darkening, or (radius > 0) a masking vignette in a colour
     let v = i.uv - 0.5;
-    mapped *= 1.0 - p.c.x * dot(v, v) * 1.6;
+    if (p.g[4].w > 0.0) {
+        let q = vec2f(v.x * mix(1.0, p.c.w, p.g[6].w), v.y) * 2.0; // roundness 1: aspect-correct circle
+        let m = smoothstep(p.g[4].w, p.g[4].w + p.g[5].w, length(q));
+        mapped = mix(mapped, p.g[6].rgb, m * clamp(p.c.x, 0.0, 1.0));
+    } else {
+        mapped *= 1.0 - p.c.x * dot(v, v) * 1.6;
+    }
+    // film grain: per frame, per grain cell, stronger in the darks
+    if (p.g[2].w > 0.0) {
+        let cell = floor(i.pos.xy / p.g[3].w);
+        let n = grain_hash(cell + vec2f(p.g[7].x * 17.0, p.g[7].x * 31.0)) - 0.5;
+        let lw = mix(1.0, 0.35, luma(mapped));
+        mapped = clamp(mapped + n * p.g[2].w * 0.25 * lw, vec3f(0.0), vec3f(1.0));
+    }
     var outc = mix(c, mapped, mask);
     if (GAMMA_OUT) {
         outc = pow(max(outc, vec3f(0.0)), vec3f(1.0 / 2.2));
