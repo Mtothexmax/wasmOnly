@@ -327,7 +327,9 @@ fn apply_sample(world: &World, a: &Animator, ch: &Channel, s: Sample, w: f32, po
                 if let Ok(mut def) = world.get::<&mut Deformer>(d) {
                     for (k, x) in ws.iter().enumerate() {
                         if let Some(dst) = def.weights.get_mut(k) {
-                            *dst = *dst + (x - *dst) * w;
+                            // w = 1 must give x exactly: `dst + (x - dst)` can differ in the last bit and
+                            // flip between two values, re-deforming (and re-uploading) the mesh every frame
+                            *dst = if w >= 1.0 { *x } else { *dst + (x - *dst) * w };
                         }
                     }
                 }
@@ -431,7 +433,7 @@ pub(crate) fn deform_all(ctx: &mut Ctx) {
                     continue;
                 }
                 if (wsum - 1.0).abs() > 1e-3 {
-                    m = m * (1.0 / wsum);
+                    m *= 1.0 / wsum;
                 }
                 let p = m.transform_point3(Vec3::from(out[i].pos));
                 let nn = m.transform_vector3(Vec3::from(out[i].normal)).normalize_or(Vec3::Y);

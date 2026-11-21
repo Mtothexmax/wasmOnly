@@ -157,7 +157,7 @@ impl CharacterController {
     pub fn drive(&mut self, axis: Vec2, camera_yaw: f32) {
         let a = if axis.length() > 1.0 { axis.normalize() } else { axis };
         let fwd = Vec3::new(-camera_yaw.sin(), 0.0, -camera_yaw.cos());
-        let right = Vec3::new(fwd.z * -1.0, 0.0, fwd.x);
+        let right = Vec3::new(-fwd.z, 0.0, fwd.x);
         self.wish = right * a.x + fwd * a.y;
     }
 
@@ -241,7 +241,7 @@ pub(crate) fn step_characters(ctx: &mut Ctx, dt: f32) {
         kcc.max_slope_climb_angle = cc.max_slope_deg.to_radians();
         kcc.min_slope_slide_angle = (cc.max_slope_deg + 5.0).to_radians();
         kcc.offset = CharacterLength::Absolute(0.02);
-        kcc.autostep = (cc.step_height > 0.0).then(|| CharacterAutostep {
+        kcc.autostep = (cc.step_height > 0.0).then_some(CharacterAutostep {
             max_height: CharacterLength::Absolute(cc.step_height),
             min_width: CharacterLength::Absolute(cc.radius * 0.5),
             include_dynamic_bodies: false,
@@ -294,7 +294,7 @@ pub(crate) fn step_characters(ctx: &mut Ctx, dt: f32) {
             up.snap_to_ground = None;
             let lift = up.move_shape(dt, &qp, &*shape, &pos, Vec3::Y * cc.step_height, |_| {});
             let p1 = Pose::from_parts(t.translation + lift.translation, Quat::IDENTITY);
-            let mut flat = kcc.clone();
+            let mut flat = kcc;
             flat.snap_to_ground = None;
             flat.autostep = None;
             let side = flat.move_shape(dt, &qp, &*shape, &p1, want_h, |_| {});

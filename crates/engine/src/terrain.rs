@@ -473,7 +473,7 @@ impl Ctx {
             }
         }
         let t0 = crate::log::now_ms();
-        let px: Vec<Vec<u8>> = crate::jobs::par_map(&layers.to_vec(), |p| crate::texgen::TexGen::new(*p).size(256).seed(7).generate());
+        let px: Vec<Vec<u8>> = crate::jobs::par_map(layers.as_ref(), |p| crate::texgen::TexGen::new(*p).size(256).seed(7).generate());
         let px: [Vec<u8>; 4] = [px[0].clone(), px[1].clone(), px[2].clone(), px[3].clone()];
         let atlas_tex = self.renderer.add_texture_rgba(512, 512, &atlas(&px, 256), "terrain-atlas").ok();
         let splat_bytes: Vec<u8> = t.splat.iter().flatten().copied().collect();

@@ -17,7 +17,8 @@ Rust → `wasm32-unknown-unknown` → Chrome (WebGPU). AI-first: every runtime s
 | Models | glTF `.glb` (static, skinned, morph targets, clips via `Animator`) (`gltf_loader`, `animation`); other formats via `tools/asset-cook` |
 | Procedural content | `MeshBuilder` geometry kit + generator registry, cached + instanced (`geom`); static batching, `Motion` (`batch`) |
 | World | heightmap terrain (LOD chunks, splat, colliders, scatter), GPU grass, streaming cells, floating origin (`terrain`, `vegetation`, `streaming`) |
-| Look | PBR, cascaded shadows, clustered point/spot lights, physically based sky (clouds, stars, moon, skybox) with day/night cycle, fog, bloom, depth darkening, particles, Unreal-style water (Gerstner waves, refraction, SSR, caustics, foam), render to texture, adaptive resolution |
+| Look | PBR, cascaded shadows, clustered point/spot lights, physically based sky (clouds, stars, moon, skybox) with day/night cycle, fog, bloom, depth darkening, particles, Unreal-style water (Gerstner waves, refraction, SSR, caustics, foam), render to texture, colour grading (`render {grade}`, `engine::Grade`), plastic materials (`Material` clearcoat / subsurface), wind-bent vegetation (`Material::bend`), per-entity opacity with solid fade |
+| Frame rate | automatic frame pacing (`pacing`): full rate when the GPU keeps up, every 2nd/3rd refresh when not, back when there is headroom; no GPU queue (back-pressure). `max_fps` is only an optional limit; `ctx.time.lock_fixed_to_frames` for the same step count every frame |
 | UI | DOM HUD slots with `data-action` buttons (`ui`), clickable world panels (`panel`), world-anchored labels |
 | Audio | 3D sounds, procedural sfx presets, streamed music (`audio`) |
 | Physics | rapier3d (`physics`): bodies, collision events (`collision_events`, `entered`, `exited`, `inside`), trigger zones (`ctx.spawn_trigger`), overlap / sphere-cast / ray queries |
@@ -63,7 +64,9 @@ auto_lod: false, ..Default::default() })`, `ctx.gltf_defaults.auto_lod = false`,
    character states and your `game_state`. The character controller logs a warning when movement or a
    jump has no effect, with the entity that blocks it.
 5. **Performance**: `bridge perf` gives a verdict (smooth / gpu-bound / cpu-bound / stutter) with the
-   biggest pass or phase. Adaptive resolution keeps the GPU inside `render.frame_budget_ms`.
+   biggest pass or phase. Frame pacing picks the cadence (`stats.render.pacing`), adaptive resolution keeps the GPU
+   inside `render.frame_budget_ms`; don't set a fixed `max_fps` per device. Call `ctx.renderer.prewarm()` at the end of
+   a loading screen so first-use pipeline compiles (mobile drivers) don't hitch mid-game.
 6. **Z-fighting**: the debug build checks automatically near the camera; `zfight {radius}` on demand.
    Fix by offsetting surfaces, never with depth bias.
 7. Engine gaps or bugs: fix them in the engine repository (with a test in `games/demo/tests`) so every
@@ -88,7 +91,7 @@ auto_lod: false, ..Default::default() })`, `ctx.gltf_defaults.auto_lod = false`,
 | Point/spot lights, day/night | `PointLight`, `SpotLight` (clustered, hundreds); `day_cycle` + `time_of_day` (+ `day_length_minutes`) drive sun, moon, sky and ambient; lamps follow `ctx.renderer.sky.night` |
 | Sprite particles | `ctx.spawn_particles(name, pos, ParticleEmitter::preset(..))` |
 | Rain `InstancedMesh` | `ParticlePreset::Rain`, or instanced entities (same mesh = one draw) |
-| Quality presets / auto-downgrade | adaptive resolution (`render.auto_resolution`), `shadow_cascades`, grass radius |
+| Quality presets / auto-downgrade | frame pacing + adaptive resolution (`render.auto_resolution`, `min_render_scale`), `shadow_cascades`, grass radius |
 | Voice lines / mp3 | `ctx.audio.play_music` (streamed), `ctx.load_sound` + `play_named` |
 | npm test for content | scripted tests (`tests/*.txt`), game commands for content checks |
 

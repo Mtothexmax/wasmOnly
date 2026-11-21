@@ -856,19 +856,9 @@ pub struct FrameStats {
     /// Why static copies were re-rendered (totals): [no copy yet, sun direction, static caster
     /// changed, cascade re-fitted (camera left the margin), copy not kept].
     pub shadow_static_why: [u32; 5],
-    /// Main-view frames submitted but not finished by the GPU (`onSubmittedWorkDone`).
-    pub frames_in_flight: u32,
-    /// Submit -> GPU done of the main view, smoothed (ms). Large = the GPU runs behind (input lag).
-    pub gpu_latency_ms: f32,
     /// Draws of faded entities through the solid-fade path this frame (`settings.solid_fade`).
     pub solid_fade_draws: u32,
-    /// Frames not rendered because `max_frames_in_flight` was reached (total).
-    pub frames_skipped: u64,
-    /// Frames that finished more than 3/4 of a frame slot later than expected (total; `pacing.late`).
-    pub late_presents: u64,
-    /// Refreshes per drawn frame the automatic pacing added on top of the `max_fps` cap (0 = none).
-    pub auto_frame_step: u32,
-    /// Frame pacing decision and its inputs (`crate::pacing`).
+    /// Frame pacing: cadence, back-pressure, latency, misses (`crate::pacing`).
     pub pacing: crate::pacing::PacingStats,
     /// Per cascade of the current set: re-rendered this frame (false = cached map reused).
     pub shadow_cascades_rendered: Vec<bool>,
@@ -2698,6 +2688,7 @@ impl Renderer {
 
     /// Full-resolution canvas size in device pixels (CSS size x devicePixelRatio). The scene and
     /// the canvas backing store use `scene_size_for` of it (`render_scale`).
+    #[allow(clippy::misnamed_getters)]
     pub fn size(&self) -> (u32, u32) {
         self.canvas_size
     }
@@ -2730,8 +2721,8 @@ impl Renderer {
 
     /// Adaptive resolution, called once per frame. Every change of `render_scale` reallocates the
     /// render targets (a 20-35 ms hitch at 4K), so it changes rarely and lands on a value that fits:
-    /// * measures the whole-frame GPU time (`gpu_ms.frame`, includes clears/resolves; else the
-    ///   frame interval) averaged over 30 frames;
+    /// * measures the whole-frame GPU time (`gpu_ms.frame`, includes clears/resolves) averaged over
+    ///   30 frames; without timestamps frame pacing (`crate::pacing`) owns the scale;
     /// * GPU time scales with pixels, so the scale that fits is `s * sqrt(target / gpu)` with
     ///   target = 90 % of `frame_budget_ms`; it jumps there in one step (0.05 grid);
     /// * goes down when over budget, goes up only if the *predicted* time at the higher step stays
@@ -2779,7 +2770,7 @@ impl Renderer {
             if self.timing_strikes >= 4 {
                 self.timing = None;
                 self.stats.gpu_ms = None;
-                crate::log_warn!("GPU timestamps unreliable on this device (gpu frame {avg_gpu:.0} ms vs rendered-frame interval {render_interval:.0} ms): timing off, adaptive resolution uses the frame interval");
+                crate::log_warn!("GPU timestamps unreliable on this device (gpu frame {avg_gpu:.0} ms vs rendered-frame interval {render_interval:.0} ms): timing off, frame pacing judges the GPU by latency");
             }
             return;
         }
@@ -2820,22 +2811,8 @@ impl Renderer {
                     best.min(1.0)
                 }
             }
-            // no timestamp queries, but completions are tracked: frame pacing decides the scale
-            None if self.pacing.stats.baseline_ms > 0.0 => s,
-            // no timestamp queries: interval between *rendered* frames (vsync-bound, coarse; frames the
-            // limiter skipped do not count as cheap ones)
-            None => {
-                if since < 4000.0 {
-                    return;
-                }
-                if render_interval > (budget * 1.1).max(18.5) {
-                    snap(s * (budget.max(16.7) * 0.9 / render_interval).sqrt().min(0.85))
-                } else if render_interval < 17.2 && s < 1.0 {
-                    snap(s + 0.05)
-                } else {
-                    s
-                }
-            }
+            // no timestamp queries: frame pacing decides the scale (crate::pacing)
+            None => return,
         };
         if (next - s).abs() > 0.004 {
             self.settings.render_scale = next;
@@ -2866,9 +2843,6 @@ impl Renderer {
             self.adapt_last_change = now;
         }
         self.stats.pacing = self.pacing.stats.clone();
-        self.stats.auto_frame_step = self.pacing.interval().saturating_sub(self.pacing.cap.max(1));
-        self.stats.late_presents = self.pacing.stats.late;
-        self.stats.frames_skipped = self.pacing.stats.skipped;
     }
 
     /// gpu_slow test pass: a compute loop whose iteration count is calibrated to `ms` with the (possibly
@@ -3034,8 +3008,7 @@ impl Renderer {
             let since = *self.skip_since.get_or_insert(now);
             if now - since < 1000.0 {
                 self.last_drew = false;
-                self.stats.frames_skipped = self.pacing.stats.skipped;
-                self.stats.frames_in_flight = self.pacing.queued();
+                self.stats.pacing = self.pacing.stats.clone();
                 return Ok(());
             }
             // a GPU promise that never resolves: forget it and render again
@@ -3324,7 +3297,7 @@ impl Renderer {
         let mut slots: Vec<u32> = Vec::with_capacity(self.pool.recs.len());
         if main {
             self.pool.frame += 1;
-            if self.pool.frame % 30 == 0 {
+            if self.pool.frame.is_multiple_of(30) {
                 self.pool.sweep();
             }
         }
@@ -4486,12 +4459,7 @@ impl Renderer {
             let t0 = crate::log::now_ms();
             self.pacing.submitted(t0);
             self.last_drew = true;
-            stats.frames_in_flight = self.pacing.queued();
-            stats.gpu_latency_ms = self.pacing.last_latency();
-            stats.frames_skipped = self.pacing.stats.skipped;
-            stats.late_presents = self.pacing.stats.late;
             stats.pacing = self.pacing.stats.clone();
-            stats.auto_frame_step = self.pacing.interval().saturating_sub(self.pacing.cap.max(1));
             let shared = self.pacing.shared.clone();
             let done = self.queue.on_submitted_work_done();
             wasm_bindgen_futures::spawn_local(async move {

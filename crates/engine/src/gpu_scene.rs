@@ -541,7 +541,7 @@ impl GpuScene {
         }
         // dynamic casters that stayed still long enough go back into the static shadow cache, in
         // batches (every 30 frames: one re-render of the static copies instead of one per caster)
-        let mut k = if frame % 30 == 0 { 0 } else { self.dyn_slots.len() };
+        let mut k = if frame.is_multiple_of(30) { 0 } else { self.dyn_slots.len() };
         while k < self.dyn_slots.len() {
             let i = self.dyn_slots[k] as usize;
             let inf = &self.infos[i];

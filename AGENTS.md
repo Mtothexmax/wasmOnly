@@ -17,7 +17,7 @@ node tools/bridge.mjs call help     # list every engine + game command
 node tools/bridge.mjs screenshot out.png
 node tools/bridge.mjs check          # build check: reload, assets, z-fighting, engine errors (exit 1 = fail)
 node tools/dev.mjs build --check     # build + check in one step (watch --check: after every rebuild)
-node tools/dev.mjs build --release    # optimised build (no wasm-opt: after gzip it saved ~1 %)
+node tools/dev.mjs build --release    # optimised build
 node tools/bridge.mjs run games/demo/tests/smoke.txt   # scripted test run (input, step, expect, screenshot)
 node tools/new-game.mjs ../my-game                     # new standalone game repo (see HANDOFF.md)
 node tools/dev.mjs watch --game-dir ../my-game         # build/serve a game from another folder
@@ -299,8 +299,8 @@ normal `cargo` output above it.
   clearcoat_roughness}` sets them. Test: `games/demo/tests/plastic.txt`.
 - **Input lag on a GPU-bound device:** without a limit Chrome queues frames and the screen shows one that is
   up to a second old (desktop repro: 320vw canvas, 7 frames in flight, 1 s latency). The back-pressure of frame pacing
-  (`render {max_frames_in_flight}`, default 2; 0 = off; 64 queued = hard cap) prevents it. `stats.render`:
-  `frames_in_flight`, `gpu_latency_ms` (last submit -> done), `frames_skipped`, `late_presents`, `pacing.queue_ms`.
+  (`render {max_frames_in_flight}`, default 2; 0 = off; 64 queued = hard cap) prevents it. `stats.render.pacing`:
+  `queued`, `latency_ms` (last submit -> done), `queue_ms`, `skipped`, `late`.
 - **GPU time, the honest number:** `gpu_ms.frame` = first pass begin to last pass end. It is larger than `total`
   (the sum of the passes) because clears, MSAA resolves and copies run *between* the timed passes;
   `gpu_ms.timeline` has begin/end per pass (cull, shadow, opaque, blend, hiz, post), so the gaps show them.
@@ -365,6 +365,7 @@ normal `cargo` output above it.
 | `crates/engine/src/terrain.rs` | heightmap terrain: chunk LOD + skirts, splat material, heightfield colliders, streaming, edits, scatter rules |
 | `crates/engine/src/vegetation.rs` | GPU grass (vertex-shader placed blades) |
 | `crates/engine/src/streaming.rs` | streaming layers (cells = scenes) + floating origin (`ctx.origin`, `shift_origin`) |
+| `crates/engine/src/pacing.rs` | frame pacing: automatic cadence (refresh divisor), back-pressure, completion tracking, `stats.render.pacing` |
 | `crates/engine/src/gpu_scene.rs` | GPU-driven scene: persistent objects + draw groups, change detection, `cull.wgsl` dispatch, readback |
 | `crates/engine/src/gpu_cull.rs` | Hi-Z occlusion pyramid |
 | `crates/engine/src/panel.rs` | world panels: Canvas2D widgets -> texture on a quad, ray/UV hit test |

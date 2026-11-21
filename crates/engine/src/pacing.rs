@@ -61,6 +61,8 @@ pub struct PacingStats {
     pub queue_ms: f32,
     /// Frames submitted and not resolved yet.
     pub queued: u32,
+    /// Submit -> done latency of the last resolved frame (ms; includes Chrome's resolve delay).
+    pub latency_ms: f32,
     /// Frames that finished more than 3/4 of a slot late (total).
     pub late: u64,
     /// Frames not submitted because of back-pressure (total).
@@ -172,10 +174,6 @@ impl FramePacing {
         self.lat.iter().map(|l| l.1).fold(f32::MAX, f32::min)
     }
 
-    pub(crate) fn last_latency(&self) -> f32 {
-        self.last_latency
-    }
-
     pub(crate) fn queued(&self) -> u32 {
         self.shared.borrow().pending.len() as u32
     }
@@ -257,6 +255,7 @@ impl FramePacing {
         self.stats.jitter_ms = self.jitter.max(0.0);
         self.stats.queue_ms = self.queue_ms(now);
         self.stats.queued = self.queued();
+        self.stats.latency_ms = self.last_latency;
         self.stats.wait_s = (self.wait_ms / 1000.0) as f32;
         self.stats.failed_triangles = self.failed_tris.iter().map(|&t| t as u64).collect();
         if self.win_start == 0.0 {

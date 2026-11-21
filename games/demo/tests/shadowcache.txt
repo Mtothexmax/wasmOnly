@@ -3,10 +3,15 @@
 # Run: node tools/bridge.mjs run games/demo/tests/shadowcache.txt
 reload
 screen play
+# glTF models (the skinned critter) finish loading asynchronously; their first pose re-renders the
+# shadows once, so wait for them before calling the scene still
+wait_for assets.models_pending.length == 0 10000
 pause
 call render {"shadow_cache":true,"particles":false}
 call sky {"time":15.5,"day_length":0}
 frames 20
+# nothing changes while paused (a morph-weight rounding flip used to re-deform the critter every frame)
+expect gpu_scene.changed.length == 0
 expect stats.render.shadow_passes_cached >= 2
 expect stats.render.shadow_passes_rendered <= 2
 down KeyW
