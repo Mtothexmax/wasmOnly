@@ -1069,6 +1069,18 @@ pub struct Renderer {
     fade_copy: (GpuRenderPipeline, GpuBindGroupLayout),
     /// Second depth buffer of the canvas size: scene depth + nearest faded surfaces.
     fade_depth: Option<((u32, u32), GpuTextureView)>,
+    /// Prewarm on the next main-view frame (`prewarm()`; once automatically at startup): every
+    /// pipeline variant a game reaches later (mask, blend, solid fade, depth-equal) draws one triangle
+    /// into a 1x1 scissor, so mobile drivers that compile on first draw do it now, not mid-game.
+    prewarm_pending: bool,
+    prewarmed: bool,
+    /// (solid_fade, day_cycle) last frame: switching one on prewarms again.
+    warm_flags: (bool, bool),
+    /// First real use of a lazily reached path (bit per kind), logged with the next frame's interval.
+    first_use_seen: u32,
+    first_use_log: Vec<&'static str>,
+    first_use_frame: u64,
+    render_frames: u64,
     /// Set when the driver failed to build that pipeline: its draws are skipped (see
     /// `debug::create_pipeline_guarded`), so one broken shader does not blank the whole frame.
     pipeline_broken: [Rc<Cell<bool>>; 6],
@@ -1700,6 +1712,13 @@ impl Renderer {
             fade_broken,
             fade_copy,
             fade_depth: None,
+            prewarm_pending: true,
+            prewarmed: false,
+            warm_flags: (false, false),
+            first_use_seen: 0,
+            first_use_log: vec![],
+            first_use_frame: 0,
+            render_frames: 0,
             pipeline_broken,
             shadow_pipeline,
             shadow_mask_pipeline,
@@ -2024,10 +2043,44 @@ impl Renderer {
         Ok((device.create_render_pipeline(&d).map_err(js_err)?, bgl))
     }
 
+    /// Builds what a game reaches only later, during a loading screen instead of mid-game: on the next
+    /// frame every pipeline variant (alpha mask, blend, solid fade incl. its depth copy, depth-equal)
+    /// draws one triangle into a 1x1 scissor (mobile drivers compile on first draw: tens of ms each),
+    /// the solid-fade depth target is allocated (with `solid_fade` on) and, with a moving sun
+    /// (`day_cycle`, `shadow_step_deg` and `shadow_fade_ms` > 0), the second shadow-map set. Runs once
+    /// by itself on the first frame; call it again after changing those settings. API: `prewarm`.
+    pub fn prewarm(&mut self) {
+        self.prewarm_pending = true;
+    }
+
+    /// Notes the first real use of a lazily reached path; logged with the next frame's interval.
+    fn first_use(&mut self, bit: u32, name: &'static str) {
+        if self.first_use_seen & bit == 0 {
+            self.first_use_seen |= bit;
+            self.first_use_log.push(name);
+            self.first_use_frame = self.render_frames;
+        }
+    }
+
+    /// Draws one triangle of the first usable mesh with `pipeline` into a 1x1 scissor (prewarm).
+    fn warm_draw(&self, pass: &GpuRenderPassEncoder, pipeline: &GpuRenderPipeline, mg: &GpuBindGroup, mesh: usize) {
+        let m = &self.meshes[mesh];
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(1, Some(mg));
+        pass.set_vertex_buffer(0, Some(&m.vb));
+        pass.set_index_buffer(&m.ib, GpuIndexFormat::Uint32);
+        pass.set_scissor_rect(0, 0, 1, 1);
+        pass.draw_indexed_with_instance_count_and_first_index_and_base_vertex_and_first_instance(3, 1, 0, 0, 0);
+        pass.set_scissor_rect(0, 0, self.size.0.max(1), self.size.1.max(1));
+    }
+
     /// Allocates the second shadow-map set (cross-fading a stepped sun). False if that failed.
     fn ensure_two_shadow_sets(&mut self) -> bool {
         if self.shadow_sets >= 2 {
             return true;
+        }
+        if !self.prewarm_pending {
+            self.first_use(4, "second shadow-map set");
         }
         match Self::make_shadow_maps(&self.device, self.shadow_size, 2) {
             Ok((_, view, layers)) => {
@@ -2688,6 +2741,17 @@ impl Renderer {
     ///   under 85 % of the budget for 3 windows in a row (no up/down oscillation);
     /// * at least 4 s between changes, except when more than 30 % over budget.
     pub fn adapt_resolution(&mut self, frame_dt: f32) {
+        self.render_frames += 1;
+        if !self.first_use_log.is_empty() && self.render_frames > self.first_use_frame + 1 {
+            crate::log_info!(
+                "first use: {} (frame took {:.1} ms, typical {:.1} ms; {})",
+                self.first_use_log.join(", "),
+                frame_dt * 1000.0,
+                self.frame_interval_ms,
+                if self.prewarmed { "prewarmed" } else { "not prewarmed: renderer.prewarm() / API prewarm" }
+            );
+            self.first_use_log.clear();
+        }
         if frame_dt > 0.0 {
             let ms = frame_dt * 1000.0;
             self.frame_interval_ms = if self.frame_interval_ms == 0.0 { ms } else { self.frame_interval_ms * 0.95 + ms * 0.05 };
@@ -2997,6 +3061,17 @@ impl Renderer {
         }
         self.skip_since = None;
         self.adapt_rendered += 1;
+        let flags = (self.settings.solid_fade, self.settings.day_cycle);
+        if (flags.0 && !self.warm_flags.0) || (flags.1 && !self.warm_flags.1) {
+            self.prewarm_pending = true;
+        }
+        self.warm_flags = flags;
+        if self.prewarm_pending {
+            let s = &self.settings;
+            if s.day_cycle && s.shadow_step_deg > 0.0 && s.shadow_fade_ms > 0.0 && s.shadows {
+                self.ensure_two_shadow_sets();
+            }
+        }
         self.apply_render_scale();
         for i in 0..self.rtts.len() {
             if !self.rtts[i].due() {
@@ -4059,7 +4134,23 @@ impl Renderer {
         // Nothing blended (no transparent draws, particles or water): the opaque pass resolves
         // straight into the HDR target and the blend pass is skipped. Saves a full load + store of
         // the 4x MSAA HDR target, pure bandwidth (a few ms on integrated GPUs).
-        let skip_blend = blend_runs.is_empty() && solid_runs.is_empty() && n_add + n_alpha == 0 && !has_water;
+        // prewarm (main view, once a mesh exists): every lazily reached pipeline draws a 1x1 triangle
+        let warm_mesh = if main && self.prewarm_pending { self.meshes.iter().position(|m| m.index_count >= 3) } else { None };
+        let warm_mg = warm_mesh.map(|_| self.material_group((0, u32::MAX, u32::MAX)));
+        if warm_mesh.is_some() {
+            self.prewarm_pending = false;
+            self.prewarmed = true;
+            crate::log_info!("prewarm: mask, blend{} and depth-equal pipelines drawn once (1x1)", if self.settings.solid_fade { ", solid fade" } else { "" });
+        } else if main {
+            if !solid_runs.is_empty() {
+                self.first_use(1, "solid fade (depth target + pipelines)");
+            }
+            if !blend_runs.is_empty() {
+                self.first_use(2, "blend pipelines");
+            }
+        }
+        let warm_solid = warm_mesh.is_some() && self.settings.solid_fade && self.fade_broken.iter().all(|b| !b.get());
+        let skip_blend = warm_mesh.is_none() && blend_runs.is_empty() && solid_runs.is_empty() && n_add + n_alpha == 0 && !has_water;
         // --- Opaque pass (indirect on the GPU path); keeps colour + depth for the blend pass ---
         {
             // without MSAA: the scene is drawn straight into the HDR target (into scene_color while
@@ -4188,6 +4279,21 @@ impl Renderer {
                 self.grass.draw(&pass, &self.bind0, &mg, grass_blades);
                 stats.draw_calls += 1;
             }
+            if let (Some(m), Some(mg)) = (warm_mesh, warm_mg.as_ref()) {
+                pass.set_bind_group(0, Some(&self.bind0));
+                for i in 0..4 {
+                    if !self.pipeline_broken[i].get() {
+                        self.warm_draw(&pass, &self.pipelines[i], mg, m);
+                    }
+                }
+                if gpu && self.settings.depth_prepass {
+                    for i in 2..4 {
+                        if !self.prepass_broken[i].get() {
+                            self.warm_draw(&pass, &self.prepass_pipelines[i], mg, m);
+                        }
+                    }
+                }
+            }
             if self.settings.sky {
                 // last: only pixels no geometry covered pass the depth test (less-equal at z = 1)
                 pass.set_pipeline(&self.post.sky_pipeline);
@@ -4200,7 +4306,7 @@ impl Renderer {
         // --- Solid fade: scene depth + the faded entities' nearest surfaces into a second depth
         // buffer (depth only, no colour traffic); the blend pass tests against it (equal = nearest)
         let mut fade_depth_view = None;
-        if !solid_runs.is_empty() {
+        if !solid_runs.is_empty() || warm_solid {
             let size = self.size;
             if self.fade_depth.as_ref().map(|f| f.0) != Some(size) {
                 let d = GpuTextureDescriptor::new(DEPTH_FORMAT, &nums(&[size.0.max(1), size.1.max(1)]), gpu_texture_usage::RENDER_ATTACHMENT);
@@ -4236,6 +4342,11 @@ impl Renderer {
                 pass.set_index_buffer(&mesh.ib, GpuIndexFormat::Uint32);
                 pass.draw_indexed_with_instance_count_and_first_index_and_base_vertex_and_first_instance(mesh.index_count, count, 0, 0, first);
                 stats.draw_calls += 1;
+            }
+            if let (true, Some(m), Some(mg)) = (warm_solid, warm_mesh, warm_mg.as_ref()) {
+                for i in 0..2 {
+                    self.warm_draw(&pass, &self.fade_pipelines[i], mg, m);
+                }
             }
             pass.end();
             fade_depth_view = Some(fd);
@@ -4312,6 +4423,18 @@ impl Renderer {
                 let tris = (mesh.index_count / 3) as u64 * count as u64;
                 stats.triangles += tris;
                 stats.candidate_triangles += tris;
+            }
+            if let (Some(m), Some(mg)) = (warm_mesh, warm_mg.as_ref()) {
+                if fade_depth_view.is_some() {
+                    for i in 2..4 {
+                        self.warm_draw(&pass, &self.fade_pipelines[i], mg, m);
+                    }
+                }
+                for i in 4..6 {
+                    if !self.pipeline_broken[i].get() {
+                        self.warm_draw(&pass, &self.pipelines[i], mg, m);
+                    }
+                }
             }
             // particles: additive first (order-independent), then alpha-blended far -> near
             if n_add + n_alpha > 0 {

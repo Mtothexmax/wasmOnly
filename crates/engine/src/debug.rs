@@ -67,6 +67,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("resume", "Resume simulation."),
     ("step", "Run N fixed steps immediately (works while paused). args: {n?: 1}"),
     ("time_scale", "Set simulation speed. args: {value}"),
+    ("prewarm", "Draw every lazily reached pipeline variant once on the next frame (mask, blend, solid fade, depth-equal; second shadow set with a moving sun)"),
     ("time", "Simulation clock: fixed_dt, frame_dt (sim) / frame_dt_raw (rAF), refresh_hz, frame_interval, steps_per_frame. args: {lock_fixed_to_frames?, nominal_fixed_dt?, fixed_dt?}"),
     ("seed", "Reseed the engine RNG (ctx.rng). args: {value}"),
     ("input", "Inject input. args: {key?: 'KeyW', down?: bool} | {button?: 0|1|2, down?} | {x?, y?: pointer position, CSS px} | {dx?, dy?} | {action?: 'ui-action'} | {touch: {id, x, y, phase: 'start'|'move'|'end'}} | {release_all: true} | {stick: bool} (virtual joystick on/off). Returns keys, buttons and touch gestures"),
@@ -692,6 +693,10 @@ pub(crate) fn handle<G: Game>(
                 ctx.time.fixed_dt = (v as f32).max(1e-4);
             }
             Ok(serde_json::to_value(&ctx.time).map_err(|e| e.to_string())?)
+        }
+        "prewarm" => {
+            ctx.renderer.prewarm();
+            Ok(json!({"prewarm": "next frame"}))
         }
         "time_scale" => {
             ctx.time.time_scale = a

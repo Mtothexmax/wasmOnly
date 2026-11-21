@@ -194,7 +194,14 @@ normal `cargo` output above it.
   second depth buffer and adds the faded entities' depth; the blend pass tests against it (equal = nearest). Main
   view only; blended materials, alpha-tested ones, water and render textures keep the classic path; blended things
   behind a faded entity (particles, water) are hidden by it. Hi-Z and post keep the real scene depth; shadows cast
-  as before. `stats.render.solid_fade_draws`. Test: `games/demo/tests/solidfade.txt`. Entity commands
+  as before. `stats.render.solid_fade_draws`. Test: `games/demo/tests/solidfade.txt`.
+- **First-use hitches / prewarm:** all pipelines are created at startup, but mobile drivers (PowerVR) compile a
+  variant on its first draw (tens of ms). On the first frame with a mesh (and again when `solid_fade` or `day_cycle`
+  is switched on) the renderer draws one triangle per lazily reached variant (alpha mask, blend, solid fade incl. the
+  depth copy and its depth target, depth-equal) into a 1x1 scissor, and with a moving sun allocates the second
+  shadow-map set. `ctx.renderer.prewarm()` / API `prewarm` repeats it (e.g. at the end of a loading screen).
+  The first real use of solid fade, blend draws and the second shadow set logs `first use: <what> (frame took X ms,
+  typical Y ms; prewarmed|not prewarmed)`, so a hitch in a phone log can be pinned. Entity commands
   accept `{name}` instead of `{id}`.
   Lens flare: `render {lens_flare: 0..}` (0 = off); test `games/demo/tests/flare.txt` (visible / hidden behind the tower).
 - **Water:** `Material::water` + `ctx.spawn_water(name, mat, size, t)` / `ctx.spawn_ocean(mat, y)`; tune `wave_height`,
