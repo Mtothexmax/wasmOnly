@@ -916,6 +916,9 @@ pub struct FrameStats {
     pub shadow_hash: f64,
     pub shadow_steps: u32,
     pub shadow_fade: f32,
+    /// Cascades of the current set not yet re-rendered after a sun step (they still hold an
+    /// older direction): their pixels use the previous set. Bit k = cascade k.
+    pub shadow_stale: u32,
     pub draw_calls: u32,
     pub shadow_draw_calls: u32,
     /// Shadow passes rendered this frame (the others reused their cached map).
@@ -3567,6 +3570,9 @@ impl Renderer {
         // static shadow cache: split passes draw the static copy + dynamic casters; need_static =
         // the static copy is re-rendered first (matrix changed or a static caster changed)
         let mut need_static = vec![true; shadow_passes.len()];
+        // current-set cascades still holding the content (and matrix) of an older direction after a
+        // sun step: the shader takes the previous set for them (`cascade_scale[k].w`)
+        let mut stale = [false; MAX_CASCADES];
         for (p, &(slot, layer)) in shadow_passes.iter().enumerate() {
             let k = slot % MAX_CASCADES;
             let mut content: u64 = 0xcbf2_9ce4_8422_2325;
@@ -3602,6 +3608,9 @@ impl Renderer {
             // k > 0 keep their old content (and matrix) for k more frames, so the step re-renders one
             // cascade per frame instead of all of them in one frame
             let staggered = cache_on && fading.is_some() && p < n_casc && k > 0 && c.valid && self.shadow_frame < self.shadow_step_frame + k as u64;
+            if staggered {
+                stale[k] = true;
+            }
             let reuse = staggered || cache_on && c.valid && c.dir == dir && {
                 let same = c.mat == mat;
                 let covers = (k > 0 || split_on) && (center - c.center).length() + need <= c.radius;
@@ -3665,6 +3674,8 @@ impl Renderer {
                     sc[i] = rk.dot(r0) / r0.length_squared().max(1e-20);
                     off[i] = mk.w_axis[i] - sc[i] * m0.w_axis[i];
                 }
+                // w = 1: this cascade of the current set is stale (see `stale`); xyz = scale
+                sc[3] = stale[k] as u32 as f32;
                 globals.cascade_scale[k] = sc;
                 globals.cascade_offset[k] = off;
             }
@@ -3849,6 +3860,7 @@ impl Renderer {
             instance_upload_bytes: upload_bytes,
             instance_slots: n_records,
             shadow_fade: prev_weight,
+            shadow_stale: stale.iter().enumerate().map(|(k, &b)| (b as u32) << k).sum(),
             ..Default::default()
         };
         let groups: Vec<GpuBindGroup> = key_list.iter().map(|k| self.material_group(*k)).collect();

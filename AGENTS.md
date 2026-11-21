@@ -209,7 +209,11 @@ normal `cargo` output above it.
   (default 400; a second shadow-map set is allocated on first use), so the texel grid does not re-snap every frame
   (shimmering edges). `shadow_step_deg: 0` = follow every frame.
   Proof per frame: `stats.render.shadow_hash` (cascade matrices) stays constant between `shadow_steps`;
-  `shadow_fade` > 0 while cross-fading.
+  `shadow_fade` > 0 while cross-fading. With the shadow cache a step re-renders the new set's cascades k > 0 one per
+  frame (cascade k after k frames); until then they hold an older direction, are flagged in
+  `stats.render.shadow_stale` (bit k) and their pixels take the previous set (before that fix they read the wrong
+  depth and the cross-fade's new-set pixels came out lit: shadows ~10% lighter and grainy for 1-3 frames after every
+  step). Test: `games/demo/tests/sunstep.txt`.
 - **Opacity:** `MeshRenderer.opacity` (0..1) fades one entity without material copies; it moves to the blend pass
   and keeps its full shadow (0 = invisible, still casts). `set {id|name, opacity}` (applies to children, e.g. glTF).
   An opacity-only change (a fade, the solid-fade switch) leaves the shadow caches alone (`stats.render.shadow_static_rendered`

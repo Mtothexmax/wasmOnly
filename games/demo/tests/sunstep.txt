@@ -1,0 +1,21 @@
+# Sun step with the shadow cache: right after a step the current set's cascades k > 0 are re-rendered
+# one per frame; until then they are marked stale (stats.render.shadow_stale, bit k) and the shader takes
+# the previous set for their pixels (no lighter, grainy shadow for 1-3 frames).
+# Pixel check (shadow term stays flat during the cross-fade) was done with an 8-degree step at 0.5 fps.
+#   node tools/bridge.mjs run games/demo/tests/sunstep.txt
+reload
+screen play
+wait 1000
+pause
+call render {"shadow_step_deg": 8, "shadow_fade_ms": 5000, "shadow_cascades": 4}
+call sky {"time": 14.0, "day_length": 0}
+frames 10
+call sky {"time": 14.6}
+frames 10
+call sky {"time": 15.2}
+frames 1
+expect stats.render.shadow_fade > 0.5
+expect stats.render.shadow_stale > 0
+frames 5
+expect stats.render.shadow_stale == 0
+expect logs{"level": "error"}.entries.length == 0

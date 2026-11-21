@@ -253,7 +253,10 @@ fn shadow_factor(world: vec3f, n: vec3f, frag: vec2f) -> f32 {
     let end = g.cascade_splits[k];
     let band = mix(start, end, 0.85);
     let t = clamp((vz - band) / max(end - band, 1e-3), 0.0, 1.0);
-    let prev = fract(52.9829189 * fract(dot(floor(frag), vec2f(0.06711056, 0.00583715)))) < g.shadow_sets.z;
+    // right after a sun step the current set's cascades k > 0 are re-rendered one per frame; until
+    // then they hold an older direction (cascade_scale[k].w = 1): those pixels take the previous set
+    let stale = g.shadow_sets.z > 0.0 && (g.cascade_scale[k].w > 0.5 || (t > 0.0 && k + 1u < count && g.cascade_scale[k + 1u].w > 0.5));
+    let prev = stale || fract(52.9829189 * fract(dot(floor(frag), vec2f(0.06711056, 0.00583715)))) < g.shadow_sets.z;
     let layer_base = i32(select(g.shadow_sets.x, g.shadow_sets.y, prev));
 
     let size = vec2f(textureDimensions(shadow_map));
