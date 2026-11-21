@@ -148,6 +148,8 @@ pub(crate) struct Post {
     /// Lens flare for the next composite: (sun uv x, y, strength, disk radius in uv height) and
     /// (sun colour rgb, expected disk luminance). Set by the renderer per view; strength 0 = off.
     pub flare: ([f32; 4], [f32; 4]),
+    /// Target pixels per device pixel for the grain cell size (`render_scale` on the canvas, 1 for render textures).
+    pub grain_px: f32,
     pub particle_additive: GpuRenderPipeline,
     pub particle_alpha: GpuRenderPipeline,
     pub bgl_particles: GpuBindGroupLayout,
@@ -339,6 +341,7 @@ impl Post {
             exposure_mul: 1.0,
             grain_frame: 0,
             flare: ([0.0; 4], [0.0; 4]),
+            grain_px: 1.0,
             particle_additive,
             particle_alpha,
             bgl_particles,
@@ -484,7 +487,7 @@ impl Post {
                         [gr.temperature, gr.tint, gr.contrast, gr.pivot],
                         [lr, lg, lb, gr.split_balance],
                         [gmr.max(0.01), gmg.max(0.01), gmb.max(0.01), if s.debug_view == 0 { s.grain.max(0.0) } else { 0.0 }],
-                        [gnr, gng, gnb, s.grain_size.max(0.5)],
+                        [gnr, gng, gnb, s.grain_size.max(0.5) * self.grain_px],
                         [sr, sg, sb, s.vignette_radius.max(0.0)],
                         [hr, hg, hb, s.vignette_softness.max(0.001)],
                         [vr, vg, vb, s.vignette_roundness.clamp(0.0, 1.0)],

@@ -708,7 +708,8 @@ pub struct RenderSettings {
     pub grade: crate::post::Grade,
     /// Film grain (0 = off, ~0.3 subtle): animated per frame, stronger in the darks.
     pub grain: f32,
-    /// Grain size in screen pixels.
+    /// Grain cell size in device pixels (canvas at full resolution): at `render_scale` 0.5 a size of 2 is one
+    /// rendered pixel; below that a cell cannot be finer than one rendered pixel.
     pub grain_size: f32,
     /// Draw particle systems.
     pub particles: bool,
@@ -4414,6 +4415,7 @@ impl Renderer {
         if main && !self.settings.freeze_time {
             self.post.grain_frame = self.post.grain_frame.wrapping_add(1);
         }
+        self.post.grain_px = if main { self.settings.render_scale.clamp(0.25, 1.0) } else { 1.0 };
         self.post.flare = if main { self.lens_flare(view_proj, cam_pos) } else { ([0.0; 4], [0.0; 4]) };
         {
             let ts = self.timing.as_mut().filter(|_| main).and_then(|t| t.split_writes(crate::gpu_timing::POST));

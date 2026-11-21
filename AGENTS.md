@@ -170,8 +170,9 @@ normal `cargo` output above it.
   warm, cool, fade, vivid, noir, night, golden) resets to that look first. Game code: `engine::Grade` (also in the prelude):
   `settings.grade = Grade::preset("night").unwrap()`, tweak fields, `Grade::lerp(&day, &night, sky.night)` per frame. Masking vignette: `vignette_radius` > 0 (fraction of the half
   height) + `vignette_softness`, `vignette_color`, `vignette_roundness` (1 = circle on any aspect); radius 0 = the classic
-  darkening. Film grain: `grain` (~0.3 subtle), `grain_size` px, animated per frame, stronger in the darks (frozen
-  with `freeze_time`). No 3D LUT yet. Test: `games/demo/tests/grade.txt`.
+  darkening. Film grain: `grain` (~0.3 subtle), `grain_size` in device pixels (at `render_scale` 0.5 a size of 2 = one
+  rendered pixel; never finer than one), independent per frame (pcg3d hash of cell + frame, no drifting pattern),
+  triangular distribution (sum of two uniforms), stronger in the darks (frozen with `freeze_time`). No 3D LUT yet. Test: `games/demo/tests/grade.txt`.
 - **Visual checks:** `render '{"debug_view":1}'` = normals, `2` = shadow term, `0` = lit.
 - **3D UI:** `call panels` gives every world-panel widget with its on-screen centre (`screen`, CSS px);
   click it for real with `input {x,y}` + `input {button:0}`, or directly with `panel_click {id, widget}`.

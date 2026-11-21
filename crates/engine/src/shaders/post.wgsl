@@ -42,10 +42,22 @@ fn grade(c0: vec3f) -> vec3f {
     return c;
 }
 
-fn grain_hash(q: vec2f) -> f32 {
-    var h = fract(vec3f(q.xyx) * vec3f(0.1031, 0.1030, 0.0973));
-    h += dot(h, h.yzx + 33.33);
-    return fract((h.x + h.y) * h.z);
+// pcg3d (Jarzynski & Olano 2020): every (cell, frame) gets independent bits, no drifting pattern
+fn pcg3d(q: vec3u) -> vec3u {
+    var v = q * 1664525u + 1013904223u;
+    v.x += v.y * v.z; v.y += v.z * v.x; v.z += v.x * v.y;
+    v ^= v >> vec3u(16u);
+    v.x += v.y * v.z; v.y += v.z * v.x; v.z += v.x * v.y;
+    return v;
+}
+
+// film grain sample for a cell and frame: sum of two uniforms (triangular, -1..1), scaled to the RMS
+// of the old uniform -0.5..0.5 grain so existing `grain` values keep their strength
+fn grain_noise(cell: vec2f, frame: f32) -> f32 {
+    let c = vec2i(cell);
+    let h = pcg3d(vec3u(bitcast<u32>(c.x), bitcast<u32>(c.y), u32(frame)));
+    let u = vec2f(h.xy >> vec2u(8u)) * (1.0 / 16777216.0);
+    return (u.x + u.y - 1.0) * 0.70710678;
 }
 
 @group(0) @binding(0) var src: texture_2d<f32>;
@@ -361,7 +373,7 @@ fn fs_composite(i: CompOut) -> @location(0) vec4f {
     // film grain: per frame, per grain cell, stronger in the darks
     if (p.g[2].w > 0.0) {
         let cell = floor(i.pos.xy / p.g[3].w);
-        let n = grain_hash(cell + vec2f(p.g[7].x * 17.0, p.g[7].x * 31.0)) - 0.5;
+        let n = grain_noise(cell, p.g[7].x);
         let lw = mix(1.0, 0.35, luma(mapped));
         mapped = clamp(mapped + n * p.g[2].w * 0.25 * lw, vec3f(0.0), vec3f(1.0));
     }
