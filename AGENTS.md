@@ -182,7 +182,12 @@ normal `cargo` output above it.
   Game code: `audio.is_ready(id)` / `sound_state(id)` (a sound from `ctx.load_sound` is `Loading` first; `play` before
   that returns `None` and warns once per sound), `is_playing(voice)`, `playing_count(id)`, `set_voice_volume(voice, v, fade_s)` (linear ramp on a playing voice, e.g. a looped rain that
   swells), `voice_volume(voice)`, `fade_out(voice, fade_s)` (ramp to 0, then stop); API `audio_voice {voice, volume, fade}`,
-  `audio_stop {voice, fade}`. Mixer buses `Bus::{Sfx,
+  `audio_stop {voice, fade}`. Lip sync: `voice_level(voice)` = loudness at the voice's current position, 0..1 (RMS
+  envelope, 40 ms window, made once per sound on decode, divided by the sound's loudest point; not scaled by volume),
+  `voice_time(voice)` = seconds into the sound (pitch/detune included, wraps when looped); both `None` once it ended.
+  `sound_envelope(id)` = raw 100 Hz RMS (`ENVELOPE_RATE`) + peak. `call audio` shows `time`/`level` per voice and
+  `envelope_peak` per sound. They follow the AudioContext clock (real playback), not `pause`/`step`. Test:
+  `games/demo/tests/lipsync.txt`. Mixer buses `Bus::{Sfx,
   Voice, Ambience, Ui}`: `Play::new().bus(Bus::Voice)`, `set_bus_volume(Bus::Voice, v)`; API `audio_set {voice_volume}`,
   `audio_play {bus}`.
 - **Procedural assets:** `call texgen {preset, apply_to}` and `call sfx {preset, overrides}` iterate on

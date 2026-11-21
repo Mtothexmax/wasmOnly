@@ -1,0 +1,22 @@
+# Voice playback level (lip sync): envelope per sound, voice_time / voice_level of playing voices.
+#   node tools/bridge.mjs run games/demo/tests/lipsync.txt   (debug Chrome is muted; the context still runs)
+
+reload
+screen play
+frames 10
+expect audio.sounds.4.envelope_peak > 0
+call audio_play {"sound": "chime"}
+wait 40
+expect audio.voices.-1.sound == "chime"
+expect audio.voices.-1.level > 0.3
+expect audio.voices.-1.time < 0.4
+wait 550
+expect audio.voices.-1.time > 0.4
+expect audio.voices.-1.level < 0.5
+wait 500
+expect audio.voices.-1.sound != "chime"
+# pitch 2 plays the sound twice as fast
+call audio_play {"sound": "wind", "pitch": 2}
+wait 300
+expect audio.voices.-1.time > 0.45
+expect audio.voices.-1.level >= 0

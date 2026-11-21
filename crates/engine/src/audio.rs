@@ -46,6 +46,41 @@ struct Sound {
     plays: u32,
     /// "not ready" was already logged for this sound (logged once, not per play).
     warned: bool,
+    /// RMS loudness at [`ENVELOPE_RATE`] (40 ms window around each point, all channels), made
+    /// once when the sound is registered: lip sync / meters without an AnalyserNode.
+    envelope: Vec<f32>,
+    envelope_peak: f32,
+}
+
+/// Points per second of [`Audio::sound_envelope`].
+pub const ENVELOPE_RATE: f32 = 100.0;
+
+/// 100 Hz RMS envelope of a buffer (40 ms windows) and its peak.
+fn envelope(b: &AudioBuffer) -> (Vec<f32>, f32) {
+    let rate = b.sample_rate();
+    let len = b.length() as usize;
+    let chans: Vec<Vec<f32>> = (0..b.number_of_channels()).filter_map(|c| b.get_channel_data(c).ok()).collect();
+    if chans.is_empty() || len == 0 {
+        return (vec![], 0.0);
+    }
+    // squared sum per 10 ms block (mean over channels), then a 4-block (40 ms) window
+    let block = ((rate / ENVELOPE_RATE) as usize).max(1);
+    let nb = len.div_ceil(block);
+    let mut sq = vec![0.0f64; nb];
+    for ch in &chans {
+        for (i, s) in ch.iter().enumerate() {
+            sq[i / block] += (*s as f64) * (*s as f64);
+        }
+    }
+    let n = chans.len() as f64 * block as f64;
+    let env: Vec<f32> = (0..nb)
+        .map(|i| {
+            let (a, z) = (i.saturating_sub(2), (i + 2).min(nb));
+            ((sq[a..z].iter().sum::<f64>() / (n * (z - a) as f64)).sqrt()) as f32
+        })
+        .collect();
+    let peak = env.iter().fold(0.0f32, |m, v| m.max(*v));
+    (env, peak)
 }
 
 /// Mixer bus a voice plays on; each has its own volume (`set_bus_volume`) and goes to the master.
@@ -235,6 +270,10 @@ struct Voice {
     ended_at: Option<f64>,
     fx: Fx,
     bus: Bus,
+    /// Context time at start, playback rate (pitch x detune), loop: for `voice_time`.
+    started: f64,
+    rate: f64,
+    looped: bool,
     _on_end: Closure<dyn FnMut()>,
 }
 
@@ -529,10 +568,13 @@ impl Audio {
     }
 
     fn register(&mut self, name: &str, state: SoundState, buffer: Option<AudioBuffer>) -> SoundId {
+        let (env, peak) = buffer.as_ref().map(envelope).unwrap_or_default();
         if let Some(id) = self.find(name) {
             let s = &mut self.sounds[id.0 as usize];
             s.state = state;
             s.buffer = buffer;
+            s.envelope = env;
+            s.envelope_peak = peak;
             return id;
         }
         self.sounds.push(Sound {
@@ -541,6 +583,8 @@ impl Audio {
             state,
             plays: 0,
             warned: false,
+            envelope: env,
+            envelope_peak: peak,
         });
         let id = SoundId(self.sounds.len() as u32 - 1);
         self.by_name.insert(name.into(), id);
@@ -729,6 +773,7 @@ impl Audio {
         let flag = ended.clone();
         let on_end = Closure::<dyn FnMut()>::new(move || flag.set(true));
         web_sys::AudioScheduledSourceNode::set_onended(&src, Some(on_end.as_ref().unchecked_ref()));
+        let started = ctx.current_time();
         web_sys::AudioScheduledSourceNode::start(&src).ok()?;
         sound.plays += 1;
         let name = sound.name.clone();
@@ -761,6 +806,9 @@ impl Audio {
             ended_at: None,
             fx,
             bus: p.bus,
+            started,
+            rate: p.pitch.max(0.01) as f64 * 2f64.powf(fx.detune as f64 / 1200.0),
+            looped: p.looped,
             _on_end: on_end,
         });
         Some(vid)
@@ -802,6 +850,38 @@ impl Audio {
         }
         voice.volume = target;
         true
+    }
+
+    /// Seconds into the sound of a playing voice (playback rate included, wraps when looped);
+    /// `None` when it is gone or has played to its end.
+    pub fn voice_time(&self, v: VoiceId) -> Option<f64> {
+        let x = self.voices.iter().find(|x| x.id == v && !x.ended.get())?;
+        let dur = self.sounds.get(x.sound.0 as usize)?.buffer.as_ref()?.duration();
+        let now = self.ctx.as_ref()?.current_time();
+        let t = (now - x.started).max(0.0) * x.rate;
+        if x.looped {
+            Some(if dur > 0.0 { t % dur } else { 0.0 })
+        } else {
+            (t < dur).then_some(t)
+        }
+    }
+
+    /// Loudness of a playing voice at its current position, 0..1: the sound's RMS envelope
+    /// (40 ms window) divided by its loudest point, so 1 = the loudest moment of that sound (mouth
+    /// fully open). Not scaled by the voice volume. `None` when the voice is gone or finished.
+    pub fn voice_level(&self, v: VoiceId) -> Option<f32> {
+        let t = self.voice_time(v)?;
+        let x = self.voices.iter().find(|x| x.id == v)?;
+        let s = self.sounds.get(x.sound.0 as usize)?;
+        let i = ((t * ENVELOPE_RATE as f64) as usize).min(s.envelope.len().saturating_sub(1));
+        let e = s.envelope.get(i).copied().unwrap_or(0.0);
+        Some(if s.envelope_peak > 0.0 { (e / s.envelope_peak).min(1.0) } else { 0.0 })
+    }
+
+    /// RMS envelope of a sound at [`ENVELOPE_RATE`] points per second (raw RMS, not normalised)
+    /// and its peak; empty while loading.
+    pub fn sound_envelope(&self, id: SoundId) -> (&[f32], f32) {
+        self.sounds.get(id.0 as usize).map(|s| (&s.envelope[..], s.envelope_peak)).unwrap_or((&[], 0.0))
     }
 
     /// Current (target) volume of a playing voice.
@@ -896,12 +976,15 @@ impl Audio {
             "sounds": self.sounds.iter().enumerate().map(|(i, s)| serde_json::json!({
                 "id": i, "name": s.name, "state": s.state, "plays": s.plays,
                 "duration": s.buffer.as_ref().map(|b| (b.duration() * 1000.0).round() / 1000.0),
+                "envelope_peak": s.envelope_peak,
             })).collect::<Vec<_>>(),
             "voices": self.voices.iter().map(|v| serde_json::json!({
                 "id": v.id.0, "sound": self.sounds.get(v.sound.0 as usize).map(|s| s.name.clone()),
                 "pos": v.pos.map(|p| [p.x, p.y, p.z]),
                 "distance": v.pos.map(|p| p.distance(self.listener)),
                 "fx": v.fx, "ended": v.ended.get(), "bus": v.bus, "volume": v.volume,
+                "time": self.voice_time(v.id).map(|t| (t * 1000.0).round() / 1000.0),
+                "level": self.voice_level(v.id).map(|l| (l * 1000.0).round() / 1000.0),
             })).collect::<Vec<_>>(),
             "presets": synth::SfxPreset::ALL.iter().map(|p| p.name()).collect::<Vec<_>>(),
             "plays_total": self.plays_total,
