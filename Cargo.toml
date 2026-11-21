@@ -13,6 +13,9 @@ license = "MIT OR Apache-2.0"
 # (engine feature `threads`, needs build-std + atomics) uses this pinned nightly. See tools/dev.mjs.
 [workspace.metadata.wasmonly]
 threads-toolchain = "nightly-2026-11-01"
+# binaryen's wasm-opt for --release builds, built from source by the `wasm-opt` crate (C++ compiler + CMake):
+# node tools/dev.mjs build --release --install-wasm-opt  (= cargo install wasm-opt --version <this> --locked)
+wasm-opt = "0.133.0"
 
 [workspace.dependencies]
 # wasm-bindgen MUST match the installed wasm-bindgen CLI exactly (see tools/build.mjs).
