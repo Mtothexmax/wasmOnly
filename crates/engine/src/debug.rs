@@ -61,7 +61,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("entities", "List entities. args: {name?: substring, limit?: 200, with?: 'mesh'|'body'|'light'|'label'|'camera'}"),
     ("entity", "Full detail of one entity. args: {id}"),
     ("set", "Modify an entity. args: {id, pos?: [x,y,z], rot?: [deg x,y,z], scale?: [x,y,z], vel?: [x,y,z], color?: '#rrggbb', opacity?: 0..1 (this entity and its children; keeps its shadow), layer?: 0..31 (MeshRenderer::layer, children too)}"),
-    ("impostors", "Baked impostors (glTF GltfOpts::impostor): url, views, atlas size, card size, radius, texture ids; cards: instances, showing = drawn as the card now (main camera, CPU estimate). args: {}"),
+    ("impostors", "Baked impostors (glTF GltfOpts::impostor): url, views, atlas size, card size, radius (model space; the switch scales with each instance's scale), texture ids; cards: instances, showing = drawn as the card now (main camera, CPU estimate). args: {}"),
     ("spawn", "Spawn a primitive or a glTF model. args: {shape: 'cube'|'sphere', pos, size?: 1, color?: '#rrggbb', body?: 'dynamic'|'fixed'|'kinematic'|'none', name?, parent?: id|name (pos is then local), no_zcheck?: true} or {gltf: 'assets/x.glb', pos, size?: scale, auto_lod?: bool, lod_distance?, impostor?: bool, impostor_distance?: 60 (x radius), impostor_views?: 8, impostor_res?: 128} or {camera: true, pos?, look_at?, fov?, name?, main?: bool} or {water: [x, z], pos, spacing?: 0.25, name?} (bounded water surface) or {ocean: y, radius?: 5000, segments?: 256, spacing?} (camera-following sea, returns triangles)"),
     ("despawn", "Remove entity and children. args: {id}"),
     ("pause", "Pause simulation (rendering continues)."),

@@ -156,7 +156,8 @@ normal `cargo` output above it.
   Limits: hard switch (no cross-fade), view snaps between azimuths, cylindrical (seen from high above the card is
   foreshortened). `Renderer::bake_impostor(name, &[(mesh, material, matrix)], views, res)` bakes anything.
   API `spawn {gltf, impostor: true, impostor_distance, impostor_views, impostor_res, lod_distance}`, `impostors`
-  (baked atlases, `cards`, `showing`). *HLOD* (`ctx.batch_static_with(root, cell, Some(Hlod { distance: 150.0,
+  (baked atlases, `cards`, `showing`; `radius` is in model space: like every `Lod` distance the switch is
+  divided by the instance's scale, so a model scaled x3 switches 3x farther). *HLOD* (`ctx.batch_static_with(root, cell, Some(Hlod { distance: 150.0,
   cluster: 0.75 }))`): besides the per-material batches every cell gets one mesh of all of them, vertex-clustered
   at `cluster` m with the material base colours baked into vertex colours, one material; beyond `distance` m the
   cell is that mesh (batches and HLOD share the cell's foot centre as origin, so they switch together). Textures
