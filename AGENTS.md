@@ -155,8 +155,8 @@ normal `cargo` output above it.
   temperature, tint, lift:[r,g,b], gamma, gain, contrast, pivot, split_shadows:'#rrggbb', split_highlights,
   split_balance, saturation}}` in display space after tonemapping (white balance -> lift/gamma/gain -> contrast ->
   split toning -> saturation). Fields merge over the current grade; `preset` (`render` lists `grade_presets`: neutral,
-  warm, cool, fade, vivid, noir, night, golden) resets to that look first. Game code: `settings.grade =
-  Grade::preset("night").unwrap()` and tweak fields. Masking vignette: `vignette_radius` > 0 (fraction of the half
+  warm, cool, fade, vivid, noir, night, golden) resets to that look first. Game code: `engine::Grade` (also in the prelude):
+  `settings.grade = Grade::preset("night").unwrap()`, tweak fields, `Grade::lerp(&day, &night, sky.night)` per frame. Masking vignette: `vignette_radius` > 0 (fraction of the half
   height) + `vignette_softness`, `vignette_color`, `vignette_roundness` (1 = circle on any aspect); radius 0 = the classic
   darkening. Film grain: `grain` (~0.3 subtle), `grain_size` px, animated per frame, stronger in the darks (frozen
   with `freeze_time`). No 3D LUT yet. Test: `games/demo/tests/grade.txt`.

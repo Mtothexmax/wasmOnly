@@ -80,6 +80,26 @@ impl Default for Grade {
 impl Grade {
     pub const PRESETS: [&'static str; 8] = ["neutral", "warm", "cool", "fade", "vivid", "noir", "night", "golden"];
 
+    /// Blend of two grades (`k` 0 = `a`, 1 = `b`), e.g. day -> night per frame by `sky.night`.
+    pub fn lerp(a: &Grade, b: &Grade, k: f32) -> Grade {
+        let k = k.clamp(0.0, 1.0);
+        let f = |x: f32, y: f32| x + (y - x) * k;
+        let v = |x: [f32; 3], y: [f32; 3]| [f(x[0], y[0]), f(x[1], y[1]), f(x[2], y[2])];
+        Grade {
+            temperature: f(a.temperature, b.temperature),
+            tint: f(a.tint, b.tint),
+            lift: v(a.lift, b.lift),
+            gamma: v(a.gamma, b.gamma),
+            gain: v(a.gain, b.gain),
+            contrast: f(a.contrast, b.contrast),
+            pivot: f(a.pivot, b.pivot),
+            split_shadows: v(a.split_shadows, b.split_shadows),
+            split_highlights: v(a.split_highlights, b.split_highlights),
+            split_balance: f(a.split_balance, b.split_balance),
+            saturation: f(a.saturation, b.saturation),
+        }
+    }
+
     /// A named look (see [`Grade::PRESETS`]).
     pub fn preset(name: &str) -> Option<Self> {
         let n = Self::default();
