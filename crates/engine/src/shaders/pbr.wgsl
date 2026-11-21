@@ -113,6 +113,12 @@ fn vs_main(v: VsIn) -> VsOut {
         world = vec4f(world.xyz + bend_offset(base, max(world.y - base.y, 0.0), inst.maps.w), 1.0);
     }
     var uv = v.uv;
+    if (inst.normal[2].w > 0.5) { // impostor card: faces the camera
+        let iv = impostor_vertex(inst.model, v.pos, v.uv, inst.normal[2].w, g.camera_pos.xyz - inst.model[3].xyz);
+        world = iv.world;
+        normal = iv.normal;
+        uv = iv.uv;
+    }
     if (inst.params.z > 2.5) { // water: Gerstner waves in world space; uv = undisplaced world xz
         uv = world.xz;
         let spacing = max(inst.maps.x, length(world.xyz - g.camera_pos.xyz) * 0.025);

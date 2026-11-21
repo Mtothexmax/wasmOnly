@@ -46,7 +46,10 @@ Chrome** (shared Chrome tabs steal focus and frames from each other):
 --url http://localhost:8091/` on every bridge command (or `CDP_PORT=9223 GAME_URL=http://localhost:8091/`).
 
 Detailed small models (figures, faces) seen from far cameras: `ctx.load_gltf_with(url, t, GltfOpts {
-auto_lod: false, ..Default::default() })`, `ctx.gltf_defaults.auto_lod = false`, or `render.lod_bias`.
+auto_lod: false, ..Default::default() })`, `ctx.gltf_defaults.auto_lod = false`, or
+`render.lod_distance_scale` (bigger = more detail; formerly `lod_bias`). Far forests: `GltfOpts { impostor: true, .. }`
+(one camera-facing card per model beyond ~60x its radius); far static towns: `ctx.batch_static_with(root, cell,
+Some(Hlod { distance, cluster }))`; a far clip that fades into the fog: `render.view_distance`.
 
 ## 3. Working rules (they prevented real bugs)
 

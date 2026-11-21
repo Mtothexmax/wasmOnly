@@ -28,6 +28,7 @@ struct Params {
     static_mask: u32,  // bit q: a split pass needs its static list this frame
     pass_lv: array<mat4x4f, 8>, // light view per shadow pass
     pass_box: array<vec4f, 8>,  // x = half size, y = depth range
+    view: vec4f,                // x = view distance (0 = off)
 }
 
 struct Object {
@@ -157,6 +158,7 @@ fn cull(@builtin(global_invocation_id) id: vec3u) {
                         break;
                     }
                 }
+                if (keep && p.view.x > 0.0 && length(c - p.cam.xyz) - r > p.view.x) { keep = false; }
                 if (!keep) { atomicAdd(&counters[0], 1u); }
             }
             if (keep && (p.flags & 2u) != 0u && occluded(c, r)) {

@@ -222,7 +222,7 @@ fn classify(model: &Mat4, mr: &MeshRenderer, mat: &Material, shadows_on: bool) -
     };
     normal[0][3] = cc;
     normal[1][3] = mat.clearcoat_roughness.clamp(0.02, 1.0);
-    normal[2][3] = 0.0;
+    normal[2][3] = mat.impostor_views as f32; // impostor card: views in the atlas
     let raw = InstanceRaw {
         model: model.to_cols_array_2d(),
         normal,
@@ -379,6 +379,10 @@ pub struct Material {
     pub clearcoat: f32,
     /// Roughness of the coat (default 0.06).
     pub clearcoat_roughness: f32,
+    /// Impostor card (set by [`Renderer::bake_impostor`]): number of baked azimuths in the atlas
+    /// (0 = normal mesh). The vertex shader turns the card around the model's up axis toward the
+    /// camera (shadows: toward the sun) and picks the nearest view's atlas cell.
+    pub impostor_views: u32,
 }
 
 /// Transparency of a material (glTF semantics).
@@ -430,6 +434,7 @@ impl Default for Material {
             subsurface_color: None,
             clearcoat: 0.0,
             clearcoat_roughness: 0.06,
+            impostor_views: 0,
         }
     }
 }
@@ -734,9 +739,17 @@ pub struct RenderSettings {
     /// Test switch: extra GPU work per frame in ms (a compute pass, calibrated with timestamps when the
     /// device has them; page URL `?gpu_slow=N`). 0 = off.
     pub gpu_slow_ms: f32,
-    /// Multiplies every LOD switch distance (2 = keep detail twice as far; top-down cameras far
-    /// from small models want > 1). Also lowers itself never: set it per game.
-    pub lod_bias: f32,
+    /// Multiplies every LOD switch distance: **bigger = more detail** (2 = full detail twice as far,
+    /// 0.5 = switch to coarser levels / impostors at half the distance; phones want < 1, a far
+    /// top-down camera over small models > 1). Never changes itself: set it per game / quality
+    /// profile. API name also accepted as `lod_bias` (its old name).
+    pub lod_distance_scale: f32,
+    /// Far clip for drawn geometry in metres (0 = off): entities whose bounds are farther from the
+    /// camera are not drawn (main view; shadows unaffected), and every surface fades into the fog /
+    /// horizon colour over the last `view_fade` fraction of it, so raising it shows no hard edge.
+    pub view_distance: f32,
+    /// Fraction of `view_distance` used for the fade into the fog (default 0.2).
+    pub view_fade: f32,
 }
 
 impl Default for RenderSettings {
@@ -832,7 +845,9 @@ impl Default for RenderSettings {
             auto_frame_cap: true,
             pacing_min_fps: 30.0,
             gpu_slow_ms: 0.0,
-            lod_bias: 1.0,
+            lod_distance_scale: 1.0,
+            view_distance: 0.0,
+            view_fade: 0.2,
         }
     }
 }
@@ -993,7 +1008,7 @@ struct InstanceRaw {
 #[derive(Clone, Debug, Serialize)]
 pub struct TexInfo {
     #[serde(skip)]
-    tex: Option<GpuTexture>,
+    pub(crate) tex: Option<GpuTexture>,
     pub label: String,
     pub width: u32,
     pub height: u32,
@@ -1033,8 +1048,8 @@ pub type CpuMesh = (Vec<[f32; 3]>, Vec<u32>);
 
 pub struct GpuMesh {
     pub name: String,
-    vb: GpuBuffer,
-    ib: GpuBuffer,
+    pub(crate) vb: GpuBuffer,
+    pub(crate) ib: GpuBuffer,
     pub index_count: u32,
     pub vertex_count: u32,
     pub bounds_center: Vec3,
@@ -1157,7 +1172,7 @@ pub struct Renderer {
     /// Clustered lighting buffers (lights, cluster grid, light index list).
     light_bufs: LightBufs,
     shadow_sampler: GpuSampler,
-    color_sampler: GpuSampler,
+    pub(crate) color_sampler: GpuSampler,
     msaa_view: Option<GpuTextureView>,
     /// Samples per pixel of the scene targets (`RenderConfig::msaa`): 4, or 1 (FXAA).
     pub samples: u32,
@@ -1200,12 +1215,12 @@ pub struct Renderer {
     /// `copyExternalImageToTexture` works on this device (PowerVR B-Series writes zeros); if not,
     /// `update_texture` decodes through a 2D canvas and uploads with `writeTexture`.
     external_copy_ok: bool,
-    meshes: Vec<GpuMesh>,
+    pub(crate) meshes: Vec<GpuMesh>,
     /// Slots of removed meshes, reused by `add_mesh` (streaming frees and re-creates chunks).
     free_meshes: Vec<u32>,
-    materials: Vec<Material>,
+    pub(crate) materials: Vec<Material>,
     /// Index 0 = 1x1 white default texture.
-    tex_views: Vec<GpuTextureView>,
+    pub(crate) tex_views: Vec<GpuTextureView>,
     /// 1x1 flat normal (0.5, 0.5, 1) used when a material has no normal map.
     flat_normal: Option<GpuTextureView>,
     /// Material bind groups by (base, normal, height) internal texture index (u32::MAX = default).
@@ -1214,7 +1229,9 @@ pub struct Renderer {
     start_ms: f64,
     frozen_time: Option<f32>,
     /// GPU texture objects parallel to `textures` (for updates + mip generation).
-    tex_objects: Vec<TexInfo>,
+    pub(crate) tex_objects: Vec<TexInfo>,
+    pub(crate) impostor_gpu: Option<crate::impostor::ImpostorGpu>,
+    pub(crate) empty_mesh_id: Option<MeshId>,
     mip_pipeline: GpuRenderPipeline,
     mip_pipeline_linear: GpuRenderPipeline,
     mip_sampler: GpuSampler,
@@ -1227,13 +1244,13 @@ pub struct Renderer {
     push_count: u32,
 }
 
-fn js_err(e: JsValue) -> String {
+pub(crate) fn js_err(e: JsValue) -> String {
     e.as_string()
         .or_else(|| js_sys::JSON::stringify(&e).ok().and_then(|s| s.as_string()))
         .unwrap_or_else(|| format!("{e:?}"))
 }
 
-fn nums(v: &[u32]) -> Vec<Number> {
+pub(crate) fn nums(v: &[u32]) -> Vec<Number> {
     v.iter().map(|&x| Number::from(x)).collect()
 }
 
@@ -1792,6 +1809,8 @@ impl Renderer {
             free_meshes: vec![],
             materials: vec![],
             tex_views: vec![],
+            impostor_gpu: None,
+            empty_mesh_id: None,
             flat_normal: None,
             mat_groups: std::collections::HashMap::new(),
             start_ms: crate::log::now_ms(),
@@ -2334,7 +2353,7 @@ impl Renderer {
     }
 
     /// Downsamples level i-1 into level i for every mip (render passes, linear filter).
-    fn generate_mips(&self, tex: &GpuTexture, mips: u32, linear: bool) -> Result<(), String> {
+    pub(crate) fn generate_mips(&self, tex: &GpuTexture, mips: u32, linear: bool) -> Result<(), String> {
         if mips <= 1 {
             return Ok(());
         }
@@ -3246,7 +3265,7 @@ impl Renderer {
             ground_color: (s.ground_color * s.ambient_scale.max(0.0)).extend(1.0).into(),
             counts: [n_lights as u32, s.shadows as u32, s.debug_view, n_casc as u32],
             // near must match the projection (depth_jitter) or water depth would shift with it
-            time: [shader_t, near * (1.0 + s.depth_jitter), far, 0.0],
+            time: [shader_t, near * (1.0 + s.depth_jitter), far, s.view_distance.max(0.0)],
             inv_view_proj: view_proj.inverse().to_cols_array_2d(),
             fog: [s.fog_density.max(0.0), s.fog_height_falloff.max(0.0), s.fog_start.max(0.0), s.fog_max.clamp(0.0, 1.0)],
             fog_color: s.fog_color.map(|c| c.extend(1.0)).unwrap_or(Vec4::ZERO).into(),
@@ -3257,7 +3276,7 @@ impl Renderer {
             view: view.to_cols_array_2d(),
             cascade_splits: splits,
             cascade_texel: texels,
-            cluster: [near, cluster_far, crate::lights::CLUSTER_Z as f32 / (cluster_far / near).ln(), 0.0],
+            cluster: [near, cluster_far, crate::lights::CLUSTER_Z as f32 / (cluster_far / near).ln(), s.view_distance.max(0.0) * (1.0 - s.view_fade.clamp(0.0, 1.0))],
             screen: [vw as f32, vh as f32, 1.0 / vw.max(1) as f32, 1.0 / vh.max(1) as f32],
             sky_sun: self.sky.sun.normalize_or(Vec3::Y).extend(1.0).into(),
             sky_sun_color: self.sky.sun_radiance.extend(self.sky.night).into(),
@@ -3323,7 +3342,8 @@ impl Renderer {
         // that never enter them).
         let (mut scene_min, mut scene_max) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
         let shadows_on = self.settings.shadows;
-        let lod_bias = self.settings.lod_bias.max(0.01);
+        let lod_bias = self.settings.lod_distance_scale.max(0.01);
+        let view_dist = if main { self.settings.view_distance.max(0.0) } else { 0.0 };
         if gpu {
             for id in std::mem::take(&mut self.material_touched) {
                 let i = id as usize;
@@ -3371,7 +3391,8 @@ impl Renderer {
             let (is_blend, is_mask, casts) = (c.blend, c.mask, c.casts);
             let center = model.transform_point3(mesh.bounds_center);
             let radius = mesh.bounds_radius * scale;
-            let in_frustum = planes.iter().all(|p| p.truncate().dot(center) + p.w >= -radius);
+            let in_frustum = planes.iter().all(|p| p.truncate().dot(center) + p.w >= -radius)
+                && (view_dist <= 0.0 || (center - cam_pos).length() - radius <= view_dist);
             // opacity 0: not drawn, still casts
             let drawn = in_frustum && !c.hidden;
             if !drawn {
@@ -3886,6 +3907,7 @@ impl Renderer {
                     static_mask,
                     pass_lv,
                     pass_box,
+                    view: [if main { self.settings.view_distance.max(0.0) } else { 0.0 }, 0.0, 0.0, 0.0],
                 };
                 let ts = self.timing.as_mut().filter(|_| main).and_then(|t| t.compute_writes(crate::gpu_timing::CULL));
                 if let Some(hiz) = c.hiz_view() {

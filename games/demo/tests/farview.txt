@@ -1,0 +1,31 @@
+# Far view: impostor cards for glTF props, view_distance, lod_distance_scale (old name lod_bias).
+# HLOD of static batches: games/demo/tests/hlod.txt.
+#   node tools/bridge.mjs run games/demo/tests/farview.txt
+reload
+screen play
+wait 1000
+pause
+# left: the mesh tree; right: the same model with an impostor that is always on (distance 0.01 x radius)
+call spawn {"gltf": "assets/tree.glb", "pos": [-4, 0.3, 0]}
+call spawn {"gltf": "assets/tree.glb", "pos": [4, 0.3, 0], "impostor": true, "impostor_distance": 0.01}
+wait_for impostors.cards == 1 5000
+expect impostors.baked.0.views == 8
+expect impostors.baked.0.atlas.0 == 512
+call spawn {"camera": true, "pos": [0, 3, 14], "look_at": [0, 2.5, 0], "main": true}
+frames 3
+expect impostors.showing == 1
+screenshot out/farview-impostor.png
+# bigger lod_distance_scale = detail kept farther: the card switches back to the meshes
+call render {"lod_bias": 1000}
+expect render.lod_distance_scale == 1000
+expect impostors.showing == 0
+call render {"lod_distance_scale": 1}
+expect impostors.showing == 1
+# view distance: geometry beyond it is culled, the rest fades into the fog colour
+call render {"view_distance": 8}
+frames 3
+screenshot out/farview-viewdist.png
+expect stats.render.gpu_frustum_culled > 20
+call render {"view_distance": 0}
+frames 3
+expect logs{"level": "error"}.entries.length == 0

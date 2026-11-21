@@ -254,7 +254,44 @@ fn sky_full(dir: vec3f, with_sun: bool) -> vec3f {
 }
 
 // Exponential height fog along the view ray from the camera to `world`.
+// Impostor card (Material::impostor_views > 0): local quad x = across, y = up, uv 0..1 per view.
+// Turned around the model's up axis toward `eye_dir` (world, from the pivot); the atlas cell is the
+// baked azimuth nearest to the eye's azimuth in model space (0 = local +Z, views in rows of 4).
+struct ImpostorVert {
+    world: vec4f,
+    normal: vec3f,
+    uv: vec2f,
+}
+
+fn impostor_vertex(model: mat4x4f, pos: vec3f, uv: vec2f, views: f32, eye_dir: vec3f) -> ImpostorVert {
+    let up = model[1].xyz;
+    let un = normalize(up);
+    var d = eye_dir - un * dot(eye_dir, un);
+    if (dot(d, d) < 1e-10) { d = model[2].xyz; }
+    let f = normalize(d);
+    let r = cross(un, f);
+    var o: ImpostorVert;
+    o.world = vec4f(model[3].xyz + r * pos.x * length(model[0].xyz) + up * pos.y, 1.0);
+    o.normal = f;
+    let n = max(u32(views + 0.5), 1u);
+    let phi = atan2(dot(f, normalize(model[0].xyz)), dot(f, normalize(model[2].xyz)));
+    let k = u32(round(fract(phi / 6.2831853 + 1.0) * f32(n))) % n;
+    let cols = min(n, 4u);
+    let rows = (n + cols - 1u) / cols;
+    o.uv = (vec2f(f32(k % cols), f32(k / cols)) + uv) / vec2f(f32(cols), f32(rows));
+    return o;
+}
+
 fn fog_amount(world: vec3f) -> f32 {
+    // view distance (render.view_distance): fade into the fog colour before the far clip
+    var vfade = 0.0;
+    if (g.time.w > 0.0) {
+        vfade = smoothstep(g.cluster.w, g.time.w, length(world - g.camera_pos.xyz));
+    }
+    return max(fog_density_amount(world), vfade);
+}
+
+fn fog_density_amount(world: vec3f) -> f32 {
     let density = g.fog.x;
     if (density <= 0.0) { return 0.0; }
     let d = world - g.camera_pos.xyz;

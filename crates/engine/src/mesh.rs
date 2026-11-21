@@ -260,10 +260,23 @@ impl MeshData {
     /// same cell *and* with a similar normal (6 axis buckets) merge into their average, so hard
     /// edges survive; collapsed and duplicate triangles are dropped. Fast, deterministic, crude.
     pub fn simplify_cluster(&self, cells: u32) -> MeshData {
-        use std::collections::HashMap;
         if self.vertices.is_empty() || cells < 1 {
             return self.clone();
         }
+        self.simplify_grid(Vec3::splat(cells as f32), None)
+    }
+
+    /// Vertex clustering on cubic cells of `cell` mesh units (same rules as [`Self::simplify_cluster`]):
+    /// detail smaller than `cell` disappears whatever the mesh's extent (HLOD of a whole city cell).
+    pub fn simplify_cell_size(&self, cell: f32) -> MeshData {
+        if self.vertices.is_empty() || cell <= 0.0 {
+            return self.clone();
+        }
+        self.simplify_grid(Vec3::ONE, Some(cell))
+    }
+
+    fn simplify_grid(&self, cells: Vec3, cell_size: Option<f32>) -> MeshData {
+        use std::collections::HashMap;
         let mut min = Vec3::splat(f32::MAX);
         let mut max = Vec3::splat(f32::MIN);
         for v in &self.vertices {
@@ -271,7 +284,10 @@ impl MeshData {
             max = max.max(Vec3::from(v.pos));
         }
         let size = (max - min).max(Vec3::splat(1e-6));
-        let c = cells as f32;
+        let c = match cell_size {
+            Some(cs) => (size / cs).ceil().max(Vec3::ONE),
+            None => cells,
+        };
         let bucket = |n: Vec3| -> u8 {
             let a = n.abs();
             if a.x >= a.y && a.x >= a.z {
@@ -297,7 +313,7 @@ impl MeshData {
         let mut acc: Vec<(Vec3, Vec3, [f32; 2], f32, [f32; 4])> = vec![];
         for v in &self.vertices {
             let p = Vec3::from(v.pos);
-            let q = ((p - min) / size * c).floor().min(Vec3::splat(c - 1.0));
+            let q = ((p - min) / size * c).floor().min(c - Vec3::ONE);
             let key = (
                 q.x as u32,
                 q.y as u32,

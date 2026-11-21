@@ -25,6 +25,11 @@ fn vs_shadow_mask(@location(0) pos: vec3f, @location(2) uv: vec2f, @builtin(inst
     var o: MaskOut;
     o.clip = shadow_vp * it.model * vec4f(pos, 1.0);
     o.uv = uv;
+    if (it.normal[2].w > 0.5) { // impostor card: faces the light (its silhouette from the sun's azimuth)
+        let iv = impostor_vertex(it.model, pos, uv, it.normal[2].w, vec3f(shadow_vp[0][2], shadow_vp[1][2], shadow_vp[2][2]));
+        o.clip = shadow_vp * iv.world;
+        o.uv = iv.uv;
+    }
     o.alpha_cut = vec2f(it.base_color.a, it.params.w);
     return o;
 }

@@ -25,15 +25,32 @@ pub struct GltfOpts {
     /// Attach the automatic LOD chain (vertex-clustered levels) to big primitives. Off = always
     /// full detail (small detailed models: characters, figures, props seen from far cameras).
     pub auto_lod: bool,
-    /// Multiplies this model's LOD switch distances (on top of `render.lod_bias`).
+    /// Multiplies this model's LOD switch distances, impostor included (on top of
+    /// `render.lod_distance_scale`; bigger = detail kept farther).
     pub lod_distance: f32,
+    /// Last LOD level = an impostor: one camera-facing card (2 triangles) baked from
+    /// `impostor_views` azimuths at the first instantiation (cached per model + bake settings).
+    /// Static models only (skinned / morphed models keep their meshes).
+    pub impostor: bool,
+    /// Switch distance to the card in multiples of the model's bounding radius (default 60: a
+    /// model ~20 px in radius at 60° FOV / 1350 px), times `lod_distance` and the render scale.
+    /// Auto-LOD levels that would start beyond it are dropped.
+    pub impostor_distance: f32,
+    /// Baked azimuths (default 8; 4 for symmetric props, 12-16 for distinctive ones).
+    pub impostor_views: u32,
+    /// Texels across one view (default 128).
+    pub impostor_res: u32,
 }
 
 impl Default for GltfOpts {
     fn default() -> Self {
-        Self { auto_lod: true, lod_distance: 1.0 }
+        Self { auto_lod: true, lod_distance: 1.0, impostor: false, impostor_distance: 60.0, impostor_views: 8, impostor_res: 128 }
     }
 }
+
+/// Marks the impostor card entity of a glTF instance (child of the model root).
+#[derive(Clone, Copy, Debug)]
+pub struct ImpostorCard;
 
 /// GPU-resident model, instantiable any number of times.
 #[derive(Clone, Debug)]
@@ -67,6 +84,8 @@ pub struct ModelCache {
     /// url -> roots waiting for the load to finish
     pub pending: HashMap<String, Vec<Entity>>,
     pub failed: HashMap<String, String>,
+    /// (url, views, res) -> baked impostor (or the reason it could not be baked).
+    pub impostors: HashMap<(String, u32, u32), Result<crate::impostor::Impostor, String>>,
 }
 
 /// CPU-side result of parsing (before GPU upload).
@@ -467,13 +486,17 @@ pub fn instantiate(ctx: &mut Ctx, root: Entity, model: &ModelTemplate) {
     }
     let layer = ctx.world.get::<&crate::scene::RenderLayer>(root).map(|l| l.0).unwrap_or(0);
     let opts = ctx.world.get::<&GltfOpts>(root).map(|o| *o).unwrap_or(ctx.gltf_defaults);
+    let imp = if opts.impostor { impostor_for(ctx, model, &opts) } else { None };
+    // switch distance to the card in model-root units (prims divide by their scale below the root)
+    let imp_d = imp.map(|i| i.radius * opts.impostor_distance.max(1.0) * opts.lod_distance.max(0.01));
     let n_nodes = model.nodes.len();
     let mut node_entity: Vec<Option<Entity>> = vec![None; n_nodes];
     let mut node_prims: Vec<Vec<Entity>> = vec![vec![]; n_nodes];
     // spawn the hierarchy
-    let mut stack: Vec<(usize, Entity)> = model.roots.iter().rev().map(|&r| (r, root)).collect();
-    while let Some((idx, parent)) = stack.pop() {
+    let mut stack: Vec<(usize, Entity, f32)> = model.roots.iter().rev().map(|&r| (r, root, 1.0)).collect();
+    while let Some((idx, parent, parent_scale)) = stack.pop() {
         let n = &model.nodes[idx];
+        let chain_scale = parent_scale * n.transform.scale.abs().max_element().max(1e-6);
         let e = ctx.world.spawn((n.transform, Name(n.name.clone()), Parent(parent)));
         node_entity[idx] = Some(e);
         for (k, (mesh, mat, lod)) in n.prims.iter().enumerate() {
@@ -490,11 +513,28 @@ pub fn instantiate(ctx: &mut Ctx, root: Entity, model: &ModelTemplate) {
             let mut mr = MeshRenderer::new(mesh, *mat);
             mr.layer = layer;
             let _ = ctx.world.insert_one(target, mr);
-            if let (Some(l), None, true) = (lod, &deform, opts.auto_lod) {
-                let mut l = l.clone();
-                for d in l.distances.iter_mut() {
-                    *d *= opts.lod_distance.max(0.01);
+            let mut lod_c = match (lod, &deform, opts.auto_lod) {
+                (Some(l), None, true) => {
+                    let mut l = l.clone();
+                    for d in l.distances.iter_mut() {
+                        *d *= opts.lod_distance.max(0.01);
+                    }
+                    Some(l)
                 }
+                _ => None,
+            };
+            if let (Some(d_root), None) = (imp_d, &deform) {
+                // the meshes stop where the card starts: drop levels that would begin beyond it
+                let d = d_root / chain_scale;
+                let mut l = lod_c.take().unwrap_or(Lod { meshes: vec![mesh], distances: vec![], cull_beyond: false });
+                let keep = (1 + l.distances.iter().take_while(|&&x| x < d).count()).min(l.meshes.len());
+                l.meshes.truncate(keep);
+                l.distances.truncate(keep - 1);
+                l.distances.push(d);
+                l.cull_beyond = true;
+                lod_c = Some(l);
+            }
+            if let Some(l) = lod_c {
                 let _ = ctx.world.insert_one(target, l);
             }
             if let Some(src) = deform {
@@ -505,8 +545,22 @@ pub fn instantiate(ctx: &mut Ctx, root: Entity, model: &ModelTemplate) {
             }
         }
         for &c in n.children.iter().rev() {
-            stack.push((c, e));
+            stack.push((c, e, chain_scale));
         }
+    }
+    if let (Some(i), Some(d)) = (imp, imp_d) {
+        let mut mr = MeshRenderer::new(i.mesh, i.material);
+        mr.layer = layer;
+        let card = ctx.world.spawn((
+            Transform::from_translation(i.pivot),
+            Name("impostor".into()),
+            Parent(root),
+            mr,
+            Lod { meshes: vec![i.empty, i.mesh], distances: vec![d], cull_beyond: false },
+            ImpostorCard,
+            crate::zfight::NoZCheck,
+        ));
+        let _ = card;
     }
     // resolve skins
     for (idx, n) in model.nodes.iter().enumerate() {
@@ -526,6 +580,36 @@ pub fn instantiate(ctx: &mut Ctx, root: Entity, model: &ModelTemplate) {
         let rest: Vec<Transform> = model.nodes.iter().map(|n| n.transform).collect();
         let _ = ctx.world.insert_one(root, Animator::new(model.clips.clone(), nodes, node_prims, rest));
     }
+}
+
+/// The model's impostor for these bake settings (baked on first use, cached per model).
+fn impostor_for(ctx: &mut Ctx, model: &ModelTemplate, opts: &GltfOpts) -> Option<crate::impostor::Impostor> {
+    let key = (model.url.clone(), opts.impostor_views.clamp(1, 16), opts.impostor_res.clamp(32, 512));
+    if let Some(r) = ctx.models.impostors.get(&key) {
+        return r.as_ref().ok().copied();
+    }
+    let r = (|| {
+        if model.nodes.iter().any(|n| n.deform.iter().any(|d| d.is_some())) || !model.skins.is_empty() {
+            return Err("skinned / morphed model".to_string());
+        }
+        // every primitive with its node -> model-root matrix
+        let mut parts = vec![];
+        let mut stack: Vec<(usize, Mat4)> = model.roots.iter().map(|&r| (r, Mat4::IDENTITY)).collect();
+        while let Some((idx, parent)) = stack.pop() {
+            let n = &model.nodes[idx];
+            let m = parent * n.transform.matrix();
+            for (mesh, mat, _) in &n.prims {
+                parts.push((*mesh, *mat, m));
+            }
+            stack.extend(n.children.iter().map(|&c| (c, m)));
+        }
+        ctx.renderer.bake_impostor(&model.url, &parts, key.1, key.2)
+    })();
+    if let Err(e) = &r {
+        crate::log_warn!("{}: no impostor ({e})", model.url);
+    }
+    ctx.models.impostors.insert(key, r.clone());
+    r.ok()
 }
 
 /// Starts loading `url` (or reuses the cache) and attaches the model under `root` when ready.

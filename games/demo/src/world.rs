@@ -347,7 +347,8 @@ impl Screen<Data> for WorldScreen {
                 }
             }
             let _ = placed;
-            ctx.batch_static(root, 48.0); // static parts of the cell merge per material
+            // static parts of the cell merge per material; beyond 160 m the whole cell is one HLOD mesh
+            ctx.batch_static_with(root, 48.0, Some(engine::batch::Hlod { distance: 160.0, cluster: 0.6 }));
         });
         if let Some(l) = ctx.streaming.layers.iter_mut().find(|l| l.name == "props") {
             l.budget = 3;

@@ -142,7 +142,29 @@ normal `cargo` output above it.
   when the object is ~30 px in radius at 60° FOV and 1350 px height: close cameras never switch). For a close
   camera (top-down at ~16 m) set it once per game: `ctx.gltf_defaults.lod_distance = 0.2` before loading.
   Per load: `ctx.load_gltf_with(url, t, GltfOpts { auto_lod: false, .. })` or `lod_distance`; for all loads:
-  `ctx.gltf_defaults`; globally: `render {lod_bias: 2}` (far cameras). `stats.render.lod_levels` shows the mix.
+  `ctx.gltf_defaults`; globally: `render {lod_distance_scale: 2}` = every switch distance x2, **bigger = more
+  detail** (phones/low quality < 1; the old name `lod_bias` is still accepted by the API, the Rust field is
+  `settings.lod_distance_scale`). `stats.render.lod_levels` shows the mix.
+- **Far view:** three tools, all on the same LOD distance scale.
+  *Impostors* (`GltfOpts { impostor: true, impostor_distance: 60.0, impostor_views: 8, impostor_res: 128, .. }`):
+  at the first instantiation the model is baked from `impostor_views` azimuths into an albedo + normal atlas
+  (`crate::impostor`, `shaders/impostor.wgsl`); beyond `impostor_distance` x the model radius (x `lod_distance` x
+  `lod_distance_scale`) every instance is one card (2 triangles, child entity `impostor` with `ImpostorCard`,
+  `NoZCheck`) that turns around the model's up axis toward the camera, picks the nearest baked view and is lit
+  with the baked normals (sun, shadows, fog, day/night); its shadow is the card turned toward the sun. The
+  meshes stop there (`cull_beyond`; auto-LOD levels starting beyond it are dropped). Static models only.
+  Limits: hard switch (no cross-fade), view snaps between azimuths, cylindrical (seen from high above the card is
+  foreshortened). `Renderer::bake_impostor(name, &[(mesh, material, matrix)], views, res)` bakes anything.
+  API `spawn {gltf, impostor: true, impostor_distance, impostor_views, impostor_res, lod_distance}`, `impostors`
+  (baked atlases, `cards`, `showing`). *HLOD* (`ctx.batch_static_with(root, cell, Some(Hlod { distance: 150.0,
+  cluster: 0.75 }))`): besides the per-material batches every cell gets one mesh of all of them, vertex-clustered
+  at `cluster` m with the material base colours baked into vertex colours, one material; beyond `distance` m the
+  cell is that mesh (batches and HLOD share the cell's foot centre as origin, so they switch together). Textures
+  are not baked; parts thinner than `cluster` vanish. API `batch {id, cell, hlod: {distance, cluster}}`, `batch`
+  lists `hlods`. *View distance* (`render {view_distance: m, view_fade: 0.2}`): main-view geometry whose bounds
+  lie beyond it is culled (GPU and CPU path; shadows unaffected) and every lit surface fades into the fog /
+  horizon colour over the last `view_fade` of it, so a game can raise it on PC without a cliff. Empty LOD level:
+  `renderer.empty_mesh()`. Tests: `games/demo/tests/farview.txt`, `hlod.txt`.
 - **Input in tests:** keys/buttons held through the API (`input {key, down:true}`) survive window blur; only
   `down:false` or `release_all` releases them. Two agents at once: give each its own Chrome
   (`bridge launch --port 9223 --url http://localhost:8091/`, then `--port/--url` or `CDP_PORT`/`GAME_URL` on

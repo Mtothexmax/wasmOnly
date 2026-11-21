@@ -1,0 +1,18 @@
+# HLOD: the open world batches its static props per cell (batch_static_with + Hlod): every cell gets
+# one simplified mesh of all its batches (vertex colours = material colours) drawn beyond 160 m.
+#   node tools/bridge.mjs run games/demo/tests/hlod.txt
+reload
+call screens {"switch": "world"}
+wait_for game_state.screen == "world" 5000
+wait_for world.layers.0.loaded > 10 20000
+frames 30
+expect batch.hlods.length > 10
+expect batch.hlods.0.distance == 160
+expect batch.hlods.0.triangles > 0
+# HLOD meshes overlap their batches on purpose: NoZCheck keeps them out of the z-fighting test
+expect zfight{"radius": 150}.pairs == 0
+pause
+call spawn {"camera": true, "pos": [0, 60, 260], "look_at": [0, 0, 0], "main": true}
+frames 5
+screenshot out/hlod-far.png
+expect logs{"level": "error"}.entries.length == 0

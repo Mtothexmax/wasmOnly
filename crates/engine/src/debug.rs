@@ -61,7 +61,8 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("entities", "List entities. args: {name?: substring, limit?: 200, with?: 'mesh'|'body'|'light'|'label'|'camera'}"),
     ("entity", "Full detail of one entity. args: {id}"),
     ("set", "Modify an entity. args: {id, pos?: [x,y,z], rot?: [deg x,y,z], scale?: [x,y,z], vel?: [x,y,z], color?: '#rrggbb', opacity?: 0..1 (this entity and its children; keeps its shadow), layer?: 0..31 (MeshRenderer::layer, children too)}"),
-    ("spawn", "Spawn a primitive or a glTF model. args: {shape: 'cube'|'sphere', pos, size?: 1, color?: '#rrggbb', body?: 'dynamic'|'fixed'|'kinematic'|'none', name?, parent?: id|name (pos is then local), no_zcheck?: true} or {gltf: 'assets/x.glb', pos, size?: scale, auto_lod?: bool} or {camera: true, pos?, look_at?, fov?, name?, main?: bool} or {water: [x, z], pos, spacing?: 0.25, name?} (bounded water surface) or {ocean: y, radius?: 5000, segments?: 256, spacing?} (camera-following sea, returns triangles)"),
+    ("impostors", "Baked impostors (glTF GltfOpts::impostor): url, views, atlas size, card size, radius, texture ids; cards: instances, showing = drawn as the card now (main camera, CPU estimate). args: {}"),
+    ("spawn", "Spawn a primitive or a glTF model. args: {shape: 'cube'|'sphere', pos, size?: 1, color?: '#rrggbb', body?: 'dynamic'|'fixed'|'kinematic'|'none', name?, parent?: id|name (pos is then local), no_zcheck?: true} or {gltf: 'assets/x.glb', pos, size?: scale, auto_lod?: bool, lod_distance?, impostor?: bool, impostor_distance?: 60 (x radius), impostor_views?: 8, impostor_res?: 128} or {camera: true, pos?, look_at?, fov?, name?, main?: bool} or {water: [x, z], pos, spacing?: 0.25, name?} (bounded water surface) or {ocean: y, radius?: 5000, segments?: 256, spacing?} (camera-following sea, returns triangles)"),
     ("despawn", "Remove entity and children. args: {id}"),
     ("pause", "Pause simulation (rendering continues)."),
     ("resume", "Resume simulation."),
@@ -622,6 +623,21 @@ pub(crate) fn handle<G: Game>(
                 if let Some(v) = a.get("auto_lod").and_then(|v| v.as_bool()) {
                     opts.auto_lod = v;
                 }
+                if let Some(v) = a.get("impostor").and_then(|v| v.as_bool()) {
+                    opts.impostor = v;
+                }
+                if let Some(v) = a.get("impostor_distance").and_then(|v| v.as_f64()) {
+                    opts.impostor_distance = v as f32;
+                }
+                if let Some(v) = a.get("impostor_views").and_then(|v| v.as_u64()) {
+                    opts.impostor_views = v as u32;
+                }
+                if let Some(v) = a.get("impostor_res").and_then(|v| v.as_u64()) {
+                    opts.impostor_res = v as u32;
+                }
+                if let Some(v) = a.get("lod_distance").and_then(|v| v.as_f64()) {
+                    opts.lod_distance = v as f32;
+                }
                 let e = ctx.load_gltf_with(url, Transform::from_translation(pos).with_scale(Vec3::splat(scale)), opts);
                 return Ok(json!({"id": e.id(), "loading": ctx.assets_pending() > 0}));
             }
@@ -800,6 +816,25 @@ pub(crate) fn handle<G: Game>(
             // `oldest`: first seq still kept (the buffer holds the last 10000 entries)
             Ok(json!({"next": log::next_seq(), "oldest": log::oldest_seq(), "omitted": omitted, "entries": entries}))
         }
+        "impostors" => {
+            let baked: Vec<Value> = ctx.models.impostors.iter().map(|((url, v, r), i)| match i {
+                Ok(i) => json!({"url": url, "views": v, "res": r, "atlas": [i.atlas.0, i.atlas.1], "card": [i.size.0, i.size.1], "radius": i.radius, "albedo": i.albedo.0, "normal": i.normal.0, "material": i.material.0, "mesh": i.mesh.0}),
+                Err(e) => json!({"url": url, "views": v, "res": r, "error": e}),
+            }).collect();
+            let cam = crate::scene::main_camera(&ctx.world).and_then(|c| ctx.world.get::<&crate::scene::GlobalTransform>(c).ok().map(|g| g.0.w_axis.truncate()));
+            let k = ctx.renderer.settings.lod_distance_scale.max(0.01);
+            let (mut n, mut showing) = (0, 0);
+            for (g, l, _) in ctx.world.query::<(&crate::scene::GlobalTransform, &crate::renderer::Lod, &crate::gltf_loader::ImpostorCard)>().iter() {
+                n += 1;
+                let s = g.0.x_axis.truncate().length().max(g.0.y_axis.truncate().length()).max(1e-4);
+                if let (Some(c), Some(d)) = (cam, l.distances.first()) {
+                    if (g.0.w_axis.truncate() - c).length() / s / k > *d {
+                        showing += 1;
+                    }
+                }
+            }
+            Ok(json!({"baked": baked, "cards": n, "showing": showing}))
+        }
         "render" => {
             // any RenderSettings field by name (unknown names are an error, types are checked)
             if let Some(obj) = a.as_object().filter(|o| !o.is_empty()) {
@@ -809,6 +844,7 @@ pub(crate) fn handle<G: Game>(
                     Some(json!([((c >> 16) & 255) as f32 / 255.0, ((c >> 8) & 255) as f32 / 255.0, (c & 255) as f32 / 255.0]))
                 };
                 for (k, v) in obj {
+                    let k = if k == "lod_bias" { "lod_distance_scale" } else { k.as_str() }; // old name
                     if cur.get(k).is_none() {
                         return Err(format!("unknown render setting '{k}'; known: {:?}", cur.as_object().map(|o| o.keys().cloned().collect::<Vec<_>>())));
                     }

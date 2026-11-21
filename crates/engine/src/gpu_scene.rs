@@ -77,6 +77,8 @@ pub(super) struct SceneParams {
     pub static_mask: u32,
     pub pass_lv: [[[f32; 4]; 4]; PASSES],
     pub pass_box: [[f32; 4]; PASSES],
+    /// x = view distance (0 = off): main-view objects farther away are culled.
+    pub view: [f32; 4],
 }
 
 /// The LOD component as last seen (change detection).
