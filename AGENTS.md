@@ -17,8 +17,9 @@ node tools/bridge.mjs call help     # list every engine + game command
 node tools/bridge.mjs screenshot out.png
 node tools/bridge.mjs check          # build check: reload, assets, z-fighting, engine errors (exit 1 = fail)
 node tools/dev.mjs build --check     # build + check in one step (watch --check: after every rebuild)
-node tools/dev.mjs build --release    # optimised build; wasm-opt -O3 if found (PATH or WASM_OPT), else skipped
-node tools/dev.mjs build --release --install-wasm-opt   # first cargo-installs the pinned wasm-opt (ask the user first)
+node tools/dev.mjs build --release    # optimised build (no wasm-opt unless opted in)
+node tools/dev.mjs build --release --wasm-opt           # + wasm-opt -O3 (PATH or WASM_OPT)
+node tools/dev.mjs build --release --install-wasm-opt   # same, cargo-installs the pinned wasm-opt first (ask the user)
 node tools/bridge.mjs run games/demo/tests/smoke.txt   # scripted test run (input, step, expect, screenshot)
 node tools/new-game.mjs ../my-game                     # new standalone game repo (see HANDOFF.md)
 node tools/dev.mjs watch --game-dir ../my-game         # build/serve a game from another folder
@@ -30,7 +31,8 @@ Or use the MCP server (`.mcp.json` registers `wasmonly`): tools `launch_chrome`,
 `dev.mjs build` ends with one JSON line: `{"build":"ok"|"error", ...}`. Compiler errors are
 normal `cargo` output above it.
 
-wasm-opt: the version is pinned in `Cargo.toml` `[workspace.metadata.wasmonly] wasm-opt` (the `wasm-opt` crate
+wasm-opt is opt-in (`--wasm-opt`, or `wasm-opt = true` under `[package.metadata.wasmonly]` in the game's
+Cargo.toml): after gzip it saves little (Brickhollow 1.88 -> 1.87 MB) and doubles the release build time. The version is pinned in `Cargo.toml` `[workspace.metadata.wasmonly] wasm-opt` (the `wasm-opt` crate
 builds binaryen from C++ source: MSVC/clang + CMake, a few minutes, no 111 MB binaryen archive); `cargo install`
 puts the CLI in `~/.cargo/bin`. A failing wasm-opt fails the build (`"stage":"wasm-opt"`).
 

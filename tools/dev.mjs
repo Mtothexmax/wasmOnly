@@ -2,7 +2,8 @@
 // Build + serve + watch for the wasmOnly engine. Zero npm dependencies (Node >= 22).
 //
 //   node tools/dev.mjs build [--game demo] [--release] [--threads]   -> dist/
-//   --install-wasm-opt (with --release): cargo-installs the pinned wasm-opt CLI when it is missing (no binaryen download)
+//   --wasm-opt (with --release): run wasm-opt -O3 (opt-in; or [package.metadata.wasmonly] wasm-opt = true in the game's Cargo.toml)
+//   --install-wasm-opt: --wasm-opt + cargo-installs the pinned wasm-opt CLI when it is missing (no binaryen download)
 //   --out <dir> builds/serves another folder instead of dist/ (set CARGO_TARGET_DIR too when another watcher builds the same game)
 //     --threads: threads backend (Web Worker pool, shared memory, atomics). Uses the pinned nightly
 //     from Cargo.toml [workspace.metadata.wasmonly] threads-toolchain + build-std; output in target/threads.
@@ -74,7 +75,17 @@ function wasmOptVersion() {
   const m = fs.readFileSync(path.join(ROOT, 'Cargo.toml'), 'utf8').match(/^wasm-opt\s*=\s*"([^"]+)"/m);
   return m ? m[1] : null;
 }
+/** wasm-opt is opt-in: after gzip it saves little (Brickhollow: 1.88 -> 1.87 MB) and doubles the release build. */
+function wasmOptWanted() {
+  if (flag('--wasm-opt') || flag('--install-wasm-opt')) return true;
+  const toml = path.join(GAME_SRC, 'Cargo.toml');
+  if (!fs.existsSync(toml)) return false;
+  const t = fs.readFileSync(toml, 'utf8');
+  const sec = t.match(/\[package\.metadata\.wasmonly\]([^\[]*)/);
+  return !!(sec && /^\s*wasm-opt\s*=\s*true/m.test(sec[1]));
+}
 function wasmOpt(out) {
+  if (!wasmOptWanted()) { console.log('(wasm-opt off: --wasm-opt, or wasm-opt = true under [package.metadata.wasmonly] in the game Cargo.toml)'); return true; }
   let bin = process.env.WASM_OPT || which('wasm-opt');
   const ver = wasmOptVersion();
   const install = `cargo install wasm-opt --version ${ver} --locked`;
@@ -86,7 +97,7 @@ function wasmOpt(out) {
     if (!bin) { console.log('(wasm-opt installed but not on PATH — add ~/.cargo/bin or set WASM_OPT)'); return false; }
   }
   if (!bin) {
-    console.log(`(wasm-opt not found — skipping. Smaller release builds: rerun with --install-wasm-opt, or ${install})`);
+    console.log(`(wasm-opt not found — skipping. Smaller release builds: --install-wasm-opt, or ${install})`);
     return true;
   }
   const before = fs.statSync(out).size;
