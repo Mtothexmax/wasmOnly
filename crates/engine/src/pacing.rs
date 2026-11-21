@@ -327,7 +327,8 @@ impl FramePacing {
                 }
             }
             let need = if gpu_est > 0.0 { ((gpu_est * 1.1) / v).ceil() as u32 } else { d + 1 };
-            let need = need.clamp(d + 1, MAX_DIV);
+            // at the slowest cadence (d == MAX_DIV) only the resolution lever below is left: d + 1 > MAX_DIV
+            let need = need.max(d + 1).min(MAX_DIV);
             let next_fps = 1000.0 / (need as f32 * v);
             // latency path: resolution is the second lever, used before the rate drops below min_fps
             if ts.is_none() && inp.auto_resolution && inp.scale > inp.min_scale + 1e-3 && next_fps < inp.min_fps {
