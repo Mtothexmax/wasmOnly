@@ -35,6 +35,9 @@ impl Default for RenderConfig {
     }
 }
 
+/// What a direct-output pipeline failure falls back to (log text).
+pub(crate) const DIRECT_FALLBACK: &str = "direct output is off, the composite path renders instead";
+
 /// Pipelines that write the scene colour target: one set for the HDR target, one (optional) for the
 /// direct LDR output. Cloned per frame (JS handles).
 #[derive(Clone)]
@@ -1279,6 +1282,11 @@ pub struct Renderer {
     pub samples: u32,
     /// Direct output: LDR pipeline set + the sRGB canvas view format (`RenderConfig::direct_output`).
     ldr: Option<(ScenePipes, GpuTextureFormat)>,
+    /// Driver status of every pipeline of the direct-output set: direct output runs only once all
+    /// of them are known to build (`direct_blocked` "pipeline pending" / "pipeline").
+    ldr_check: Rc<crate::debug::PipelineSet>,
+    /// The direct-output set still waits for its prewarm draw (runs once `ldr_check` is healthy).
+    ldr_warm_pending: bool,
     depth_view: Option<GpuTextureView>,
     /// Desktop GPU (AMD / NVIDIA / Intel: immediate-mode rendering) as opposed to a tile-based
     /// mobile GPU. Decides the load/store ops of the multisampled scene target: clears and discards
@@ -1390,6 +1398,13 @@ impl Renderer {
             .ok()
             .and_then(|q| q.as_string())
             .is_some_and(|q| q.contains("gpu_timing=0"));
+        // `?direct_fail=1`: the direct-output pipeline "pbr-opaque-eq-2s-ldr" is built invalid (test of
+        // the fallback when a phone driver cannot build one of the set)
+        let direct_fail = js_sys::Reflect::get(&js_sys::global(), &"location".into())
+            .and_then(|l| js_sys::Reflect::get(&l, &"search".into()))
+            .ok()
+            .and_then(|q| q.as_string())
+            .is_some_and(|q| q.contains("direct_fail=1"));
         // `?gpu_slow=N`: N ms of extra GPU work per frame (pacing tests)
         let slow_url = js_sys::Reflect::get(&js_sys::global(), &"location".into())
             .and_then(|l| js_sys::Reflect::get(&l, &"search".into()))
@@ -1605,6 +1620,8 @@ impl Renderer {
         // variant: 0 = normal, 1 = depth prepass (depth only), 2 = after a prepass (depth equal, no write),
         // 3 = blended with depth equal (solid fade colour), 4 = depth only without colour target (solid fade depth)
         // ldr: Some(canvas view format) = direct-output variant (tonemaps in the shader)
+        // the direct-output set is optional: a driver failure falls back to the composite path
+        let ldr_check = Rc::new(crate::debug::PipelineSet::default());
         let make_pipeline_f = |kind: u8, two_sided: bool, variant: u8, ldr: Option<GpuTextureFormat>| -> Result<(GpuRenderPipeline, Rc<Cell<bool>>), String> {
             let blend = kind == 2;
             let vs = GpuVertexState::new(&pbr_module);
@@ -1668,6 +1685,13 @@ impl Renderer {
             desc.set_primitive(&prim);
             desc.set_depth_stencil(&ds);
             desc.set_multisample(&ms);
+            if ldr.is_some() {
+                if direct_fail && label == "pbr-opaque-eq-2s-ldr" {
+                    ms.set_count(3); // invalid sample count: a validation error, like a driver failure
+                }
+                let p = crate::debug::create_pipeline_optional(&device, &desc, label, &ldr_check, DIRECT_FALLBACK)?;
+                return Ok((p, Rc::new(Cell::new(false))));
+            }
             crate::debug::create_pipeline_guarded(&device, &desc, label)
         };
         let make_pipeline_v = |kind: u8, two_sided: bool, variant: u8| make_pipeline_f(kind, two_sided, variant, None);
@@ -1838,7 +1862,7 @@ impl Renderer {
             None => (None, None),
         };
 
-        let post = crate::post::Post::new(&device, format, common, &bgl0, &bgl0_t, DEPTH_FORMAT, samples, ldr_format)?;
+        let post = crate::post::Post::new(&device, format, common, &bgl0, &bgl0_t, DEPTH_FORMAT, samples, ldr_format, &ldr_check)?;
         let ldr = match (ldr_pbr, &post.sky_ldr, &post.particle_ldr) {
             (Some((main, pre, fade, f)), Some(sky), Some((pa, pb))) => Some((
                 ScenePipes {
@@ -1934,6 +1958,8 @@ impl Renderer {
             msaa_view: None,
             samples,
             ldr,
+            ldr_check,
+            ldr_warm_pending: false,
             depth_view: None,
             post,
             grass,
@@ -2246,6 +2272,10 @@ impl Renderer {
             "not built"
         } else if !s.direct_output {
             "off"
+        } else if !self.ldr_check.failed.borrow().is_empty() {
+            "pipeline"
+        } else if self.ldr_check.pending.get() > 0 {
+            "pipeline pending"
         } else if s.debug_view != 0 {
             "debug_view"
         } else if s.bloom {
@@ -4394,11 +4424,12 @@ impl Renderer {
         let warm_mg = warm_mesh.map(|_| self.material_group((0, u32::MAX, u32::MAX)));
         if warm_mesh.is_some() {
             self.prewarm_pending = false;
+            self.ldr_warm_pending = self.ldr.is_some();
             self.prewarmed = true;
             crate::log_info!(
                 "prewarm: mask, blend{} and depth-equal pipelines drawn once (1x1){}",
                 if self.settings.solid_fade { ", solid fade" } else { "" },
-                if self.ldr.is_some() { ", plus the direct-output set" } else { "" }
+                if self.ldr.is_some() { ", the direct-output set follows once the driver built it" } else { "" }
             );
         } else if main {
             if !solid_runs.is_empty() {
@@ -4746,8 +4777,16 @@ impl Renderer {
 
         // Prewarm of the direct-output set while the HDR path draws: one triangle per LDR pipeline
         // into a 1x1 target of the canvas view format (mobile drivers compile on first draw).
-        if let (Some(m), Some(mg), None, Some((lp, f))) = (warm_mesh, warm_mg.as_ref(), &direct_view, &self.ldr) {
-            self.prewarm_ldr(&encoder, lp, *f, mg, m)?;
+        // Only once the driver built all of them: a failed pipeline would invalidate the frame.
+        if main && self.ldr_warm_pending && self.ldr_check.pending.get() == 0 {
+            self.ldr_warm_pending = false;
+            let mesh = self.meshes.iter().position(|m| m.index_count >= 3);
+            if let (true, Some(m)) = (self.ldr_check.healthy(), mesh) {
+                let mg = self.material_group((0, u32::MAX, u32::MAX));
+                if let Some((lp, f)) = &self.ldr {
+                    self.prewarm_ldr(&encoder, lp, *f, &mg, m)?;
+                }
+            }
         }
 
         // --- Post: bloom + depth darkening + tonemap -> canvas ------------------------------

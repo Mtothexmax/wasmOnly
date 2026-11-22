@@ -1,0 +1,17 @@
+# Direct output when the driver cannot build one of its pipelines (a phone reported
+# VK_ERROR_UNKNOWN for "pbr-opaque-eq-2s-ldr"): the set is optional, the failure is a warning
+# (no error, no overlay) and the frame renders through the composite (direct_blocked "pipeline").
+# ?direct_fail=1 builds that pipeline invalid on purpose:
+#   node tools/bridge.mjs launch --url "http://localhost:8080/?msaa=1&direct=1&direct_fail=1"
+#   node tools/bridge.mjs run games/demo/tests/directfail.txt
+reload
+wait 1000
+call render {"bloom": false, "fxaa": false, "depth_darkening": 0, "lens_flare": 0}
+frames 3
+expect stats.render.direct_output == false
+expect stats.render.direct_blocked == "pipeline"
+expect logs{"level": "error"}.entries.length == 0
+screen play
+wait 500
+expect stats.render.gpu_visible > 0
+expect logs{"level": "error"}.entries.length == 0

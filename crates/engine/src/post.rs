@@ -234,7 +234,7 @@ fn alpha_blend() -> GpuBlendState {
 impl Post {
     /// `ldr_format`: the canvas view format of the direct output (`RenderConfig::direct_output`); when
     /// set, sky and particles also get LDR variants that tonemap in the fragment shader.
-    pub fn new(device: &GpuDevice, canvas_format: GpuTextureFormat, common: &str, bgl0: &GpuBindGroupLayout, bgl0_t: &GpuBindGroupLayout, depth_format: GpuTextureFormat, samples: u32, ldr_format: Option<GpuTextureFormat>) -> Result<Self, String> {
+    pub fn new(device: &GpuDevice, canvas_format: GpuTextureFormat, common: &str, bgl0: &GpuBindGroupLayout, bgl0_t: &GpuBindGroupLayout, depth_format: GpuTextureFormat, samples: u32, ldr_format: Option<GpuTextureFormat>, ldr_check: &std::rc::Rc<crate::debug::PipelineSet>) -> Result<Self, String> {
         let module = device.create_shader_module(&GpuShaderModuleDescriptor::new(&crate::renderer::ms_src(include_str!("shaders/post.wgsl"), samples)));
         module.set_label("post.wgsl");
         crate::debug::report_shader_errors(&module, "post.wgsl");
@@ -323,6 +323,9 @@ impl Post {
             d.set_fragment(&fs);
             d.set_depth_stencil(&ds);
             d.set_multisample(&ms);
+            if ldr {
+                return crate::debug::create_pipeline_optional(device, &d, "sky-ldr", ldr_check, crate::renderer::DIRECT_FALLBACK);
+            }
             device.create_render_pipeline(&d).map_err(js_err)
         };
         let sky_pipeline = sky(HDR_FORMAT, false)?;
@@ -363,6 +366,9 @@ impl Post {
             d.set_depth_stencil(&ds);
             d.set_multisample(&ms);
             d.set_primitive(&prim);
+            if ldr {
+                return crate::debug::create_pipeline_optional(device, &d, label, ldr_check, crate::renderer::DIRECT_FALLBACK);
+            }
             device.create_render_pipeline(&d).map_err(js_err)
         };
         let particle_additive = particle("fs_additive", additive_blend(), "particles-add", HDR_FORMAT, false)?;

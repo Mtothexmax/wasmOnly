@@ -192,7 +192,12 @@ normal `cargo` output above it.
   into an sRGB view of the canvas: no HDR target write/read, no composite pass. Used per frame when nothing else of
   the composite is on, else the normal path: `stats.render.direct_output`, `direct_blocked` ("not built", "off",
   "debug_view", "bloom", "fxaa", "depth_darkening", "lens_flare", "grade", "grain", "vignette_radius", "water",
-  "grass", "size", "render texture"); `render {direct_output: false}` forces the composite. Costs ~20 pipelines at
+  "grass", "size", "render texture", "pipeline", "pipeline pending"); `render {direct_output: false}` forces the composite.
+  The LDR set is optional: a pipeline of it the driver cannot build (a phone reported `VK_ERROR_UNKNOWN` for
+  `pbr-opaque-eq-2s-ldr`) is a log warning, not an error/overlay, and the composite path renders instead
+  (`direct_blocked` "pipeline"; "pipeline pending" until every pipeline of the set is known to build, so a broken
+  one is never drawn; its prewarm waits for that too). Test: `?msaa=1&direct=1&direct_fail=1` builds that pipeline
+  invalid on purpose, `games/demo/tests/directfail.txt`. Costs ~20 pipelines at
   startup (prewarmed with the rest; `first use: direct output` in the log). Pixels match the composite (title
   screen: mean diff 0.8/255) except semi-transparent surfaces, which blend after the tonemap (a 50 % red cube over
   the sky reads redder), additive particles (exposure only, no curve) and the clear colour (no vignette).

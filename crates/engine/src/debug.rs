@@ -175,6 +175,52 @@ pub fn create_pipeline_guarded(
     Ok((pipeline, broken))
 }
 
+/// Health of a set of optional pipelines (the direct-output set): `pending` counts pipelines whose
+/// error scopes have not resolved yet, `failed` names the ones the driver could not build.
+#[derive(Default)]
+pub struct PipelineSet {
+    pub pending: std::cell::Cell<u32>,
+    pub failed: std::cell::RefCell<Vec<String>>,
+}
+
+impl PipelineSet {
+    /// Every pipeline is known to work.
+    pub fn healthy(&self) -> bool {
+        self.pending.get() == 0 && self.failed.borrow().is_empty()
+    }
+}
+
+/// Like `create_pipeline_guarded` for a pipeline the engine can do without (it has a fallback
+/// path): a driver failure is a warning in the log, no overlay, recorded in `set`.
+pub fn create_pipeline_optional(
+    device: &web_sys::GpuDevice,
+    desc: &web_sys::GpuRenderPipelineDescriptor,
+    label: &str,
+    set: &Rc<PipelineSet>,
+    fallback: &'static str,
+) -> Result<web_sys::GpuRenderPipeline, String> {
+    device.push_error_scope(web_sys::GpuErrorFilter::Internal);
+    device.push_error_scope(web_sys::GpuErrorFilter::Validation);
+    let created = device.create_render_pipeline(desc);
+    let validation = device.pop_error_scope();
+    let internal = device.pop_error_scope();
+    let pipeline = created.map_err(|e| format!("{label}: {e:?}"))?;
+    set.pending.set(set.pending.get() + 1);
+    let set = set.clone();
+    let label = label.to_string();
+    wasm_bindgen_futures::spawn_local(async move {
+        for p in [validation, internal] {
+            let Ok(v) = wasm_bindgen_futures::JsFuture::from(p).await else { continue };
+            let Ok(err) = v.dyn_into::<web_sys::GpuError>() else { continue };
+            log::write(Level::Warn, format!("WebGPU: render pipeline \"{label}\" failed on this GPU, {fallback}: {}", err.message()));
+            set.failed.borrow_mut().push(label.clone());
+            break;
+        }
+        set.pending.set(set.pending.get().saturating_sub(1));
+    });
+    Ok(pipeline)
+}
+
 pub fn install_gpu_error_handler(device: &web_sys::GpuDevice) {
     let cb = Closure::<dyn FnMut(web_sys::GpuUncapturedErrorEvent)>::new(
         |ev: web_sys::GpuUncapturedErrorEvent| {
