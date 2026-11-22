@@ -129,8 +129,15 @@ pub(crate) struct PostTargets {
     /// The resolved opaque scene for water refraction/reflection (resolve target of the opaque pass
     /// while water is visible; the blend pass samples it and resolves the final image into `hdr_view`).
     pub scene_color: GpuTextureView,
-    bloom_views: Vec<GpuTextureView>,
-    bloom_sizes: Vec<(u32, u32)>,
+    bloom: BloomChain,
+}
+
+/// Bloom mips + the post params/bind groups that depend on them (rebuilt by `Post::ensure_bloom`).
+struct BloomChain {
+    /// false: 1x1 placeholder, no bloom pass runs
+    on: bool,
+    views: Vec<GpuTextureView>,
+    sizes: Vec<(u32, u32)>,
     params: GpuBuffer,
     pre_group: GpuBindGroup,
     /// down_groups[i] samples mip i (writes mip i+1); up_groups[i] samples mip i (adds onto mip i-1).
@@ -159,9 +166,10 @@ pub(crate) struct Post {
     prefilter: GpuRenderPipeline,
     down: GpuRenderPipeline,
     up: GpuRenderPipeline,
-    /// [gamma-encoded output (canvas), linear output into an sRGB texture (render-to-texture)]
-    composite_canvas: GpuRenderPipeline,
-    composite_srgb: GpuRenderPipeline,
+    /// [gamma-encoded output (canvas), linear output into an sRGB texture (render-to-texture)];
+    /// index 1 = with FXAA (built only without MSAA, used while `RenderSettings::fxaa`)
+    composite_canvas: [Option<GpuRenderPipeline>; 2],
+    composite_srgb: [Option<GpuRenderPipeline>; 2],
     bgl_post: GpuBindGroupLayout,
     bgl_comp: GpuBindGroupLayout,
     sampler: GpuSampler,
@@ -261,15 +269,23 @@ impl Post {
         let up_t = GpuColorTargetState::new(HDR_FORMAT);
         up_t.set_blend(&additive_blend());
         let up = fullscreen(device, &module, &layout_post, "vs_full", "fs_up", up_t, None, "bloom-up")?;
-        let gamma = |on: bool| {
+        let consts = |gamma: bool, fxaa: bool| {
             let o = js_sys::Object::new();
-            let _ = js_sys::Reflect::set(&o, &"GAMMA_OUT".into(), &(if on { 1.0 } else { 0.0 }).into());
-            // no MSAA: anti-aliasing in the composite
-            let _ = js_sys::Reflect::set(&o, &"FXAA".into(), &(if samples == 1 { 1.0 } else { 0.0 }).into());
+            let _ = js_sys::Reflect::set(&o, &"GAMMA_OUT".into(), &(if gamma { 1.0 } else { 0.0 }).into());
+            // no MSAA: anti-aliasing in the composite (RenderSettings::fxaa)
+            let _ = js_sys::Reflect::set(&o, &"FXAA".into(), &(if fxaa { 1.0 } else { 0.0 }).into());
             o
         };
-        let composite_canvas = fullscreen(device, &module, &layout_comp, "vs_composite", "fs_composite", GpuColorTargetState::new(canvas_format), Some(&gamma(true)), "composite")?;
-        let composite_srgb = fullscreen(device, &module, &layout_comp, "vs_composite", "fs_composite", GpuColorTargetState::new(GpuTextureFormat::Rgba8unormSrgb), Some(&gamma(false)), "composite-rtt")?;
+        // [plain, FXAA]; the FXAA variants exist only without MSAA
+        let mut composite_canvas = [None, None];
+        let mut composite_srgb = [None, None];
+        for fx in 0..(if samples == 1 { 2 } else { 1 }) {
+            let l = if fx == 1 { "-fxaa" } else { "" };
+            let fmt = GpuColorTargetState::new(canvas_format);
+            composite_canvas[fx] = Some(fullscreen(device, &module, &layout_comp, "vs_composite", "fs_composite", fmt, Some(&consts(true, fx == 1)), &format!("composite{l}"))?);
+            let fmt = GpuColorTargetState::new(GpuTextureFormat::Rgba8unormSrgb);
+            composite_srgb[fx] = Some(fullscreen(device, &module, &layout_comp, "vs_composite", "fs_composite", fmt, Some(&consts(false, fx == 1)), &format!("composite-rtt{l}"))?);
+        }
 
         // --- sky (opaque pass, far plane, depth less-equal) ---
         let sky_src = crate::renderer::ms_src(&format!("{common}\n{}", include_str!("shaders/sky.wgsl")), samples);
@@ -381,7 +397,7 @@ impl Post {
     }
 
     /// Creates the targets for a `w` x `h` output.
-    pub fn targets(&self, device: &GpuDevice, w: u32, h: u32, depth_format: GpuTextureFormat, samples: u32, label: &str) -> Result<PostTargets, String> {
+    pub fn targets(&self, device: &GpuDevice, w: u32, h: u32, depth_format: GpuTextureFormat, samples: u32, bloom: bool, label: &str) -> Result<PostTargets, String> {
         let tex = |fmt: GpuTextureFormat, size: (u32, u32), usage: u32, samples: u32, mips: u32, l: &str| -> Result<GpuTexture, String> {
             let d = GpuTextureDescriptor::new(fmt, &nums(&[size.0.max(1), size.1.max(1)]), usage);
             d.set_sample_count(samples);
@@ -401,10 +417,30 @@ impl Post {
         // MSAA the opaque pass draws into it and it is copied into the HDR target
         let scene_tex = tex(HDR_FORMAT, (w, h), RA | TB | CS, 1, 1, "scene-color")?;
         let scene_color = scene_tex.create_view().map_err(js_err)?;
+        let chain = self.bloom_chain(device, (w, h), &hdr_view, &depth, bloom, label)?;
+        Ok(PostTargets { size: (w, h), msaa, depth, hdr_view, hdr_tex, scene_tex, scene_color, bloom: chain })
+    }
+
+    /// Allocates (or drops to the 1x1 placeholder) the bloom chain when `bloom` changed since the
+    /// targets were made. Called before `encode`.
+    pub fn ensure_bloom(&self, device: &GpuDevice, t: &mut PostTargets, bloom: bool) -> Result<(), String> {
+        if t.bloom.on != bloom {
+            t.bloom = self.bloom_chain(device, t.size, &t.hdr_view, &t.depth, bloom, "post")?;
+        }
+        Ok(())
+    }
+
+    /// Bloom mip chain, its params and bind groups, and the composite bind group (which binds mip 0).
+    /// Off: one 1x1 mip the composite binds but never samples, and no bloom pass runs.
+    fn bloom_chain(&self, device: &GpuDevice, (w, h): (u32, u32), hdr_view: &GpuTextureView, depth: &GpuTextureView, on: bool, label: &str) -> Result<BloomChain, String> {
+        use gpu_texture_usage::{RENDER_ATTACHMENT as RA, TEXTURE_BINDING as TB};
         // bloom starts at quarter resolution (the glow is soft; half res costs ~4x for no visible gain)
-        let (bw, bh) = ((w / 4).max(1), (h / 4).max(1));
-        let mips = (32 - bw.min(bh).max(1).leading_zeros()).saturating_sub(2).clamp(1, MAX_BLOOM_MIPS);
-        let bloom = tex(HDR_FORMAT, (bw, bh), RA | TB, 1, mips, "bloom")?;
+        let (bw, bh) = if on { ((w / 4).max(1), (h / 4).max(1)) } else { (1, 1) };
+        let mips = if on { (32 - bw.min(bh).max(1).leading_zeros()).saturating_sub(2).clamp(1, MAX_BLOOM_MIPS) } else { 1 };
+        let d = GpuTextureDescriptor::new(HDR_FORMAT, &nums(&[bw, bh]), RA | TB);
+        d.set_mip_level_count(mips);
+        d.set_label(&format!("{label}:bloom"));
+        let bloom = device.create_texture(&d).map_err(js_err)?;
         let mut bloom_views = vec![];
         let mut bloom_sizes = vec![];
         for m in 0..mips {
@@ -431,25 +467,25 @@ impl Post {
                 &self.bgl_post,
             ))
         };
-        let pre_group = group(&hdr_view, 0);
+        let pre_group = group(hdr_view, 0);
         let down_groups = (0..mips).map(|i| group(&bloom_views[i as usize], 1 + i)).collect();
         let up_groups = (0..mips).map(|i| group(&bloom_views[i as usize], 1 + mips + i)).collect();
         let comp_group = device.create_bind_group(&GpuBindGroupDescriptor::new(
             &[
-                GpuBindGroupEntry::new_with_gpu_texture_view(0, &hdr_view),
+                GpuBindGroupEntry::new_with_gpu_texture_view(0, hdr_view),
                 GpuBindGroupEntry::new(1, &self.sampler),
                 slot(slots - 1),
                 GpuBindGroupEntry::new_with_gpu_texture_view(3, &bloom_views[0]),
-                GpuBindGroupEntry::new_with_gpu_texture_view(4, &depth),
+                GpuBindGroupEntry::new_with_gpu_texture_view(4, depth),
             ],
             &self.bgl_comp,
         ));
-        Ok(PostTargets { size: (w, h), msaa, depth, hdr_view, hdr_tex, scene_tex, scene_color, bloom_views, bloom_sizes, params, pre_group, down_groups, up_groups, comp_group })
+        Ok(BloomChain { on, views: bloom_views, sizes: bloom_sizes, params, pre_group, down_groups, up_groups, comp_group })
     }
 
     /// Bloom + composite into `output` (canvas texture or an sRGB render texture).
     pub fn encode(&self, queue: &GpuQueue, enc: &GpuCommandEncoder, t: &PostTargets, s: &crate::renderer::RenderSettings, near_far: (f32, f32), output: &GpuTextureView, srgb_output: bool, transparent: bool, ts: Option<(GpuRenderPassTimestampWrites, GpuRenderPassTimestampWrites)>) -> Result<(), String> {
-        let mips = t.bloom_views.len() as u32;
+        let mips = t.bloom.views.len() as u32;
         let slots = 2 + 2 * mips;
         let mut data = vec![0u8; (slots * SLOT) as usize];
         let mut put = |i: u32, p: PostParams| {
@@ -457,10 +493,10 @@ impl Post {
             data[o..o + std::mem::size_of::<PostParams>()].copy_from_slice(bytemuck::bytes_of(&p));
         };
         let texel = |sz: (u32, u32)| [1.0 / sz.0 as f32, 1.0 / sz.1 as f32];
-        let bloom = s.bloom && s.debug_view == 0;
+        let bloom = s.bloom && t.bloom.on && s.debug_view == 0;
         put(0, PostParams { a: [1.0 / t.size.0 as f32, 1.0 / t.size.1 as f32, s.bloom_threshold, s.bloom_knee], ..Default::default() });
         for i in 0..mips {
-            let [tx, ty] = texel(t.bloom_sizes[i as usize]);
+            let [tx, ty] = texel(t.bloom.sizes[i as usize]);
             put(1 + i, PostParams { a: [tx, ty, 0.0, 0.0], ..Default::default() });
             // larger radius = more weight on the coarse levels
             put(1 + mips + i, PostParams { a: [tx, ty, s.bloom_radius, 0.0], ..Default::default() });
@@ -496,7 +532,7 @@ impl Post {
                 },
             },
         );
-        queue.write_buffer_with_u32_and_u8_slice(&t.params, 0, &data).map_err(js_err)?;
+        queue.write_buffer_with_u32_and_u8_slice(&t.bloom.params, 0, &data).map_err(js_err)?;
 
         let (ts_begin, ts_end) = match ts {
             Some((b, e)) => (Some(b), Some(e)),
@@ -529,14 +565,16 @@ impl Post {
             Ok(())
         };
         if bloom {
-            run(&self.prefilter, &t.pre_group, &t.bloom_views[0], false, "bloom-prefilter")?;
+            run(&self.prefilter, &t.bloom.pre_group, &t.bloom.views[0], false, "bloom-prefilter")?;
             for i in 0..mips.saturating_sub(1) {
-                run(&self.down, &t.down_groups[i as usize], &t.bloom_views[i as usize + 1], false, "bloom-down")?;
+                run(&self.down, &t.bloom.down_groups[i as usize], &t.bloom.views[i as usize + 1], false, "bloom-down")?;
             }
             for i in (1..mips).rev() {
-                run(&self.up, &t.up_groups[i as usize], &t.bloom_views[i as usize - 1], true, "bloom-up")?;
+                run(&self.up, &t.bloom.up_groups[i as usize], &t.bloom.views[i as usize - 1], true, "bloom-up")?;
             }
         }
-        run(if srgb_output { &self.composite_srgb } else { &self.composite_canvas }, &t.comp_group, output, false, "composite")
+        let set = if srgb_output { &self.composite_srgb } else { &self.composite_canvas };
+        let comp = if s.fxaa { set[1].as_ref().or(set[0].as_ref()) } else { set[0].as_ref() };
+        run(comp.ok_or("no composite pipeline")?, &t.bloom.comp_group, output, false, "composite")
     }
 }

@@ -1,0 +1,21 @@
+# Post switches: FXAA (only without MSAA: open the page with ?msaa=1 to see it) and bloom off = no bloom
+# pass, 1x1 placeholder chain, rebuilt when switched on again. Cost check (gpu_ms.post) by hand:
+# ?msaa=1, canvas 200vw x 200vh, render_scale 1: fxaa+bloom 10.5 ms, fxaa 6.7, none 5.4 at 14 Mpx (780M).
+#   node tools/bridge.mjs run games/demo/tests/postfx.txt
+reload
+screen play
+wait 1000
+call render {"fxaa": false, "bloom": false}
+frames 5
+expect render.fxaa == false
+expect render.bloom == false
+screenshot postfx_off.png
+call render {"fxaa": true, "bloom": true}
+frames 5
+expect render.bloom == true
+screenshot postfx_on.png
+call render {"bloom": false}
+frames 3
+call render {"bloom": true}
+frames 3
+expect logs{"level": "error"}.entries.length == 0

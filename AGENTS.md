@@ -180,6 +180,12 @@ normal `cargo` output above it.
   `render config: 1x MSAA (FXAA)`. Graphics menu: `engine::set_msaa_pref(Some(1), reload)` stores the player's choice
   (localStorage, used at the next start over the game's `RenderConfig`; the URL still wins); the sample count is baked
   into pipelines and targets, so it applies on reload.
+  `render {fxaa: false}` (`settings.fxaa`, default true, no effect with MSAA) drops FXAA at runtime: one scene sample
+  per pixel (high-DPI phones: sharper small text). `render {bloom: false}` runs no bloom pass, skips the bloom tap in the
+  composite and shrinks the bloom chain to a 1x1 placeholder (rebuilt when switched on). What stays is the composite
+  itself (one HDR read + tonemap + write, ~0.3 ms/Mpx on a Radeon 780M): at 14 Mpx with `?msaa=1` post was 10.5 ms with
+  FXAA + bloom, 6.7 FXAA only, 5.4 neither, 4.2 with depth darkening / flare / vignette / grain off too.
+  Test: `games/demo/tests/postfx.txt`.
 - **Resolution:** `render {render_scale}` (0.25..1; the canvas backing store has the scene size too, the browser scales it), `auto_resolution` (default on) adapts it to
   `frame_budget_ms` of whole-frame GPU time (`gpu_ms.frame`); every change reallocates the targets (a 20-35 ms
   hitch at 4K), so it jumps once to a scale that fits and changes at most every 4 s; `stats.render` has `width/height` (scene) and `canvas`.

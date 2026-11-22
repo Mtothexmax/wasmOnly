@@ -741,7 +741,14 @@ pub struct RenderSettings {
     pub water_caustics: f32,
     // ---- post-processing ----
     pub exposure: f32,
+    /// Bloom chain (prefilter, down + up passes from quarter resolution). Off: no bloom pass runs,
+    /// the composite skips its bloom tap and the chain's textures shrink to a 1x1 placeholder
+    /// (reallocated when it is switched on again).
     pub bloom: bool,
+    /// FXAA in the composite when the canvas has no MSAA (`RenderConfig { msaa: 1 }`); no effect
+    /// with MSAA. Off: the composite takes one scene sample per pixel instead of FXAA's ~9 taps
+    /// (high-DPI phones: sharper small text, less work per pixel).
+    pub fxaa: bool,
     pub bloom_intensity: f32,
     /// HDR brightness above which pixels bloom (soft knee below).
     pub bloom_threshold: f32,
@@ -876,6 +883,7 @@ impl Default for RenderSettings {
             water_caustics: 1.0,
             exposure: 1.0,
             bloom: true,
+            fxaa: true,
             bloom_intensity: 0.35,
             bloom_threshold: 1.2,
             bloom_knee: 0.6,
@@ -2656,7 +2664,7 @@ impl Renderer {
         vd.set_mip_level_count(1);
         let view0 = tex.create_view_with_descriptor(&vd).map_err(js_err)?;
         let texture = self.push_texture_view(&full, TexInfo { tex: Some(tex.clone()), label: label.into(), width: w, height: h, mips, uploads: 0, linear: false });
-        let targets = self.post.targets(&self.device, w, h, DEPTH_FORMAT, self.samples, label)?;
+        let targets = self.post.targets(&self.device, w, h, DEPTH_FORMAT, self.samples, self.settings.bloom, label)?;
         self.rtts.push(crate::render_texture::RenderTexture {
             size: (w, h),
             texture,
@@ -2978,7 +2986,7 @@ impl Renderer {
             return;
         }
         self.size = (w, h);
-        match self.post.targets(&self.device, w, h, DEPTH_FORMAT, self.samples, "canvas") {
+        match self.post.targets(&self.device, w, h, DEPTH_FORMAT, self.samples, self.settings.bloom, "canvas") {
             Ok(t) => {
                 self.msaa_view = Some(t.msaa.clone());
                 self.depth_view = Some(t.depth.clone());
@@ -4518,11 +4526,15 @@ impl Renderer {
                 None => {
                     let surface = self.context.get_current_texture().map_err(js_err)?;
                     let surface_view = surface.create_view().map_err(js_err)?;
+                    if let Some(t) = self.targets.as_mut() {
+                        self.post.ensure_bloom(&self.device, t, self.settings.bloom)?;
+                    }
                     if let Some(t) = &self.targets {
                         self.post.encode(&self.queue, &encoder, t, &self.settings, nf, &surface_view, false, false, ts)?;
                     }
                 }
                 Some(i) => {
+                    self.post.ensure_bloom(&self.device, &mut self.rtts[i].targets, self.settings.bloom)?;
                     let rt = &self.rtts[i];
                     self.post.encode(&self.queue, &encoder, &rt.targets, &self.settings, nf, &rt.view0, true, rt.opts.transparent, ts)?;
                 }
