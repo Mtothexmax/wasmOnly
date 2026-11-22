@@ -148,6 +148,9 @@ struct BloomChain {
 
 pub(crate) struct Post {
     pub sky_pipeline: GpuRenderPipeline,
+    /// Direct-output variants (LDR canvas view, tonemap in the shader): sky, (additive, alpha) particles.
+    pub sky_ldr: Option<GpuRenderPipeline>,
+    pub particle_ldr: Option<(GpuRenderPipeline, GpuRenderPipeline)>,
     /// Exposure multiplier from the day/night cycle (set by the renderer each frame).
     pub exposure_mul: f32,
     /// Frame counter for the animated film grain.
@@ -173,6 +176,13 @@ pub(crate) struct Post {
     bgl_post: GpuBindGroupLayout,
     bgl_comp: GpuBindGroupLayout,
     sampler: GpuSampler,
+}
+
+/// Pipeline constants of the direct-output (LDR) variants.
+pub(crate) fn ldr_consts() -> js_sys::Object {
+    let o = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(&o, &"LDR_OUT".into(), &1.0.into());
+    o
 }
 
 fn js_err(e: wasm_bindgen::JsValue) -> String {
@@ -222,7 +232,9 @@ fn alpha_blend() -> GpuBlendState {
 }
 
 impl Post {
-    pub fn new(device: &GpuDevice, canvas_format: GpuTextureFormat, common: &str, bgl0: &GpuBindGroupLayout, bgl0_t: &GpuBindGroupLayout, depth_format: GpuTextureFormat, samples: u32) -> Result<Self, String> {
+    /// `ldr_format`: the canvas view format of the direct output (`RenderConfig::direct_output`); when
+    /// set, sky and particles also get LDR variants that tonemap in the fragment shader.
+    pub fn new(device: &GpuDevice, canvas_format: GpuTextureFormat, common: &str, bgl0: &GpuBindGroupLayout, bgl0_t: &GpuBindGroupLayout, depth_format: GpuTextureFormat, samples: u32, ldr_format: Option<GpuTextureFormat>) -> Result<Self, String> {
         let module = device.create_shader_module(&GpuShaderModuleDescriptor::new(&crate::renderer::ms_src(include_str!("shaders/post.wgsl"), samples)));
         module.set_label("post.wgsl");
         crate::debug::report_shader_errors(&module, "post.wgsl");
@@ -297,17 +309,24 @@ impl Post {
         ms.set_count(samples);
         let vs = GpuVertexState::new(&sky_module);
         vs.set_entry_point("vs_sky");
-        let fs = GpuFragmentState::new(&sky_module, &[JsNullable::wrap(GpuColorTargetState::new(HDR_FORMAT))]);
-        fs.set_entry_point("fs_sky");
-        let ds = GpuDepthStencilState::new(depth_format);
-        ds.set_depth_write_enabled(false);
-        ds.set_depth_compare(GpuCompareFunction::LessEqual);
-        let d = GpuRenderPipelineDescriptor::new(&layout_sky, &vs);
-        d.set_label("sky");
-        d.set_fragment(&fs);
-        d.set_depth_stencil(&ds);
-        d.set_multisample(&ms);
-        let sky_pipeline = device.create_render_pipeline(&d).map_err(js_err)?;
+        let sky = |fmt: GpuTextureFormat, ldr: bool| -> Result<GpuRenderPipeline, String> {
+            let fs = GpuFragmentState::new(&sky_module, &[JsNullable::wrap(GpuColorTargetState::new(fmt))]);
+            fs.set_entry_point("fs_sky");
+            if ldr {
+                fs.set_constants(ldr_consts().unchecked_ref());
+            }
+            let ds = GpuDepthStencilState::new(depth_format);
+            ds.set_depth_write_enabled(false);
+            ds.set_depth_compare(GpuCompareFunction::LessEqual);
+            let d = GpuRenderPipelineDescriptor::new(&layout_sky, &vs);
+            d.set_label(if ldr { "sky-ldr" } else { "sky" });
+            d.set_fragment(&fs);
+            d.set_depth_stencil(&ds);
+            d.set_multisample(&ms);
+            device.create_render_pipeline(&d).map_err(js_err)
+        };
+        let sky_pipeline = sky(HDR_FORMAT, false)?;
+        let sky_ldr = ldr_format.map(|f| sky(f, true)).transpose()?;
 
         // --- particles (blend pass) ---
         let p_src = crate::renderer::ms_src(&format!("{common}\n{}", include_str!("shaders/particles.wgsl")), samples);
@@ -323,13 +342,16 @@ impl Post {
             JsNullable::wrap(bgl0_t.clone()),
             JsNullable::wrap(bgl_particles.clone()),
         ]));
-        let particle = |fs_entry: &str, blend: GpuBlendState, label: &str| -> Result<GpuRenderPipeline, String> {
+        let particle = |fs_entry: &str, blend: GpuBlendState, label: &str, fmt: GpuTextureFormat, ldr: bool| -> Result<GpuRenderPipeline, String> {
             let vs = GpuVertexState::new(&p_module);
             vs.set_entry_point("vs_particle");
-            let t = GpuColorTargetState::new(HDR_FORMAT);
+            let t = GpuColorTargetState::new(fmt);
             t.set_blend(&blend);
             let fs = GpuFragmentState::new(&p_module, &[JsNullable::wrap(t)]);
             fs.set_entry_point(fs_entry);
+            if ldr {
+                fs.set_constants(ldr_consts().unchecked_ref());
+            }
             let ds = GpuDepthStencilState::new(depth_format);
             ds.set_depth_write_enabled(false);
             ds.set_depth_compare(GpuCompareFunction::Less);
@@ -343,8 +365,12 @@ impl Post {
             d.set_primitive(&prim);
             device.create_render_pipeline(&d).map_err(js_err)
         };
-        let particle_additive = particle("fs_additive", additive_blend(), "particles-add")?;
-        let particle_alpha = particle("fs_alpha", alpha_blend(), "particles-alpha")?;
+        let particle_additive = particle("fs_additive", additive_blend(), "particles-add", HDR_FORMAT, false)?;
+        let particle_alpha = particle("fs_alpha", alpha_blend(), "particles-alpha", HDR_FORMAT, false)?;
+        let particle_ldr = match ldr_format {
+            Some(f) => Some((particle("fs_additive", additive_blend(), "particles-add-ldr", f, true)?, particle("fs_alpha", alpha_blend(), "particles-alpha-ldr", f, true)?)),
+            None => None,
+        };
         let particle_cap = 1024;
         let (particle_buf, particle_group) = Self::make_particle_buf(device, &bgl_particles, particle_cap)?;
 
@@ -354,6 +380,8 @@ impl Post {
         let sampler = device.create_sampler_with_descriptor(&sd);
         Ok(Self {
             sky_pipeline,
+            sky_ldr,
+            particle_ldr,
             exposure_mul: 1.0,
             grain_frame: 0,
             flare: ([0.0; 4], [0.0; 4]),

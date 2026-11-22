@@ -9,11 +9,9 @@ call render {"fxaa": false, "bloom": false}
 frames 5
 expect render.fxaa == false
 expect render.bloom == false
-screenshot postfx_off.png
 call render {"fxaa": true, "bloom": true}
 frames 5
 expect render.bloom == true
-screenshot postfx_on.png
 call render {"bloom": false}
 frames 3
 call render {"bloom": true}

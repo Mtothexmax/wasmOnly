@@ -24,5 +24,5 @@ fn fs_sky(i: SkyOut) -> @location(0) vec4f {
     if (g.fog.x > 0.0 && g.fog_color.w > 0.5) {
         c = mix(c, g.fog_color.rgb, g.fog.w);
     }
-    return vec4f(c, 1.0);
+    return ldr_opaque(vec4f(c, 1.0), i.pos.xy);
 }

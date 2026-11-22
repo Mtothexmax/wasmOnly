@@ -51,6 +51,7 @@ struct Globals {
     cascade_offset: array<vec4f, 4>,
     pushers: array<vec4f, 16>, // xyz = position, w = radius: bendable geometry leans away (`set_pushers`)
     push: vec4f,               // x = pusher count, yz = wind (xz direction * strength) for Material::bend, w = ambient specular
+    ldr: vec4f,                // direct output: x = exposure (incl. day/night), y = saturation, z = vignette
 }
 
 // Lean of a point `h` metres above its base `base` away from the pushers (xz offset grows with
@@ -322,4 +323,40 @@ fn apply_fog(color: vec3f, world: vec3f) -> vec3f {
     let f = fog_amount(world);
     if (f <= 0.0) { return color; }
     return mix(color, fog_color(world), f);
+}
+
+// --- Direct output (RenderConfig::direct_output) ---------------------------------------------------
+// The LDR pipeline variants draw the main view straight into the canvas (sRGB view: the hardware
+// encodes and blends in linear) and run the composite's colour chain at the end of each fragment
+// shader: exposure, ACES, saturation, classic vignette. Only used while nothing else of the composite
+// is on (bloom, FXAA, depth darkening, lens flare, grade, grain, masking vignette).
+override LDR_OUT: bool = false;
+
+fn ldr_tonemap(c: vec3f, frag: vec2f) -> vec3f {
+    let ok = (c >= vec3f(0.0)) & (c <= vec3f(6.0e4));
+    let x = select(vec3f(0.0), min(c, vec3f(2.0e3)), ok) * g.ldr.x;
+    var m = clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), vec3f(0.0), vec3f(1.0));
+    let l = dot(m, vec3f(0.2126, 0.7152, 0.0722));
+    m = clamp(mix(vec3f(l), m, g.ldr.y), vec3f(0.0), vec3f(1.0));
+    let v = frag * g.screen.zw - 0.5;
+    return m * (1.0 - g.ldr.z * dot(v, v) * 1.6);
+}
+
+// Opaque output: alpha is the tonemap mask (0 = UI panel / debug view, shown as it is).
+fn ldr_opaque(o: vec4f, frag: vec2f) -> vec4f {
+    if (!LDR_OUT) { return o; }
+    return vec4f(mix(o.rgb, ldr_tonemap(o.rgb, frag), clamp(o.a, 0.0, 1.0)), 1.0);
+}
+
+// Blended output: alpha is coverage, colour always tonemapped.
+fn ldr_blended(o: vec4f, frag: vec2f) -> vec4f {
+    if (!LDR_OUT) { return o; }
+    return vec4f(ldr_tonemap(o.rgb, frag), o.a);
+}
+
+// Additive output (glow particles): ACES' toe would swallow small additions, so exposure only
+// (the curve's mid-range slope is ~1).
+fn ldr_additive(o: vec4f) -> vec4f {
+    if (!LDR_OUT) { return o; }
+    return vec4f(o.rgb * g.ldr.x, o.a);
 }

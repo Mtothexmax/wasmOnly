@@ -665,8 +665,16 @@ async fn start<G: Game>(game: G, mut config: crate::renderer::RenderConfig) -> R
     if let Some(m) = query.trim_start_matches('?').split('&').find_map(|kv| kv.strip_prefix("msaa=")).and_then(|v| v.parse::<u32>().ok()) {
         config.msaa = m;
     }
+    if let Some(d) = query.trim_start_matches('?').split('&').find_map(|kv| kv.strip_prefix("direct=")) {
+        config.direct_output = d == "1" || d == "true";
+    }
     let renderer = Renderer::new(&canvas, config).await?;
-    log_info!("render config: {}x MSAA{}", renderer.samples, if renderer.samples == 1 { " (FXAA)" } else { "" });
+    log_info!(
+        "render config: {}x MSAA{}{}",
+        renderer.samples,
+        if renderer.samples == 1 { " (FXAA)" } else { "" },
+        if renderer.direct_output_built() { ", direct output" } else if config.direct_output { ", direct output needs msaa 1" } else { "" }
+    );
     debug::install_gpu_error_handler(&renderer.device);
     let ui = Ui::new(&document).map_err(|e| format!("ui: {e:?}"))?;
 

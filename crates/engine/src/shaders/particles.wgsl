@@ -77,11 +77,11 @@ fn particle_alpha(i: POut) -> f32 {
 fn fs_additive(i: POut) -> @location(0) vec4f {
     let a = particle_alpha(i);
     let f = fog_amount(i.world);
-    return vec4f(i.color.rgb * a * (1.0 - f), 0.0);
+    return ldr_additive(vec4f(i.color.rgb * a * (1.0 - f), 0.0));
 }
 
 @fragment
 fn fs_alpha(i: POut) -> @location(0) vec4f {
     let a = particle_alpha(i);
-    return vec4f(apply_fog(i.color.rgb, i.world), a);
+    return ldr_blended(vec4f(apply_fog(i.color.rgb, i.world), a), i.clip.xy);
 }

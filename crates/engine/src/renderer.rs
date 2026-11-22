@@ -22,12 +22,31 @@ pub struct RenderConfig {
     /// Samples per pixel of the scene targets: 4 = 4x MSAA (default), 1 = no MSAA, FXAA in the
     /// composite instead (much less bandwidth: integrated and mobile GPUs).
     pub msaa: u32,
+    /// Direct output (only with `msaa: 1`): builds a second set of scene pipelines that tonemap in
+    /// the fragment shader and draw the main view straight into the canvas (no HDR target, no
+    /// composite pass) while nothing else of the composite is on: `settings.direct_output` and
+    /// `stats.render.direct_output` / `direct_blocked`. Costs the extra pipelines at startup. URL `?direct=1|0`.
+    pub direct_output: bool,
 }
 
 impl Default for RenderConfig {
     fn default() -> Self {
-        RenderConfig { msaa: 4 }
+        RenderConfig { msaa: 4, direct_output: false }
     }
+}
+
+/// Pipelines that write the scene colour target: one set for the HDR target, one (optional) for the
+/// direct LDR output. Cloned per frame (JS handles).
+#[derive(Clone)]
+struct ScenePipes {
+    pipelines: [GpuRenderPipeline; 6],
+    pipeline_broken: [Rc<Cell<bool>>; 6],
+    prepass: [GpuRenderPipeline; 4],
+    prepass_broken: [Rc<Cell<bool>>; 4],
+    fade: [GpuRenderPipeline; 4],
+    sky: GpuRenderPipeline,
+    particle_additive: GpuRenderPipeline,
+    particle_alpha: GpuRenderPipeline,
 }
 
 const MSAA_PREF_KEY: &str = "wasmonly.msaa";
@@ -749,6 +768,10 @@ pub struct RenderSettings {
     /// with MSAA. Off: the composite takes one scene sample per pixel instead of FXAA's ~9 taps
     /// (high-DPI phones: sharper small text, less work per pixel).
     pub fxaa: bool,
+    /// Use the direct output when the game started with `RenderConfig { msaa: 1, direct_output: true }`
+    /// and the frame allows it (no bloom, FXAA, depth darkening, lens flare, grade, grain, masking
+    /// vignette, debug view, water or GPU grass in the main view). Default true.
+    pub direct_output: bool,
     pub bloom_intensity: f32,
     /// HDR brightness above which pixels bloom (soft knee below).
     pub bloom_threshold: f32,
@@ -884,6 +907,7 @@ impl Default for RenderSettings {
             exposure: 1.0,
             bloom: true,
             fxaa: true,
+            direct_output: true,
             bloom_intensity: 0.35,
             bloom_threshold: 1.2,
             bloom_knee: 0.6,
@@ -947,6 +971,10 @@ pub struct FrameStats {
     pub shadow_cascades_rendered: Vec<bool>,
     /// Hi-Z occlusion culling ran this frame (off: too little geometry, or auto off).
     pub hiz_active: bool,
+    /// The main view went straight into the canvas (LDR pipelines, no composite pass).
+    pub direct_output: bool,
+    /// Why not (empty when active): "not built" (RenderConfig), "off", "bloom", "fxaa", ...
+    pub direct_blocked: &'static str,
     /// Instance record slots in use (stable per entity).
     pub instance_slots: u32,
     /// Instance records + id lists uploaded this frame (only what changed), bytes.
@@ -1044,6 +1072,8 @@ struct Globals {
     cascade_offset: [[f32; 4]; MAX_CASCADES],
     pushers: [[f32; 4]; MAX_PUSHERS],
     push: [f32; 4],
+    /// Direct output: exposure (incl. day/night), saturation, vignette.
+    ldr: [f32; 4],
 }
 
 /// Pushers per frame (`Renderer::set_pushers`).
@@ -1247,6 +1277,8 @@ pub struct Renderer {
     msaa_view: Option<GpuTextureView>,
     /// Samples per pixel of the scene targets (`RenderConfig::msaa`): 4, or 1 (FXAA).
     pub samples: u32,
+    /// Direct output: LDR pipeline set + the sRGB canvas view format (`RenderConfig::direct_output`).
+    ldr: Option<(ScenePipes, GpuTextureFormat)>,
     depth_view: Option<GpuTextureView>,
     /// Desktop GPU (AMD / NVIDIA / Intel: immediate-mode rendering) as opposed to a tile-based
     /// mobile GPU. Decides the load/store ops of the multisampled scene target: clears and discards
@@ -1400,6 +1432,16 @@ impl Renderer {
         let format = gpu.get_preferred_canvas_format();
         let cfg = GpuCanvasConfiguration::new(&device, format);
         cfg.set_alpha_mode(GpuCanvasAlphaMode::Opaque);
+        // direct output draws through an sRGB view of the canvas (hardware encode, linear blending)
+        let ldr_format = match format {
+            _ if samples != 1 || !config.direct_output => None,
+            GpuTextureFormat::Bgra8unorm => Some(GpuTextureFormat::Bgra8unormSrgb),
+            GpuTextureFormat::Rgba8unorm => Some(GpuTextureFormat::Rgba8unormSrgb),
+            _ => None,
+        };
+        if let Some(f) = ldr_format {
+            cfg.set_view_formats(&[JsValue::from(f).unchecked_into()]);
+        }
         context.configure(&cfg).map_err(js_err)?;
 
         // --- Bind group layouts ---------------------------------------------------------
@@ -1562,12 +1604,13 @@ impl Renderer {
         // kind 0 = opaque (no discard -> early-Z), 1 = alpha-test / UI, 2 = blend.
         // variant: 0 = normal, 1 = depth prepass (depth only), 2 = after a prepass (depth equal, no write),
         // 3 = blended with depth equal (solid fade colour), 4 = depth only without colour target (solid fade depth)
-        let make_pipeline_v = |kind: u8, two_sided: bool, variant: u8| -> Result<(GpuRenderPipeline, Rc<Cell<bool>>), String> {
+        // ldr: Some(canvas view format) = direct-output variant (tonemaps in the shader)
+        let make_pipeline_f = |kind: u8, two_sided: bool, variant: u8, ldr: Option<GpuTextureFormat>| -> Result<(GpuRenderPipeline, Rc<Cell<bool>>), String> {
             let blend = kind == 2;
             let vs = GpuVertexState::new(&pbr_module);
             vs.set_entry_point("vs_main");
             vs.set_buffers(&[JsNullable::wrap(vertex_layout())]);
-            let target = GpuColorTargetState::new(crate::post::HDR_FORMAT);
+            let target = GpuColorTargetState::new(ldr.unwrap_or(crate::post::HDR_FORMAT));
             if blend {
                 let c = GpuBlendComponent::new();
                 c.set_src_factor(GpuBlendFactor::SrcAlpha);
@@ -1586,6 +1629,9 @@ impl Renderer {
             fs.set_entry_point(if blend { "fs_blend" } else if variant == 1 { "fs_depth" } else { "fs_main" });
             let consts = js_sys::Object::new();
             let _ = js_sys::Reflect::set(&consts, &"ALPHA_TEST".into(), &(if kind == 0 { 0.0 } else { 1.0 }).into());
+            if ldr.is_some() {
+                let _ = js_sys::Reflect::set(&consts, &"LDR_OUT".into(), &1.0.into());
+            }
             fs.set_constants(consts.unchecked_ref());
             let prim = GpuPrimitiveState::new();
             prim.set_topology(GpuPrimitiveTopology::TriangleList);
@@ -1613,6 +1659,8 @@ impl Renderer {
                 4 => if two_sided { "pbr-fade-depth-2s" } else { "pbr-fade-depth" },
                 _ => label,
             };
+            let label = if ldr.is_some() { format!("{label}-ldr") } else { label.to_string() };
+            let label = label.as_str();
             desc.set_label(label);
             if variant != 4 {
                 desc.set_fragment(&fs);
@@ -1622,7 +1670,19 @@ impl Renderer {
             desc.set_multisample(&ms);
             crate::debug::create_pipeline_guarded(&device, &desc, label)
         };
+        let make_pipeline_v = |kind: u8, two_sided: bool, variant: u8| make_pipeline_f(kind, two_sided, variant, None);
         let make_pipeline = |kind: u8, two_sided: bool| make_pipeline_v(kind, two_sided, 0);
+        // direct output: the same variants into the sRGB canvas view (sky + particles come from Post)
+        let ldr_pbr = match ldr_format {
+            Some(f) => {
+                let m = |k: u8, ts: bool, v: u8| make_pipeline_f(k, ts, v, Some(f));
+                let main = [m(0, false, 0)?, m(0, true, 0)?, m(1, false, 0)?, m(1, true, 0)?, m(2, false, 0)?, m(2, true, 0)?];
+                let pre = [m(0, false, 1)?, m(0, true, 1)?, m(0, false, 2)?, m(0, true, 2)?];
+                let fade = [m(0, false, 4)?, m(0, true, 4)?, m(2, false, 3)?, m(2, true, 3)?];
+                Some((main, pre, fade, f))
+            }
+            None => None,
+        };
         let prepass_built = [make_pipeline_v(0, false, 1)?, make_pipeline_v(0, true, 1)?, make_pipeline_v(0, false, 2)?, make_pipeline_v(0, true, 2)?];
         let prepass_broken: [Rc<Cell<bool>>; 4] = std::array::from_fn(|i| prepass_built[i].1.clone());
         let prepass_pipelines: [GpuRenderPipeline; 4] = prepass_built.map(|b| b.0);
@@ -1778,7 +1838,23 @@ impl Renderer {
             None => (None, None),
         };
 
-        let post = crate::post::Post::new(&device, format, common, &bgl0, &bgl0_t, DEPTH_FORMAT, samples)?;
+        let post = crate::post::Post::new(&device, format, common, &bgl0, &bgl0_t, DEPTH_FORMAT, samples, ldr_format)?;
+        let ldr = match (ldr_pbr, &post.sky_ldr, &post.particle_ldr) {
+            (Some((main, pre, fade, f)), Some(sky), Some((pa, pb))) => Some((
+                ScenePipes {
+                    pipeline_broken: std::array::from_fn(|i| main[i].1.clone()),
+                    pipelines: main.map(|b| b.0),
+                    prepass_broken: std::array::from_fn(|i| pre[i].1.clone()),
+                    prepass: pre.map(|b| b.0),
+                    fade: fade.map(|b| b.0),
+                    sky: sky.clone(),
+                    particle_additive: pa.clone(),
+                    particle_alpha: pb.clone(),
+                },
+                f,
+            )),
+            _ => None,
+        };
         let grass = crate::vegetation::GrassRenderer::new(&device, &pbr_module, &bgl0, &bgl_mat, crate::post::HDR_FORMAT, DEPTH_FORMAT, samples)?;
         let timing = if timing_supported {
             crate::gpu_timing::GpuTiming::new(&device).map_err(|e| crate::log_warn!("GPU timing disabled: {e}")).ok()
@@ -1857,6 +1933,7 @@ impl Renderer {
             color_sampler,
             msaa_view: None,
             samples,
+            ldr,
             depth_view: None,
             post,
             grass,
@@ -2139,6 +2216,124 @@ impl Renderer {
             self.first_use_log.push(name);
             self.first_use_frame = self.render_frames;
         }
+    }
+
+    /// Whether the direct-output pipeline set exists (`RenderConfig { msaa: 1, direct_output: true }`).
+    pub fn direct_output_built(&self) -> bool {
+        self.ldr.is_some()
+    }
+
+    /// The HDR pipeline set (see `ScenePipes`).
+    fn hdr_pipes(&self) -> ScenePipes {
+        ScenePipes {
+            pipelines: self.pipelines.clone(),
+            pipeline_broken: self.pipeline_broken.clone(),
+            prepass: self.prepass_pipelines.clone(),
+            prepass_broken: self.prepass_broken.clone(),
+            fade: self.fade_pipelines.clone(),
+            sky: self.post.sky_pipeline.clone(),
+            particle_additive: self.post.particle_additive.clone(),
+            particle_alpha: self.post.particle_alpha.clone(),
+        }
+    }
+
+    /// Why this view cannot use the direct output ("" = it can): something the composite would add.
+    fn direct_blocked(&self, main: bool, has_water: bool, grass_blades: u32) -> &'static str {
+        let s = &self.settings;
+        if !main {
+            "render texture"
+        } else if self.ldr.is_none() {
+            "not built"
+        } else if !s.direct_output {
+            "off"
+        } else if s.debug_view != 0 {
+            "debug_view"
+        } else if s.bloom {
+            "bloom"
+        } else if s.fxaa {
+            "fxaa"
+        } else if s.depth_darkening > 0.0 {
+            "depth_darkening"
+        } else if s.lens_flare > 0.0 {
+            "lens_flare"
+        } else if s.grade != crate::post::Grade::default() {
+            "grade"
+        } else if s.grain > 0.0 {
+            "grain"
+        } else if s.vignette_radius > 0.0 {
+            "vignette_radius"
+        } else if has_water {
+            "water"
+        } else if grass_blades > 0 {
+            "grass"
+        } else {
+            ""
+        }
+    }
+
+    /// Clear colour of the direct output: exposure, ACES, saturation (linear, the sRGB view encodes).
+    fn ldr_clear(&self, c: Vec3) -> Vec3 {
+        let s = &self.settings;
+        let x = c.max(Vec3::ZERO) * s.exposure * self.sky.exposure_mul;
+        let m = ((x * (x * 2.51 + 0.03)) / (x * (x * 2.43 + 0.59) + 0.14)).clamp(Vec3::ZERO, Vec3::ONE);
+        let l = m.dot(Vec3::new(0.2126, 0.7152, 0.0722));
+        (Vec3::splat(l) + (m - Vec3::splat(l)) * s.saturation).clamp(Vec3::ZERO, Vec3::ONE)
+    }
+
+    /// One triangle per direct-output pipeline into a 1x1 colour (canvas view format) + depth target.
+    fn prewarm_ldr(&self, encoder: &GpuCommandEncoder, lp: &ScenePipes, format: GpuTextureFormat, mg: &GpuBindGroup, mesh: usize) -> Result<(), String> {
+        use gpu_texture_usage::RENDER_ATTACHMENT as RA;
+        let tex = |f: GpuTextureFormat| self.device.create_texture(&GpuTextureDescriptor::new(f, &nums(&[1, 1]), RA)).map_err(js_err)?.create_view().map_err(js_err);
+        let (color, depth) = (tex(format)?, tex(DEPTH_FORMAT)?);
+        let att = GpuRenderPassColorAttachment::new_with_gpu_texture_view(GpuLoadOp::Clear, GpuStoreOp::Discard, &color);
+        let datt = GpuRenderPassDepthStencilAttachment::new_with_gpu_texture_view(&depth);
+        datt.set_depth_clear_value(1.0);
+        datt.set_depth_load_op(GpuLoadOp::Clear);
+        datt.set_depth_store_op(GpuStoreOp::Discard);
+        let desc = GpuRenderPassDescriptor::new(&[JsNullable::wrap(att)]);
+        desc.set_depth_stencil_attachment(&datt);
+        desc.set_label("prewarm-direct");
+        let pass = encoder.begin_render_pass(&desc).map_err(js_err)?;
+        let m = &self.meshes[mesh];
+        let tri = |p: &GpuRenderPipeline| {
+            pass.set_pipeline(p);
+            pass.set_bind_group(1, Some(mg));
+            pass.set_vertex_buffer(0, Some(&m.vb));
+            pass.set_index_buffer(&m.ib, GpuIndexFormat::Uint32);
+            pass.draw_indexed_with_instance_count_and_first_index_and_base_vertex_and_first_instance(3, 1, 0, 0, 0);
+        };
+        pass.set_bind_group(0, Some(&self.bind0));
+        for i in 0..4 {
+            if !lp.pipeline_broken[i].get() {
+                tri(&lp.pipelines[i]);
+            }
+        }
+        for i in 0..4 {
+            if !lp.prepass_broken[i].get() {
+                tri(&lp.prepass[i]);
+            }
+        }
+        pass.set_pipeline(&lp.sky);
+        pass.draw(3);
+        if let Some(b0t) = &self.bind0_t {
+            pass.set_bind_group(0, Some(b0t));
+            for i in 4..6 {
+                if !lp.pipeline_broken[i].get() {
+                    tri(&lp.pipelines[i]);
+                }
+            }
+            if self.settings.solid_fade {
+                tri(&lp.fade[2]);
+                tri(&lp.fade[3]);
+            }
+            pass.set_bind_group(1, Some(&self.post.particle_group));
+            pass.set_pipeline(&lp.particle_additive);
+            pass.draw_with_instance_count_and_first_vertex_and_first_instance(6, 1, 0, 0);
+            pass.set_pipeline(&lp.particle_alpha);
+            pass.draw_with_instance_count_and_first_vertex_and_first_instance(6, 1, 0, 0);
+        }
+        pass.end();
+        Ok(())
     }
 
     /// Draws one triangle of the first usable mesh with `pipeline` into a 1x1 scissor (prewarm).
@@ -3372,6 +3567,7 @@ impl Renderer {
                 let w = self.grass.settings.wind;
                 [self.push_count as f32, w[0] * w[2], w[1] * w[2], s.ambient_specular.max(0.0)]
             },
+            ldr: [s.exposure * self.sky.exposure_mul, s.saturation, s.vignette, 0.0],
         };
 
         // --- Instances -------------------------------------------------------------------------
@@ -4199,7 +4395,11 @@ impl Renderer {
         if warm_mesh.is_some() {
             self.prewarm_pending = false;
             self.prewarmed = true;
-            crate::log_info!("prewarm: mask, blend{} and depth-equal pipelines drawn once (1x1)", if self.settings.solid_fade { ", solid fade" } else { "" });
+            crate::log_info!(
+                "prewarm: mask, blend{} and depth-equal pipelines drawn once (1x1){}",
+                if self.settings.solid_fade { ", solid fade" } else { "" },
+                if self.ldr.is_some() { ", plus the direct-output set" } else { "" }
+            );
         } else if main {
             if !solid_runs.is_empty() {
                 self.first_use(1, "solid fade (depth target + pipelines)");
@@ -4210,12 +4410,39 @@ impl Renderer {
         }
         let warm_solid = warm_mesh.is_some() && self.settings.solid_fade && self.fade_broken.iter().all(|b| !b.get());
         let skip_blend = warm_mesh.is_none() && blend_runs.is_empty() && solid_runs.is_empty() && n_add + n_alpha == 0 && !has_water;
+        // Direct output: the main view goes straight into an sRGB view of the canvas with the LDR
+        // pipeline set (tonemap in the fragment shaders) when the composite would only tonemap.
+        let mut direct_why = self.direct_blocked(main, has_water, grass_blades);
+        let mut direct_view = None;
+        if direct_why.is_empty() {
+            if let Some((_, f)) = &self.ldr {
+                let tex = self.context.get_current_texture().map_err(js_err)?;
+                if (tex.width(), tex.height()) == self.size {
+                    let d = GpuTextureViewDescriptor::new();
+                    d.set_format(*f);
+                    direct_view = Some(tex.create_view_with_descriptor(&d).map_err(js_err)?);
+                } else {
+                    direct_why = "size"; // canvas backing store differs from the scene size
+                }
+            }
+        }
+        if main {
+            stats.direct_output = direct_view.is_some();
+            stats.direct_blocked = direct_why;
+        }
+        if main && direct_view.is_some() {
+            self.first_use(8, "direct output (LDR pipelines)");
+        }
+        let sp = match (&direct_view, &self.ldr) {
+            (Some(_), Some((p, _))) => p.clone(),
+            _ => self.hdr_pipes(),
+        };
         // --- Opaque pass (indirect on the GPU path); keeps colour + depth for the blend pass ---
         {
             // without MSAA: the scene is drawn straight into the HDR target (into scene_color while
             // water samples it, copied into the HDR target before the blend pass)
             let single = self.samples == 1;
-            let opaque_target = if single && has_water { &scene_color } else { &msaa };
+            let opaque_target = if let Some(v) = &direct_view { v } else if single && has_water { &scene_color } else { &msaa };
             let att = GpuRenderPassColorAttachment::new_with_gpu_texture_view(GpuLoadOp::Clear, GpuStoreOp::Store, opaque_target);
             if single {
             } else if skip_blend {
@@ -4228,10 +4455,15 @@ impl Renderer {
                 // the blend pass samples (no extra full-screen copy)
                 att.set_resolve_target_gpu_texture_view(&scene_color);
             }
-            let cc = self.settings.clear_color; // linear HDR target, alpha 1 = tonemapped
+            let mut cc = self.settings.clear_color; // linear HDR target, alpha 1 = tonemapped
+            if direct_view.is_some() {
+                cc = self.ldr_clear(cc); // the composite's tonemap, on the CPU (no vignette)
+            }
             let clear_a = if rtt.is_some_and(|i| self.rtts[i].opts.transparent) { 0.0 } else { 1.0 };
             att.set_clear_value_gpu_color_dict(&GpuColorDict::new(clear_a, cc.z as f64, cc.y as f64, cc.x as f64));
-            if self.immediate_gpu && self.settings.sky && clear_a == 1.0 {
+            // (not on the canvas texture of the direct output: it is fresh every frame, a load would make
+            // the browser clear it first)
+            if self.immediate_gpu && self.settings.sky && clear_a == 1.0 && direct_view.is_none() {
                 // The sky pass at the end writes every sample no geometry covered, so nothing of
                 // the old content survives and the clear of the 4x HDR target (about 1 ms at 1440p
                 // on an integrated desktop GPU) is pure overhead. Tile-based GPUs keep the clear:
@@ -4256,7 +4488,7 @@ impl Renderer {
                 let args = self.scene_gpu.as_ref().unwrap().args_buf.clone();
                 let near = rb.as_ref().map(|r| r.1.as_slice()).unwrap_or(&[]);
                 let order = self.scene.draw_order(near, self.settings.reverse_draw_order, &planes, cam_pos, lod_bias);
-                let prepass = self.settings.depth_prepass && self.prepass_broken.iter().all(|b| !b.get());
+                let prepass = self.settings.depth_prepass && sp.prepass_broken.iter().all(|b| !b.get());
                 if prepass {
                     // depth only for every opaque group (alpha-tested ones are shaded normally below)
                     let mut bound = usize::MAX;
@@ -4266,7 +4498,7 @@ impl Renderer {
                             continue;
                         }
                         if pipe as usize != bound {
-                            pass.set_pipeline(&self.prepass_pipelines[pipe as usize]);
+                            pass.set_pipeline(&sp.prepass[pipe as usize]);
                             bound = pipe as usize;
                         }
                         if tex != bound_tex {
@@ -4285,14 +4517,14 @@ impl Renderer {
                         continue;
                     }
                     let pi = pipe as usize;
-                    if self.pipeline_broken[pi].get() {
+                    if sp.pipeline_broken[pi].get() {
                         continue;
                     }
                     if pi != bound_pipe {
                         if prepass && pi <= 1 {
-                            pass.set_pipeline(&self.prepass_pipelines[2 + pi]);
+                            pass.set_pipeline(&sp.prepass[2 + pi]);
                         } else {
-                            pass.set_pipeline(&self.pipelines[pi]);
+                            pass.set_pipeline(&sp.pipelines[pi]);
                         }
                         bound_pipe = pi;
                     }
@@ -4312,11 +4544,11 @@ impl Renderer {
             for &b in &draw_order {
                 let (two_sided, tex, mesh_id, first, count) = batches[b as usize];
                 let pi = two_sided as usize; // pipeline index 0..3
-                if self.pipeline_broken[pi].get() {
+                if sp.pipeline_broken[pi].get() {
                     continue;
                 }
                 if pi != bound_pipe {
-                    pass.set_pipeline(&self.pipelines[pi]);
+                    pass.set_pipeline(&sp.pipelines[pi]);
                     bound_pipe = pi;
                 }
                 if tex != bound_tex {
@@ -4341,21 +4573,21 @@ impl Renderer {
             if let (Some(m), Some(mg)) = (warm_mesh, warm_mg.as_ref()) {
                 pass.set_bind_group(0, Some(&self.bind0));
                 for i in 0..4 {
-                    if !self.pipeline_broken[i].get() {
-                        self.warm_draw(&pass, &self.pipelines[i], mg, m);
+                    if !sp.pipeline_broken[i].get() {
+                        self.warm_draw(&pass, &sp.pipelines[i], mg, m);
                     }
                 }
                 if gpu && self.settings.depth_prepass {
                     for i in 2..4 {
-                        if !self.prepass_broken[i].get() {
-                            self.warm_draw(&pass, &self.prepass_pipelines[i], mg, m);
+                        if !sp.prepass_broken[i].get() {
+                            self.warm_draw(&pass, &sp.prepass[i], mg, m);
                         }
                     }
                 }
             }
             if self.settings.sky {
                 // last: only pixels no geometry covered pass the depth test (less-equal at z = 1)
-                pass.set_pipeline(&self.post.sky_pipeline);
+                pass.set_pipeline(&sp.sky);
                 pass.set_bind_group(0, Some(&self.bind0));
                 pass.draw(3);
             }
@@ -4392,7 +4624,7 @@ impl Renderer {
             for &(two_sided, tex, mesh_id, first, count) in &solid_runs {
                 let pi = two_sided as usize;
                 if pi != bound {
-                    pass.set_pipeline(&self.fade_pipelines[pi]);
+                    pass.set_pipeline(&sp.fade[pi]);
                     bound = pi;
                 }
                 pass.set_bind_group(1, Some(&groups[tex as usize]));
@@ -4404,7 +4636,7 @@ impl Renderer {
             }
             if let (true, Some(m), Some(mg)) = (warm_solid, warm_mesh, warm_mg.as_ref()) {
                 for i in 0..2 {
-                    self.warm_draw(&pass, &self.fade_pipelines[i], mg, m);
+                    self.warm_draw(&pass, &sp.fade[i], mg, m);
                 }
             }
             pass.end();
@@ -4425,7 +4657,7 @@ impl Renderer {
             }
             // immediate-mode GPUs keep the samples (free there) so the next opaque pass can skip its clear
             let store = if self.immediate_gpu || single { GpuStoreOp::Store } else { GpuStoreOp::Discard };
-            let att = GpuRenderPassColorAttachment::new_with_gpu_texture_view(GpuLoadOp::Load, store, &msaa);
+            let att = GpuRenderPassColorAttachment::new_with_gpu_texture_view(GpuLoadOp::Load, store, direct_view.as_ref().unwrap_or(&msaa));
             if !single {
                 att.set_resolve_target_gpu_texture_view(&hdr_view);
             }
@@ -4446,7 +4678,7 @@ impl Renderer {
             let mut bound_pipe = usize::MAX;
             // solid fade first: only the nearest faded surface passes (depth equal), blended once
             for &(two_sided, tex, mesh_id, first, count) in &solid_runs {
-                pass.set_pipeline(&self.fade_pipelines[2 + two_sided as usize]);
+                pass.set_pipeline(&sp.fade[2 + two_sided as usize]);
                 pass.set_bind_group(1, Some(&groups[tex as usize]));
                 bound_tex = tex;
                 let mesh = &self.meshes[mesh_id as usize];
@@ -4462,11 +4694,11 @@ impl Renderer {
             }
             for &(two_sided, tex, mesh_id, first, count) in &blend_runs {
                 let pi = 4 + two_sided as usize;
-                if self.pipeline_broken[pi].get() {
+                if sp.pipeline_broken[pi].get() {
                     continue;
                 }
                 if pi != bound_pipe {
-                    pass.set_pipeline(&self.pipelines[pi]);
+                    pass.set_pipeline(&sp.pipelines[pi]);
                     bound_pipe = pi;
                 }
                 if tex != bound_tex {
@@ -4486,12 +4718,12 @@ impl Renderer {
             if let (Some(m), Some(mg)) = (warm_mesh, warm_mg.as_ref()) {
                 if fade_depth_view.is_some() {
                     for i in 2..4 {
-                        self.warm_draw(&pass, &self.fade_pipelines[i], mg, m);
+                        self.warm_draw(&pass, &sp.fade[i], mg, m);
                     }
                 }
                 for i in 4..6 {
-                    if !self.pipeline_broken[i].get() {
-                        self.warm_draw(&pass, &self.pipelines[i], mg, m);
+                    if !sp.pipeline_broken[i].get() {
+                        self.warm_draw(&pass, &sp.pipelines[i], mg, m);
                     }
                 }
             }
@@ -4499,17 +4731,23 @@ impl Renderer {
             if n_add + n_alpha > 0 {
                 pass.set_bind_group(1, Some(&self.post.particle_group));
                 if n_add > 0 {
-                    pass.set_pipeline(&self.post.particle_additive);
+                    pass.set_pipeline(&sp.particle_additive);
                     pass.draw_with_instance_count_and_first_vertex_and_first_instance(6, n_add, 0, 0);
                     stats.draw_calls += 1;
                 }
                 if n_alpha > 0 {
-                    pass.set_pipeline(&self.post.particle_alpha);
+                    pass.set_pipeline(&sp.particle_alpha);
                     pass.draw_with_instance_count_and_first_vertex_and_first_instance(6, n_alpha, 0, n_add);
                     stats.draw_calls += 1;
                 }
             }
             pass.end();
+        }
+
+        // Prewarm of the direct-output set while the HDR path draws: one triangle per LDR pipeline
+        // into a 1x1 target of the canvas view format (mobile drivers compile on first draw).
+        if let (Some(m), Some(mg), None, Some((lp, f))) = (warm_mesh, warm_mg.as_ref(), &direct_view, &self.ldr) {
+            self.prewarm_ldr(&encoder, lp, *f, mg, m)?;
         }
 
         // --- Post: bloom + depth darkening + tonemap -> canvas ------------------------------
@@ -4519,7 +4757,7 @@ impl Renderer {
         }
         self.post.grain_px = if main { self.settings.render_scale.clamp(0.25, 1.0) } else { 1.0 };
         self.post.flare = if main { self.lens_flare(view_proj, cam_pos) } else { ([0.0; 4], [0.0; 4]) };
-        {
+        if direct_view.is_none() {
             let ts = self.timing.as_mut().filter(|_| main).and_then(|t| t.split_writes(crate::gpu_timing::POST));
             let nf = (near * (1.0 + self.settings.depth_jitter), far);
             match rtt {

@@ -670,8 +670,8 @@ fn fs_main(i: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4f {
     let d = derivs(i);
     let face_n = safe_normal(cross(d.dpx, d.dpy), i.normal);
     let s = shade(i, front, d, face_n);
-    if (g.counts.z >= 3u) { return debug_extra(i); }
-    return debug_out(s);
+    if (g.counts.z >= 3u) { return ldr_opaque(debug_extra(i), i.clip.xy); }
+    return ldr_opaque(debug_out(s), i.clip.xy);
 }
 
 // --- Blend pass: the opaque depth buffer is readable here -------------------------------------
@@ -897,9 +897,9 @@ fn fs_blend(i: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4f 
     let d = derivs(i);
     let face_n = safe_normal(cross(d.dpx, d.dpy), i.normal);
     if (instances[i.inst].params.z > 2.5) {
-        return water(i, d);
+        return ldr_blended(water(i, d), i.clip.xy);
     }
-    return debug_out(shade(i, front, d, face_n));
+    return ldr_blended(debug_out(shade(i, front, d, face_n)), i.clip.xy);
 }
 
 // --- GPU grass (see vegetation.rs) -------------------------------------------------------------

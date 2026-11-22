@@ -186,6 +186,17 @@ normal `cargo` output above it.
   itself (one HDR read + tonemap + write, ~0.3 ms/Mpx on a Radeon 780M): at 14 Mpx with `?msaa=1` post was 10.5 ms with
   FXAA + bloom, 6.7 FXAA only, 5.4 neither, 4.2 with depth darkening / flare / vignette / grain off too.
   Test: `games/demo/tests/postfx.txt`.
+  **Direct output** (`RenderConfig { msaa: 1, direct_output: true, .. }`, URL `?direct=1`): a second set of scene
+  pipelines (pbr variants, sky, particles; `LDR_OUT` override in `common.wgsl`) runs the composite's colour chain at
+  the end of the fragment shader (exposure, ACES, saturation, classic vignette) and draws the main view straight
+  into an sRGB view of the canvas: no HDR target write/read, no composite pass. Used per frame when nothing else of
+  the composite is on, else the normal path: `stats.render.direct_output`, `direct_blocked` ("not built", "off",
+  "debug_view", "bloom", "fxaa", "depth_darkening", "lens_flare", "grade", "grain", "vignette_radius", "water",
+  "grass", "size", "render texture"); `render {direct_output: false}` forces the composite. Costs ~20 pipelines at
+  startup (prewarmed with the rest; `first use: direct output` in the log). Pixels match the composite (title
+  screen: mean diff 0.8/255) except semi-transparent surfaces, which blend after the tonemap (a 50 % red cube over
+  the sky reads redder), additive particles (exposure only, no curve) and the clear colour (no vignette).
+  14 Mpx on a Radeon 780M: GPU frame 10.2-11.0 -> 7.0-7.5 ms. Test: `games/demo/tests/directout.txt`.
 - **Resolution:** `render {render_scale}` (0.25..1; the canvas backing store has the scene size too, the browser scales it), `auto_resolution` (default on) adapts it to
   `frame_budget_ms` of whole-frame GPU time (`gpu_ms.frame`); every change reallocates the targets (a 20-35 ms
   hitch at 4K), so it jumps once to a scale that fits and changes at most every 4 s; `stats.render` has `width/height` (scene) and `canvas`.
