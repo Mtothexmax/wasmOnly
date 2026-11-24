@@ -673,7 +673,7 @@ async fn start<G: Game>(game: G, mut config: crate::renderer::RenderConfig) -> R
         "render config: {}x MSAA{}{}",
         renderer.samples,
         if renderer.samples == 1 { " (FXAA)" } else { "" },
-        if renderer.direct_output_built() { ", direct output" } else if config.direct_output { ", direct output needs msaa 1" } else { "" }
+        if renderer.direct_output_built() { ", direct output" } else if config.direct_output && renderer.samples != 1 { ", direct output needs msaa 1" } else if config.direct_output { ", direct output not built (see above)" } else { "" }
     );
     debug::install_gpu_error_handler(&renderer.device);
     let ui = Ui::new(&document).map_err(|e| format!("ui: {e:?}"))?;

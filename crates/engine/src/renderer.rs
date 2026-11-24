@@ -58,6 +58,27 @@ fn local_storage() -> Option<web_sys::Storage> {
     web_sys::window()?.local_storage().ok()?
 }
 
+/// localStorage key: the GPU + browser on which the direct-output set failed to build (value =
+/// `direct_gpu_key()`). Such a start skips the set (no doomed pipeline builds); a new Chrome version
+/// or another GPU retries. Remove the key to retry by hand.
+pub const DIRECT_FAIL_KEY: &str = "wasmonly.direct_output_failed";
+
+fn direct_gpu_key(adapter: &GpuAdapter) -> String {
+    let info = js_sys::Reflect::get(adapter.as_ref(), &"info".into()).ok();
+    let field = |k: &str| info.as_ref().and_then(|i| js_sys::Reflect::get(i, &k.into()).ok()).and_then(|v| v.as_string()).unwrap_or_default();
+    let ua = web_sys::window().and_then(|w| w.navigator().user_agent().ok()).unwrap_or_default();
+    format!("{}|{}|{}|{}|{ua}", field("vendor"), field("architecture"), field("device"), field("description"))
+}
+
+async fn sleep_ms(ms: i32) {
+    let p = js_sys::Promise::new(&mut |resolve, _| {
+        if let Ok(f) = js_sys::Reflect::get(&js_sys::global(), &"setTimeout".into()) {
+            let _ = f.unchecked_into::<js_sys::Function>().call2(&JsValue::NULL, &resolve, &ms.into());
+        }
+    });
+    let _ = wasm_bindgen_futures::JsFuture::from(p).await;
+}
+
 /// The player's stored MSAA choice (graphics menu), used at startup instead of the game's
 /// `RenderConfig`. The URL `?msaa=` still wins.
 pub fn msaa_pref() -> Option<u32> {
@@ -1287,6 +1308,11 @@ pub struct Renderer {
     ldr_check: Rc<crate::debug::PipelineSet>,
     /// The direct-output set still waits for its prewarm draw (runs once `ldr_check` is healthy).
     ldr_warm_pending: bool,
+    /// A failure of the set was written to localStorage (`DIRECT_FAIL_KEY`) / the GPU key it uses.
+    ldr_fail_stored: bool,
+    gpu_key: String,
+    /// `?direct_fail=1` test run: that forced (late) failure is not remembered (`=2` is, like a real one).
+    direct_fail_test: bool,
     depth_view: Option<GpuTextureView>,
     /// Desktop GPU (AMD / NVIDIA / Intel: immediate-mode rendering) as opposed to a tile-based
     /// mobile GPU. Decides the load/store ops of the multisampled scene target: clears and discards
@@ -1398,13 +1424,14 @@ impl Renderer {
             .ok()
             .and_then(|q| q.as_string())
             .is_some_and(|q| q.contains("gpu_timing=0"));
-        // `?direct_fail=1`: the direct-output pipeline "pbr-opaque-eq-2s-ldr" is built invalid (test of
-        // the fallback when a phone driver cannot build one of the set)
+        // `?direct_fail=1`: the direct-output pipeline "pbr-opaque-eq-2s-ldr" is built invalid, `=2`: the
+        // canary "pbr-opaque-ldr" (tests of the fallback when a phone driver cannot build the set)
         let direct_fail = js_sys::Reflect::get(&js_sys::global(), &"location".into())
             .and_then(|l| js_sys::Reflect::get(&l, &"search".into()))
             .ok()
             .and_then(|q| q.as_string())
-            .is_some_and(|q| q.contains("direct_fail=1"));
+            .and_then(|q| q.split(['?', '&']).find_map(|kv| kv.strip_prefix("direct_fail=").map(str::to_string)))
+            .unwrap_or_default();
         // `?gpu_slow=N`: N ms of extra GPU work per frame (pacing tests)
         let slow_url = js_sys::Reflect::get(&js_sys::global(), &"location".into())
             .and_then(|l| js_sys::Reflect::get(&l, &"search".into()))
@@ -1686,7 +1713,7 @@ impl Renderer {
             desc.set_depth_stencil(&ds);
             desc.set_multisample(&ms);
             if ldr.is_some() {
-                if direct_fail && label == "pbr-opaque-eq-2s-ldr" {
+                if (direct_fail == "1" && label == "pbr-opaque-eq-2s-ldr") || (direct_fail == "2" && label == "pbr-opaque-ldr") {
                     ms.set_count(3); // invalid sample count: a validation error, like a driver failure
                 }
                 let p = crate::debug::create_pipeline_optional(&device, &desc, label, &ldr_check, DIRECT_FALLBACK)?;
@@ -1697,16 +1724,39 @@ impl Renderer {
         let make_pipeline_v = |kind: u8, two_sided: bool, variant: u8| make_pipeline_f(kind, two_sided, variant, None);
         let make_pipeline = |kind: u8, two_sided: bool| make_pipeline_v(kind, two_sided, 0);
         // direct output: the same variants into the sRGB canvas view (sky + particles come from Post)
-        let ldr_pbr = match ldr_format {
+        // A driver that cannot build one of the set usually builds none (PowerVR B-series: all
+        // VK_ERROR_UNKNOWN, ~300 ms each). So one canary is built and awaited first, and a failure is
+        // remembered per GPU + browser (`DIRECT_FAIL_KEY`): the next start skips the set.
+        let gpu_key = direct_gpu_key(&adapter);
+        let remembered = ldr_format.is_some()
+            && direct_fail.is_empty()
+            && local_storage().and_then(|s| s.get_item(DIRECT_FAIL_KEY).ok().flatten()).is_some_and(|v| v == gpu_key);
+        if remembered {
+            crate::log_info!("direct output: skipped, its pipelines failed on this GPU before (localStorage {DIRECT_FAIL_KEY})");
+            ldr_check.failed.borrow_mut().push("remembered".into());
+        }
+        let ldr_pbr = match ldr_format.filter(|_| !remembered) {
             Some(f) => {
                 let m = |k: u8, ts: bool, v: u8| make_pipeline_f(k, ts, v, Some(f));
-                let main = [m(0, false, 0)?, m(0, true, 0)?, m(1, false, 0)?, m(1, true, 0)?, m(2, false, 0)?, m(2, true, 0)?];
-                let pre = [m(0, false, 1)?, m(0, true, 1)?, m(0, false, 2)?, m(0, true, 2)?];
-                let fade = [m(0, false, 4)?, m(0, true, 4)?, m(2, false, 3)?, m(2, true, 3)?];
-                Some((main, pre, fade, f))
+                let canary = m(0, false, 0)?;
+                for _ in 0..400 {
+                    if ldr_check.pending.get() == 0 {
+                        break;
+                    }
+                    sleep_ms(5).await;
+                }
+                if ldr_check.failed.borrow().is_empty() {
+                    let main = [canary, m(0, true, 0)?, m(1, false, 0)?, m(1, true, 0)?, m(2, false, 0)?, m(2, true, 0)?];
+                    let pre = [m(0, false, 1)?, m(0, true, 1)?, m(0, false, 2)?, m(0, true, 2)?];
+                    let fade = [m(0, false, 4)?, m(0, true, 4)?, m(2, false, 3)?, m(2, true, 3)?];
+                    Some((main, pre, fade, f))
+                } else {
+                    None
+                }
             }
             None => None,
         };
+        let ldr_format = ldr_pbr.as_ref().map(|p| p.3);
         let prepass_built = [make_pipeline_v(0, false, 1)?, make_pipeline_v(0, true, 1)?, make_pipeline_v(0, false, 2)?, make_pipeline_v(0, true, 2)?];
         let prepass_broken: [Rc<Cell<bool>>; 4] = std::array::from_fn(|i| prepass_built[i].1.clone());
         let prepass_pipelines: [GpuRenderPipeline; 4] = prepass_built.map(|b| b.0);
@@ -1960,6 +2010,9 @@ impl Renderer {
             ldr,
             ldr_check,
             ldr_warm_pending: false,
+            ldr_fail_stored: false,
+            gpu_key,
+            direct_fail_test: direct_fail == "1",
             depth_view: None,
             post,
             grass,
@@ -2268,12 +2321,12 @@ impl Renderer {
         let s = &self.settings;
         if !main {
             "render texture"
-        } else if self.ldr.is_none() {
-            "not built"
         } else if !s.direct_output {
             "off"
         } else if !self.ldr_check.failed.borrow().is_empty() {
             "pipeline"
+        } else if self.ldr.is_none() {
+            "not built"
         } else if self.ldr_check.pending.get() > 0 {
             "pipeline pending"
         } else if s.debug_view != 0 {
@@ -4443,6 +4496,14 @@ impl Renderer {
         let skip_blend = warm_mesh.is_none() && blend_runs.is_empty() && solid_runs.is_empty() && n_add + n_alpha == 0 && !has_water;
         // Direct output: the main view goes straight into an sRGB view of the canvas with the LDR
         // pipeline set (tonemap in the fragment shaders) when the composite would only tonemap.
+        if !self.ldr_fail_stored && !self.ldr_check.failed.borrow().is_empty() {
+            self.ldr_fail_stored = true;
+            if !self.ldr_check.failed.borrow().iter().any(|f| f == "remembered") && !self.direct_fail_test {
+                if let Some(st) = local_storage() {
+                    let _ = st.set_item(DIRECT_FAIL_KEY, &self.gpu_key);
+                }
+            }
+        }
         let mut direct_why = self.direct_blocked(main, has_water, grass_blades);
         let mut direct_view = None;
         if direct_why.is_empty() {
