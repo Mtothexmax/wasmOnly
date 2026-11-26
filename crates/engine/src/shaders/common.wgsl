@@ -105,6 +105,8 @@ struct Instance {
                               // z = parallax scale (0 = off), w = water wave scale
     studs: vec4f,             // Material::studs: x = studs per uv (0 = off), y = height, z = r_base, w = r_top
     studs2: vec4f,            // x = bevel, y = strength, z = 1: up-facing faces only
+    tri: vec4f,               // Material::triplanar: x = metres per tile (0 = mesh UVs), y = blend sharpness;
+                              // Material::parallax_fade: z = start, w = end distance in m (w = 0: no fade)
 }
 
 @group(0) @binding(0) var<uniform> g: Globals;

@@ -298,6 +298,17 @@ fn classify(model: &Mat4, mr: &MeshRenderer, mat: &Material, shadows_on: bool) -
             Some(st) => [st.bevel.clamp(0.0, st.height.max(0.0)), st.strength.clamp(0.0, 1.0), st.up_only as u32 as f32, 0.0],
             None => [0.0; 4],
         },
+        tri: {
+            let (tile, sharp) = match &mat.triplanar {
+                Some(t) if t.tile > 0.0 && !mat.terrain && !mat.water && !mat.ui => (t.tile, t.sharpness.max(1.0)),
+                _ => (0.0, 0.0),
+            };
+            let (fs, fe) = match mat.parallax_fade {
+                Some([a, b]) if b > 0.0 => (a.max(0.0).min(b - 0.01), b),
+                _ => (0.0, 0.0),
+            };
+            [tile, sharp, fs, fe]
+        },
     };
     let shadow_raw = (faded && casts).then(|| {
         let mut r = raw;
@@ -438,6 +449,31 @@ pub struct Material {
     /// stud cylinders of a grid in the material's UVs; the hit's normal and UV replace the surface's,
     /// so a flat plate shows standing studs (silhouette inside the plate, bevel, soft contact shade).
     pub studs: Option<StudRelief>,
+    /// World-space triplanar mapping (`Triplanar`): base colour, normal map and parallax are
+    /// projected along x, y and z from the world position and blended by the normal, so round
+    /// meshes (bushes, rocks) need no UVs and show no seams. Replaces the mesh UVs for those three
+    /// maps (studs are ignored; vertex displacement and alpha-tested shadows still use the mesh UVs).
+    pub triplanar: Option<Triplanar>,
+    /// `[start, end]` camera distance in metres over which the parallax depth fades to flat; it
+    /// also fades where one pixel covers more than ~1/40 of a tile (no shimmer far away or at
+    /// grazing angles). `None` = full depth everywhere.
+    pub parallax_fade: Option<[f32; 2]>,
+}
+
+/// [`Material::triplanar`]: projection scale and blend.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct Triplanar {
+    /// Metres per texture tile (the parallax depth `Material::parallax` stays in tile units).
+    pub tile: f32,
+    /// Blend weight exponent of |normal| per axis: 1 = soft wide blend, 4 = default, 8+ = sharp.
+    pub sharpness: f32,
+}
+
+impl Triplanar {
+    /// `tile` metres per tile, sharpness 4.
+    pub fn new(tile: f32) -> Self {
+        Self { tile, sharpness: 4.0 }
+    }
 }
 
 /// Stud grid for [`Material::studs`]. Sizes are in stud units (1 = one stud pitch); the grid is
@@ -524,6 +560,8 @@ impl Default for Material {
             clearcoat_roughness: 0.06,
             impostor_views: 0,
             studs: None,
+            triplanar: None,
+            parallax_fade: None,
         }
     }
 }
@@ -1128,6 +1166,9 @@ struct InstanceRaw {
     studs: [f32; 4],
     /// x = bevel, y = strength, z = 1: only faces whose normal points up, w = unused
     studs2: [f32; 4],
+    /// Material::triplanar: x = metres per tile (0 = mesh UVs), y = blend sharpness;
+    /// Material::parallax_fade: z = start, w = end distance (0 = no fade)
+    tri: [f32; 4],
 }
 
 #[derive(Clone, Debug, Serialize)]

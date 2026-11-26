@@ -384,6 +384,64 @@ fn parallax_uv(uv: vec2f, view_ts: vec3f, scale: f32, d: Deriv) -> vec2f {
     return mix(cur_uv, prev_uv, clamp(w, 0.0, 1.0));
 }
 
+// Parallax depth after Material::parallax_fade: off beyond the fade distance and where one pixel
+// covers so much of the texture (uv footprint) that the march would only shimmer.
+fn parallax_scale(inst: Instance, world: vec3f, duvx: vec2f, duvy: vec2f) -> f32 {
+    if (inst.tri.w <= 0.0) { return inst.maps.z; }
+    let dist = length(g.camera_pos.xyz - world);
+    let fw = max(length(duvx), length(duvy));
+    return inst.maps.z * (1.0 - smoothstep(inst.tri.z, inst.tri.w, dist)) * (1.0 - smoothstep(0.008, 0.045, fw));
+}
+
+// Material::triplanar: base colour, normal map and parallax from world-space projections along x, y
+// and z (no mesh UVs, no seams on round meshes), blended by |normal|^sharpness. Each axis has an
+// explicit frame (u, v, projection axis; u x v = -axis like a face seen with u right, v down), the
+// parallax ray is marched per axis in it with depth along the surface normal, the normal map tilts the
+// surface normal along that axis' u / v.
+struct TriSample {
+    tex: vec4f,
+    n: vec3f,
+}
+
+fn triplanar(i: VsOut, n: vec3f, v: vec3f, d: Deriv, inst: Instance) -> TriSample {
+    let inv = 1.0 / inst.tri.x;
+    var w = pow(abs(n), vec3f(max(inst.tri.y, 1.0)));
+    w = w / max(w.x + w.y + w.z, 1e-6);
+    let sg = select(vec3f(-1.0), vec3f(1.0), n >= vec3f(0.0));
+    var tex = vec4f(0.0);
+    var nsum = vec3f(0.0);
+    var wsum = 0.0;
+    for (var a = 0; a < 3; a++) {
+        if (w[a] < 0.03) { continue; }
+        var U = vec3f(sg.y, 0.0, 0.0);
+        var V = vec3f(0.0, 0.0, sg.y);
+        if (a == 0) {
+            U = vec3f(0.0, 0.0, -sg.x);
+            V = vec3f(0.0, -1.0, 0.0);
+        } else if (a == 2) {
+            U = vec3f(sg.z, 0.0, 0.0);
+            V = vec3f(0.0, -1.0, 0.0);
+        }
+        var uv = vec2f(dot(i.world, U), dot(i.world, V)) * inv;
+        let dd = Deriv(d.dpx, d.dpy, vec2f(dot(d.dpx, U), dot(d.dpx, V)) * inv, vec2f(dot(d.dpy, U), dot(d.dpy, V)) * inv);
+        let ps = parallax_scale(inst, i.world, dd.duvx, dd.duvy);
+        if (ps > 0.0) {
+            uv = parallax_uv(uv, vec3f(dot(v, U), dot(v, V), dot(v, n)), ps, dd);
+        }
+        tex += textureSampleGrad(base_tex, base_sampler, uv, dd.duvx, dd.duvy) * w[a];
+        if (inst.maps.x != 0.0) {
+            let tn = textureSampleGrad(normal_tex, base_sampler, uv, dd.duvx, dd.duvy).xyz * 2.0 - 1.0;
+            nsum += (U * tn.x + V * tn.y) * inst.maps.x * w[a] + n * tn.z * w[a];
+        }
+        wsum += w[a];
+    }
+    tex = tex / max(wsum, 1e-6);
+    var r: TriSample;
+    r.tex = tex;
+    r.n = select(n, safe_normal(nsum, n), inst.maps.x != 0.0);
+    return r;
+}
+
 // Terrain: 4 layers from a 2x2 atlas (base_tex), weights from the splat map (normal_tex slot),
 // UVs from world XZ (instance: emissive_metallic = local corner xz + 1/size, maps = metres per tile).
 fn terrain_albedo(i: VsOut, d: Deriv, inst: Instance) -> vec3f {
@@ -528,14 +586,16 @@ fn shade(i: VsOut, front: bool, d: Deriv, face_n: vec3f) -> Surface {
 
     let is_terrain = inst.params.z < -0.5;
     var uv = i.uv;
-    if (inst.maps.z > 0.0 && !is_terrain) { // parallax occlusion mapping
+    let tri_on = inst.tri.x > 0.0 && !is_terrain;
+    let ps = parallax_scale(inst, i.world, d.duvx, d.duvy);
+    if (ps > 0.0 && !is_terrain && !tri_on) { // parallax occlusion mapping
         let view_ts = vec3f(dot(v, tbn[0]), dot(v, tbn[1]), dot(v, tbn[2]));
-        uv = parallax_uv(uv, view_ts, inst.maps.z, d);
+        uv = parallax_uv(uv, view_ts, ps, d);
     }
     // Material::studs (render.stud_relief = quality, 0 = off)
     var stud = StudHit(vec3f(0.0, 0.0, 1.0), uv, 1.0, 0.0);
     var stud_tbn = tbn;
-    if (inst.studs.x > 0.0 && g.shadow_sets.w > 0.5 && !is_terrain && (inst.studs2.z < 0.5 || n_geo.y > 0.5)) {
+    if (inst.studs.x > 0.0 && g.shadow_sets.w > 0.5 && !is_terrain && !tri_on && (inst.studs2.z < 0.5 || n_geo.y > 0.5)) {
         // cotangent_frame drops the determinant's sign (WebGPU's y-down screen: T, B = -du, -dv on
         // front faces); the ray needs the true +u / +v directions, so orient the frame by the uv gradient
         let ori = dot(d.dpx, tbn[0]) * d.duvx.x + dot(d.dpy, tbn[0]) * d.duvy.x;
@@ -549,7 +609,11 @@ fn shade(i: VsOut, front: bool, d: Deriv, face_n: vec3f) -> Surface {
     if (is_terrain) {
         tex = vec4f(terrain_albedo(i, d, inst), 1.0);
     }
-    if (inst.maps.x != 0.0 && !is_terrain) { // tangent-space normal map
+    if (tri_on) {
+        let t = triplanar(i, n, v, d, inst);
+        tex = t.tex;
+        n = t.n;
+    } else if (inst.maps.x != 0.0 && !is_terrain) { // tangent-space normal map
         var tn = textureSampleGrad(normal_tex, base_sampler, uv, d.duvx, d.duvy).xyz * 2.0 - 1.0;
         tn = vec3f(tn.xy * inst.maps.x, tn.z);
         n = normalize(tbn * tn);

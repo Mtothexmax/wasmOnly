@@ -79,7 +79,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("raycast", "Physics ray cast. args: {origin, dir, max?: 1000, exclude?: id|name|[...] (ignore these bodies, e.g. the caster)}"),
     ("pick", "Entity under a canvas point (CSS px). args: {x, y, mesh?: true = test rendered meshes instead of physics colliders; also returns depth_ties (z-fighting partners)}"),
     ("ui", "HUD slot contents."),
-    ("material", "Materials. Without id: every material (id, name, roughness, metallic, subsurface, clearcoat, bend). args: {id | entity: id|name (its MeshRenderer's material), roughness?, metallic?, subsurface?: 0..1, subsurface_color?: '#rrggbb' | null (= albedo), clearcoat?: 0..1, clearcoat_roughness?, studs?: {pitch_uv, height?: 0.22, r_base?: 0.30, r_top?: 0.272, bevel?: 0.025, strength?: 1, up_only?: true} | null (analytic stud relief, quality render.stud_relief 0/1/2)} sets them and returns the material."),
+    ("material", "Materials. Without id: every material (id, name, roughness, metallic, subsurface, clearcoat, bend). args: {id | entity: id|name (its MeshRenderer's material), roughness?, metallic?, subsurface?: 0..1, subsurface_color?: '#rrggbb' | null (= albedo), clearcoat?: 0..1, clearcoat_roughness?, studs?: {pitch_uv, height?: 0.22, r_base?: 0.30, r_top?: 0.272, bevel?: 0.025, strength?: 1, up_only?: true} | null (analytic stud relief, quality render.stud_relief 0/1/2), triplanar?: metres per tile | {tile, sharpness?: 4} | null (world-space projection of colour/normal/parallax), parallax_fade?: [start, end] m | null, parallax?, normal_scale?} sets them and returns the material."),
     ("bend", "Pushers that bend Material::bend geometry and GPU grass. args: {pushers?: [[x,y,z,radius], ...] (replaces; [] = none), material?: id, bend?: value (sets Material::bend), wind?: [dir_x, dir_z, strength] (shared with GPU grass; strength 0 = still)}. Returns pushers, wind and every material with bend > 0."),
     ("static_collider", "args: {pos: [x,y,z], half?: [x,y,z]} adds a static box collider to the current scene (physics.add_static) -> {handle: [index, generation]}; {remove: [index, generation]} removes one (physics.remove_static, the scene forgets it) -> {removed}."),
     ("zfight", "args: {radius?: m around the camera or `center` (use in big worlds), center?: [x,y,z] (default radius 10), entity?: id|name|[...] (only pairs involving these and their children; a name matches every entity with it), exclude?: id|name|[...], same_root?: true skips pairs within one hierarchy (parts of one model)}. Entities with the NoZCheck component (and their children) are never checked; `auto` = the automatic check (runs, incremental_runs, last_entities_checked, last_ms). Find z-fighting: coplanar, same-facing, overlapping triangles of different entities (opaque/masked). args: {eps?: 0.002 plane distance, tolerance?: 0.002 overlap, limit?: 50}. Returns pair count and the worst pairs with entities, world point and screen position."),
@@ -90,7 +90,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("audio_stop", "Stop a voice (or all). args: {voice?, fade?: seconds (fade out, then stop)}"),
     ("audio_voice", "Change a playing voice. args: {voice, volume, fade?: seconds (linear ramp)}. Returns the voice's volume."),
     ("sfx", "Synthesize a sound from a preset and register it. args: {preset, name?: preset, seed?: 0 (0 = exact preset, else a mutation), overrides?: {wave, freq, freq_end, duty, attack, decay, sustain, sustain_time, release, vibrato_depth, vibrato_rate, arp_mult, arp_time, partials, noise_mix, lowpass, highpass, bitcrush, volume}}. Returns duration, peak, rms and the full recipe. args {} lists presets."),
-    ("texgen", "Generate a seamless procedural texture. args: {preset, size?: 256, seed?: 1, scale?: 1, colors?: ['#dark','#light'], apply_to?: entity id (sets that entity's material texture), normal?: strength (also generates + applies a normal map), parallax?: uv depth (applies the height map as parallax)}. args {} lists presets."),
+    ("texgen", "Generate a seamless procedural texture. args: {preset, size?: 256, seed?: 1, scale?: 1, colors?: ['#dark','#light'], apply_to?: entity id|name (sets that entity's material texture), normal?: strength (also generates + applies a normal map), parallax?: uv depth (applies the height map as parallax)}. args {} lists presets."),
     ("audio_set", "Master audio. args: {volume?, music_volume?, sfx_volume?, voice_volume?, ambience_volume?, ui_volume?, muted?, pause_on_blur?: bool (suspend while the tab is unfocused, default true)}"),
     ("panels", "World panels (clickable 3D UI): widgets with rects, on-screen centres (CSS px), hover, click history."),
     ("panel_click", "Click a world panel through the engine path. args: {id, widget?: name} | {id, x, y: panel px}. Returns the action or null."),
@@ -1152,6 +1152,29 @@ pub(crate) fn handle<G: Game>(
                 Some(_) => return Err("studs: {pitch_uv, height, r_base, r_top, bevel, strength, up_only} or null".into()),
                 None => {}
             }
+            match a.get("triplanar") {
+                Some(Value::Null) => m.triplanar = None,
+                Some(Value::Number(n)) => m.triplanar = Some(crate::renderer::Triplanar::new(n.as_f64().unwrap_or(1.0) as f32)),
+                Some(Value::Object(o)) => {
+                    let mut t = m.triplanar.unwrap_or(crate::renderer::Triplanar::new(1.0));
+                    if let Some(v) = o.get("tile").and_then(|v| v.as_f64()) { t.tile = v as f32; }
+                    if let Some(v) = o.get("sharpness").and_then(|v| v.as_f64()) { t.sharpness = v as f32; }
+                    m.triplanar = Some(t);
+                }
+                Some(_) => return Err("triplanar: metres per tile | {tile, sharpness} | null".into()),
+                None => {}
+            }
+            match a.get("parallax_fade") {
+                Some(Value::Null) => m.parallax_fade = None,
+                Some(Value::Array(v)) if v.len() == 2 => {
+                    let g = |i: usize| v[i].as_f64().unwrap_or(0.0) as f32;
+                    m.parallax_fade = Some([g(0), g(1)]);
+                }
+                Some(_) => return Err("parallax_fade: [start, end] metres | null".into()),
+                None => {}
+            }
+            if let Some(v) = f("parallax") { m.parallax = v; }
+            if let Some(v) = f("normal_scale") { m.normal_scale = v; }
             Ok(json!(m))
         }
         "bend" => {
@@ -1320,7 +1343,7 @@ pub(crate) fn handle<G: Game>(
                 .add_texture_rgba(t.size, t.size, &px, &t.label())?;
             let mut applied = Value::Null;
             if a.get("apply_to").is_some() {
-                let e = entity_arg(ctx, &json!({"id": a["apply_to"]}))?;
+                let e = resolve_entity(ctx, &a["apply_to"])?;
                 let mid = ctx
                     .world
                     .get::<&MeshRenderer>(e)

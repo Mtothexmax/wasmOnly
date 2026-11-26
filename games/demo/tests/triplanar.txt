@@ -1,0 +1,22 @@
+# Material::triplanar + parallax_fade: a round "bush" (sphere, no usable UVs) with a leaf texture,
+# normal map and parallax projected in world space along x/y/z, blended by the normal (no seams).
+#   node tools/bridge.mjs run games/demo/tests/triplanar.txt
+# Convention (like texgen): height white = high, normal map +x along +u, +y along +v (rows down).
+# Visual check by hand: hide the HUD, `camera {pos: [3, 3.5, 0.5], look_at: [0, 2.2, 4]}`, screenshot
+# with and without triplanar (mesh UVs pinch and stretch at the poles, triplanar does not).
+reload
+wait 1000
+pause
+call spawn {"shape": "sphere", "pos": [0, 2.2, 4], "size": 2.4, "color": "#ffffff", "body": "none", "name": "bush"}
+call texgen {"preset": "leaves", "apply_to": "bush", "normal": 4, "parallax": 0.08}
+call material {"entity": "bush", "triplanar": {"tile": 0.6, "sharpness": 4}, "parallax_fade": [10, 22]}
+expect material{"entity": "bush"}.triplanar.tile ~= 0.6
+expect material{"entity": "bush"}.parallax_fade.1 == 22
+frames 5
+expect zfight{"entity": "bush"}.pairs == 0
+call material {"entity": "bush", "triplanar": null}
+frames 2
+expect material{"entity": "bush"}.triplanar == null
+call material {"entity": "bush", "triplanar": 0.6}
+frames 2
+expect logs{"level": "error"}.entries.length == 0

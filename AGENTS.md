@@ -379,6 +379,20 @@ normal `cargo` output above it.
   Quality `render {stud_relief: 0|1|2}` (off / 3x3 / 5x5 neighbours, default 2; only the cells the ray crosses
   are tested, so 1 and 2 cost about the same: +0.6 ms opaque at 14 Mpx full of studs on a Radeon 780M).
   API `material {entity: id|name | id, studs: {pitch_uv, ..} | null}`. Test: `games/demo/tests/studs.txt`.
+- **Triplanar (round foliage, rocks):** `Material::triplanar = Some(Triplanar::new(metres_per_tile))` (prelude; field
+  `sharpness`, default 4 = blend weight exponent of |normal|, 1 soft .. 8+ sharp) projects base colour, normal map and
+  parallax from the world position along x, y and z and blends them by the normal: no UVs needed, no seams or pole
+  pinching on spheres. Each axis has its own frame (u, v, axis), the parallax ray is marched per axis (only axes with
+  weight > 3 %; up to 3 marches where they blend) with depth along the surface normal; `Material::parallax` stays in
+  tile units. Convention as `texgen`: height white = high, normal map +x along +u, +y along +v. World space: a moving
+  entity swims through its texture, a floating-origin shift moves the pattern. Studs are skipped; vertex
+  displacement and alpha-tested shadows still use mesh UVs. `Material::parallax_fade = Some([start, end])` (metres,
+  also for mesh UVs) fades the parallax depth to flat with camera distance and where a pixel covers more than
+  ~1/40 of a tile (`smoothstep(0.008, 0.045, uv footprint)`), against far shimmer.
+  Note: the mesh-UV path renders normal maps and parallax inverted (its derivative tangent frame is negated on front
+  faces), triplanar does not; maps tuned on the mesh-UV path look inside-out under triplanar (invert height / normal xy).
+  API `material {entity, triplanar: metres | {tile, sharpness} | null, parallax_fade: [start, end] | null, parallax,
+  normal_scale}`; `texgen {preset, apply_to: id|name, normal, parallax}`. Test: `games/demo/tests/triplanar.txt`.
 - **Input lag on a GPU-bound device:** without a limit Chrome queues frames and the screen shows one that is
   up to a second old (desktop repro: 320vw canvas, 7 frames in flight, 1 s latency). The back-pressure of frame pacing
   (`render {max_frames_in_flight}`, default 2; 0 = off; 64 queued = hard cap) prevents it. `stats.render.pacing`:
