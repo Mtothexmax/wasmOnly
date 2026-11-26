@@ -389,8 +389,9 @@ normal `cargo` output above it.
   displacement and alpha-tested shadows still use mesh UVs. `Material::parallax_fade = Some([start, end])` (metres,
   also for mesh UVs) fades the parallax depth to flat with camera distance and where a pixel covers more than
   ~1/40 of a tile (`smoothstep(0.008, 0.045, uv footprint)`), against far shimmer.
-  Note: the mesh-UV path renders normal maps and parallax inverted (its derivative tangent frame is negated on front
-  faces), triplanar does not; maps tuned on the mesh-UV path look inside-out under triplanar (invert height / normal xy).
+  Mesh UVs and triplanar share the convention: the derivative tangent frame (`cotangent_frame`, which assumes a y-up
+  screen) is oriented by the uv gradient, so T / B are the true +u / +v (until 2026-11-26 the mesh-UV path rendered
+  normal maps and parallax inverted on front faces; maps tuned by eye before that need 1 - height / -normal xy).
   API `material {entity, triplanar: metres | {tile, sharpness} | null, parallax_fade: [start, end] | null, parallax,
   normal_scale}`; `texgen {preset, apply_to: id|name, normal, parallax}`. Test: `games/demo/tests/triplanar.txt`.
 - **Input lag on a GPU-bound device:** without a limit Chrome queues frames and the screen shows one that is

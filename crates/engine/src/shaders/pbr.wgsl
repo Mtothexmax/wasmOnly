@@ -582,7 +582,13 @@ fn shade(i: VsOut, front: bool, d: Deriv, face_n: vec3f) -> Surface {
     var n = select(nn, normalize(nn - 2.0 * dot(nn, face_n) * face_n), !front);
     let n_geo = n; // before normal mapping (horizon occlusion of the ambient specular)
     let v = normalize(g.camera_pos.xyz - i.world);
-    let tbn = cotangent_frame(n, d);
+    // cotangent_frame assumes a y-up screen; WebGPU's y-down flips T and B (front faces). Orient the
+    // frame by the uv gradient so T / B are the true +u / +v directions everywhere (normal maps, parallax
+    // and studs: height white = high, normal map x along +u, y along +v, as texgen bakes them).
+    let tbn0 = cotangent_frame(n, d);
+    let ori = dot(d.dpx, tbn0[0]) * d.duvx.x + dot(d.dpy, tbn0[0]) * d.duvy.x;
+    let fs = select(-1.0, 1.0, ori >= 0.0);
+    let tbn = mat3x3f(tbn0[0] * fs, tbn0[1] * fs, tbn0[2]);
 
     let is_terrain = inst.params.z < -0.5;
     var uv = i.uv;
@@ -594,13 +600,8 @@ fn shade(i: VsOut, front: bool, d: Deriv, face_n: vec3f) -> Surface {
     }
     // Material::studs (render.stud_relief = quality, 0 = off)
     var stud = StudHit(vec3f(0.0, 0.0, 1.0), uv, 1.0, 0.0);
-    var stud_tbn = tbn;
+    let stud_tbn = tbn;
     if (inst.studs.x > 0.0 && g.shadow_sets.w > 0.5 && !is_terrain && !tri_on && (inst.studs2.z < 0.5 || n_geo.y > 0.5)) {
-        // cotangent_frame drops the determinant's sign (WebGPU's y-down screen: T, B = -du, -dv on
-        // front faces); the ray needs the true +u / +v directions, so orient the frame by the uv gradient
-        let ori = dot(d.dpx, tbn[0]) * d.duvx.x + dot(d.dpy, tbn[0]) * d.duvy.x;
-        let fs = select(-1.0, 1.0, ori >= 0.0);
-        stud_tbn = mat3x3f(tbn[0] * fs, tbn[1] * fs, tbn[2]);
         let view_ts = vec3f(dot(v, stud_tbn[0]), dot(v, stud_tbn[1]), dot(v, stud_tbn[2]));
         stud = stud_relief(uv, view_ts, inst.studs, inst.studs2, g.shadow_sets.w > 1.5, d);
         uv = mix(uv, stud.uv, step(0.5, stud.w)); // the colour map follows the stud (no half shift)

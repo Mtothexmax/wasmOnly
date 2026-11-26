@@ -1,7 +1,7 @@
 // Impostor bake (impostor.rs): renders a model's primitives from N azimuths into an atlas with an
 // orthographic camera per view. Target 0 = albedo (texture * base colour * vertex colour, sRGB
 // target), target 1 = normal in the card's tangent space as pbr.wgsl's derivative TBN reconstructs
-// it (x = -right, y = up, z toward the viewer).
+// it (x = +u = right, y = +v = down, z toward the viewer).
 // `dilate` then copies the bake into the final mip 0 and fills empty texels with the nearest
 // covered colour, so mips and bilinear filtering don't bleed black into the silhouette.
 // Standalone shader (not prefixed with common.wgsl).
@@ -53,8 +53,8 @@ fn fs_bake(i: VOut, @builtin(front_facing) front: bool) -> FOut {
     }
     var o: FOut;
     o.albedo = vec4f(t.rgb * d.color.rgb * i.col.rgb, 1.0);
-    // pbr.wgsl's cotangent_frame (WebGPU screen y points down) gives T = -right, B = +up on the card
-    o.normal = vec4f(vec3f(-n.x, n.y, n.z) * 0.5 + 0.5, 1.0);
+    // pbr.wgsl's tangent frame on the card: T = +u = right, B = +v = down (rows grow downwards)
+    o.normal = vec4f(vec3f(n.x, -n.y, n.z) * 0.5 + 0.5, 1.0);
     return o;
 }
 
