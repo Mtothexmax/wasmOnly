@@ -1354,6 +1354,15 @@ pub struct Renderer {
     gpu_key: String,
     /// `?direct_fail=1` test run: that forced (late) failure is not remembered (`=2` is, like a real one).
     direct_fail_test: bool,
+    /// `frame_probe` command: capture the next main-view frame (`crate::frame_probe`)
+    pub(crate) frame_probe_armed: bool,
+    /// instance slot whose record the probe echoes
+    pub(crate) frame_probe_slot: u32,
+    pub(crate) frame_probe_result: Rc<std::cell::RefCell<Option<serde_json::Value>>>,
+    /// the canvas was configured with COPY_SRC (`?frame_probe=1`)
+    pub(crate) frame_probe_canvas: bool,
+    /// `?frame_probe=1`: main frames until the probe arms itself (once, ~3 s after the first frame)
+    frame_probe_auto: u32,
     depth_view: Option<GpuTextureView>,
     /// Desktop GPU (AMD / NVIDIA / Intel: immediate-mode rendering) as opposed to a tile-based
     /// mobile GPU. Decides the load/store ops of the multisampled scene target: clears and discards
@@ -1522,6 +1531,15 @@ impl Renderer {
             && local_storage().and_then(|s| s.get_item(DIRECT_FAIL_KEY).ok().flatten()).is_some_and(|v| v == gpu_key);
         let cfg = GpuCanvasConfiguration::new(&device, format);
         cfg.set_alpha_mode(GpuCanvasAlphaMode::Opaque);
+        // `?frame_probe=1`: the canvas can be copied from, so `frame_probe` reads its centre pixel too
+        let probe_canvas = js_sys::Reflect::get(&js_sys::global(), &"location".into())
+            .and_then(|l| js_sys::Reflect::get(&l, &"search".into()))
+            .ok()
+            .and_then(|q| q.as_string())
+            .is_some_and(|q| q.contains("frame_probe=1"));
+        if probe_canvas {
+            cfg.set_usage(gpu_texture_usage::RENDER_ATTACHMENT | gpu_texture_usage::COPY_SRC);
+        }
         // direct output draws through an sRGB view of the canvas (hardware encode, linear blending)
         let ldr_format = match format {
             _ if samples != 1 || !config.direct_output || remembered => None,
@@ -1861,7 +1879,7 @@ impl Renderer {
         let globals_buf = device
             .create_buffer(&GpuBufferDescriptor::new(
                 std::mem::size_of::<Globals>() as u32,
-                gpu_buffer_usage::UNIFORM | gpu_buffer_usage::COPY_DST,
+                gpu_buffer_usage::UNIFORM | gpu_buffer_usage::COPY_DST | gpu_buffer_usage::COPY_SRC,
             ))
             .map_err(js_err)?;
         let shadow_size = 2048;
@@ -2057,6 +2075,11 @@ impl Renderer {
             ldr_fail_stored: false,
             gpu_key,
             direct_fail_test: direct_fail == "1",
+            frame_probe_armed: false,
+            frame_probe_slot: 0,
+            frame_probe_result: Rc::new(std::cell::RefCell::new(None)),
+            frame_probe_canvas: probe_canvas,
+            frame_probe_auto: if probe_canvas { 180 } else { 0 },
             depth_view: None,
             post,
             grass,
@@ -2140,7 +2163,7 @@ impl Renderer {
         device
             .create_buffer(&GpuBufferDescriptor::new(
                 cap * std::mem::size_of::<InstanceRaw>() as u32,
-                gpu_buffer_usage::STORAGE | gpu_buffer_usage::COPY_DST,
+                gpu_buffer_usage::STORAGE | gpu_buffer_usage::COPY_DST | gpu_buffer_usage::COPY_SRC,
             ))
             .map_err(js_err)
     }
@@ -2358,6 +2381,65 @@ impl Renderer {
             particle_additive: self.post.particle_additive.clone(),
             particle_alpha: self.post.particle_alpha.clone(),
         }
+    }
+
+    /// `frame_probe`: echoes of Globals, one Instance record and the cull Params + centre pixels (see
+    /// `crate::frame_probe`), encoded into this frame's command encoder.
+    fn encode_frame_probe(&self, encoder: &GpuCommandEncoder, stats: &FrameStats, gpu: bool, direct: bool) -> crate::frame_probe::Pending {
+        use crate::frame_probe::EchoSpec;
+        let common = include_str!("shaders/common.wgsl");
+        let cull_src = include_str!("shaders/cull.wgsl");
+        let inst_size = std::mem::size_of::<InstanceRaw>() as u32;
+        let slot = self.frame_probe_slot;
+        let mut specs = vec![EchoSpec {
+            label: "globals",
+            prefix: common,
+            struct_name: "Globals",
+            access: "g".into(),
+            buffer: &self.globals_buf,
+            binding: 0,
+            uniform: true,
+            byte_offset: 0,
+        }];
+        if (slot as f64 + 1.0) * inst_size as f64 <= self.instance_buf.size() {
+            specs.push(EchoSpec {
+                label: "instance",
+                prefix: common,
+                struct_name: "Instance",
+                access: format!("instances[{slot}u]"),
+                buffer: &self.instance_buf,
+                binding: 1,
+                uniform: false,
+                byte_offset: slot * inst_size,
+            });
+        }
+        if let Some(sg) = self.scene_gpu.as_ref() {
+            specs.push(EchoSpec {
+                label: "cull_params",
+                prefix: cull_src,
+                struct_name: "Params",
+                access: "p".into(),
+                buffer: sg.params_buffer(),
+                binding: 0,
+                uniform: true,
+                byte_offset: 0,
+            });
+        }
+        let canvas = if self.frame_probe_canvas { self.context.get_current_texture().ok() } else { None };
+        let mut pixels = Vec::new();
+        if let Some(t) = self.targets.as_ref().filter(|_| !direct) {
+            pixels.push(("hdr_centre", &t.hdr_tex, (t.size.0 / 2, t.size.1 / 2)));
+        }
+        if let Some(c) = canvas.as_ref() {
+            pixels.push(("canvas_centre", c, (c.width() / 2, c.height() / 2)));
+        }
+        let info = serde_json::json!({
+            "gpu_culling": gpu, "direct_output": direct, "size": [self.size.0, self.size.1],
+            "gpu_frustum_culled": stats.gpu_frustum_culled, "gpu_occluded": stats.gpu_occluded, "gpu_visible": stats.gpu_visible,
+            "gpu_triangles": stats.gpu_triangles, "instance_slot": slot, "canvas_copy": self.frame_probe_canvas,
+            "rust_bytes": {"globals": std::mem::size_of::<Globals>(), "instance": inst_size},
+        });
+        crate::frame_probe::encode(&self.device, encoder, &specs, &pixels, info)
     }
 
     /// Why this view cannot use the direct output ("" = it can): something the composite would add.
@@ -4945,7 +5027,20 @@ impl Renderer {
         if let Some(t) = self.timing.as_ref().filter(|_| main) {
             t.encode_resolve(&encoder);
         }
+        if main && rtt.is_none() && self.frame_probe_auto > 0 {
+            self.frame_probe_auto -= 1;
+            self.frame_probe_armed |= self.frame_probe_auto == 0;
+        }
+        let frame_probe = if main && rtt.is_none() && self.frame_probe_armed {
+            self.frame_probe_armed = false;
+            Some(self.encode_frame_probe(&encoder, &stats, gpu, direct_view.is_some()))
+        } else {
+            None
+        };
         self.queue.submit(&[encoder.finish()]);
+        if let Some(p) = frame_probe {
+            crate::frame_probe::finish(p, self.frame_probe_result.clone());
+        }
         if main {
             let t0 = crate::log::now_ms();
             self.pacing.submitted(t0);

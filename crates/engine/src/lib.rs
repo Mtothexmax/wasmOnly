@@ -19,6 +19,7 @@ pub mod geom;
 pub mod gltf_loader;
 pub mod gpu_timing;
 pub mod impostor;
+pub(crate) mod frame_probe;
 pub(crate) mod gpu_cull;
 pub mod input;
 pub mod interp;

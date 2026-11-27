@@ -443,7 +443,8 @@ impl Post {
         use gpu_texture_usage::{COPY_DST as CD, COPY_SRC as CS};
         // TEXTURE_BINDING: Hi-Z, water and particles read this frame's depth
         let depth = tex(depth_format, (w, h), RA | TB, samples, 1, "msaa-depth")?.create_view().map_err(js_err)?;
-        let hdr_tex = tex(HDR_FORMAT, (w, h), RA | TB | CD, 1, 1, "hdr")?;
+        // COPY_SRC: `frame_probe` reads its centre pixel
+        let hdr_tex = tex(HDR_FORMAT, (w, h), RA | TB | CD | CS, 1, 1, "hdr")?;
         let hdr_view = hdr_tex.create_view().map_err(js_err)?;
         // without MSAA the scene is drawn straight into the HDR target
         let msaa = if samples > 1 { tex(HDR_FORMAT, (w, h), RA, samples, 1, "msaa-hdr")?.create_view().map_err(js_err)? } else { hdr_view.clone() };

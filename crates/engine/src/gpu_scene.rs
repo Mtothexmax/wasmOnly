@@ -1009,6 +1009,11 @@ pub(super) struct SceneGpu {
 const OBJ_SIZE: u32 = std::mem::size_of::<GpuObject>() as u32;
 
 impl SceneGpu {
+    /// The cull `Params` uniform (read back by `frame_probe`).
+    pub(crate) fn params_buffer(&self) -> &GpuBuffer {
+        &self.params_buf
+    }
+
     fn buf(device: &GpuDevice, size: u32, usage: u32, label: &str) -> Result<GpuBuffer, String> {
         let b = device.create_buffer(&GpuBufferDescriptor::new(size.max(16), usage)).map_err(js_err)?;
         b.set_label(label);
@@ -1055,7 +1060,7 @@ impl SceneGpu {
             reset_pipeline: pipeline("reset"),
             cull_pipeline: pipeline("cull"),
             bgl,
-            params_buf: Self::buf(device, std::mem::size_of::<SceneParams>() as u32, gpu_buffer_usage::UNIFORM | gpu_buffer_usage::COPY_DST, "scene-params")?,
+            params_buf: Self::buf(device, std::mem::size_of::<SceneParams>() as u32, gpu_buffer_usage::UNIFORM | gpu_buffer_usage::COPY_DST | gpu_buffer_usage::COPY_SRC, "scene-params")?,
             objects_buf: Self::buf(device, 1024 * OBJ_SIZE, storage, "scene-objects")?,
             objects_cap: 1024,
             args_buf: Self::buf(device, 256 * 20, storage | gpu_buffer_usage::INDIRECT, "scene-args")?,

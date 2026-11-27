@@ -1,0 +1,15 @@
+# frame_probe: one real frame read back. The GPU's view of the Globals / Instance / cull Params buffers must
+# equal the buffers word by word (runtime-indexed, constant-indexed and raw reads), the HDR centre is lit.
+#   node tools/bridge.mjs run games/demo/tests/frameprobe.txt
+# On a device: open the page with ?frame_probe=1 (also the canvas pixel; the probe arms itself after 180
+# frames) and read the log lines "frame probe: ..." / "frame probe result: {...}".
+reload
+wait 1000
+call frame_probe
+frames 5
+wait 500
+expect frame_probe.last.echo.globals.ok == true
+expect frame_probe.last.echo.instance.ok == true
+expect frame_probe.last.echo.cull_params.ok == true
+expect frame_probe.last.errors.length == 0
+expect frame_probe.last.pixels.hdr_centre.3 == 1

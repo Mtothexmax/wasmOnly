@@ -22,7 +22,7 @@
 //      a time; the stubs that make it run name the function holding the construct the driver drops.
 // Results are shown on the page and POSTed as JSON to /__report and /__log (kind "drawprobe").
 // URL options: ?only=<substring> (tests whose name contains it), ?bisect=0, ?micro=0, ?engine=0.
-import { readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -257,6 +257,14 @@ function texture(dim, format, samples = 1, extraUsage = 0) {
   const t = d.createTexture({ size, format, usage, sampleCount: samples, dimension: dim === '1d' ? '1d' : dim === '3d' ? '3d' : '2d' });
   return t.createView({ dimension: dim });
 }
+// word i = (i % 97) + 1 as f32: every buffer read gives a known, non-zero value
+function patterned(size, usage) {
+  const b = d.createBuffer({ size, usage, mappedAtCreation: true });
+  const f = new Float32Array(b.getMappedRange());
+  for (let i = 0; i < f.length; i++) f[i] = (i % 97) + 1;
+  b.unmap();
+  return b;
+}
 function resourceFor(b, compute, probeU, probeOut) {
   const visAll = compute ? GS.COMPUTE : GS.VERTEX | GS.FRAGMENT;
   const visW = compute ? GS.COMPUTE : GS.FRAGMENT;
@@ -264,11 +272,11 @@ function resourceFor(b, compute, probeU, probeOut) {
   let r, t = b.type, m;
   if (b.space.startsWith('uniform')) {
     e.visibility = visAll; e.buffer = { type: 'uniform' };
-    r = { buffer: b.name === 'probe_u' ? probeU : d.createBuffer({ size: U_SIZE, usage: BU.UNIFORM }) };
+    r = { buffer: b.name === 'probe_u' ? probeU : patterned(U_SIZE, BU.UNIFORM) };
   } else if (b.space.startsWith('storage')) {
     const rw = b.space.includes('read_write');
     e.visibility = rw ? visW : visAll; e.buffer = { type: rw ? 'storage' : 'read-only-storage' };
-    r = { buffer: b.name === 'probe_out' ? probeOut : d.createBuffer({ size: 1 << 20, usage: BU.STORAGE }) };
+    r = { buffer: b.name === 'probe_out' ? probeOut : patterned(1 << 20, BU.STORAGE) };
   } else if (/^sampler_comparison/.test(t)) {
     e.visibility = visAll; e.sampler = { type: 'comparison' }; r = d.createSampler({ compare: 'less' });
   } else if (/^sampler/.test(t)) {
@@ -324,7 +332,7 @@ const timeout = (p, ms) => Promise.race([p, new Promise((_, rej) => setTimeout((
 async function runTest(kind, src, entry, consts) {
   if (lost) return 'ERROR device lost';
   let code;
-  try { code = kind === 'vertex' ? wrapVertex(src, entry) : kind === 'fragment' ? wrapFragment(src, entry) : wrapCompute(src, entry); }
+  try { code = kind === 'raw' ? src + PROBE : kind === 'vertex' ? wrapVertex(src, entry) : kind === 'fragment' ? wrapFragment(src, entry) : wrapCompute(src, entry); }
   catch (e) { return 'ERROR probe wrap: ' + e.message; }
   d.pushErrorScope('out-of-memory'); d.pushErrorScope('internal'); d.pushErrorScope('validation');
   let res = null, rb, rbc;
@@ -334,7 +342,7 @@ async function runTest(kind, src, entry, consts) {
     const errs = ci.messages.filter((m) => m.type === 'error');
     if (errs.length) throw new Error('WGSL ' + errs.slice(0, 2).map((m) => m.lineNum + ': ' + m.message).join('; '));
     const compute = kind === 'compute';
-    const entries = kind === 'compute' ? [entry] : kind === 'vertex' ? [entry, 'probe_fs'] : ['probe_vs', entry];
+    const entries = kind === 'compute' ? [entry] : kind === 'raw' ? ['t_vs', 't_fs2'] : kind === 'vertex' ? [entry, 'probe_fs'] : ['probe_vs', entry];
     const { layout, groups, probeOut } = setup(code, compute, entries);
     const enc = d.createCommandEncoder();
     let color = null;
@@ -343,9 +351,9 @@ async function runTest(kind, src, entry, consts) {
       const pass = enc.beginComputePass(); pass.setPipeline(p); groups.forEach((g, i) => pass.setBindGroup(i, g));
       pass.dispatchWorkgroups(1); pass.end();
     } else {
-      const vertex = kind === 'vertex' ? { module, entryPoint: entry, buffers: vertexInputs(code, entry) } : { module, entryPoint: 'probe_vs' };
-      const fsEntry = kind === 'vertex' ? 'probe_fs' : entry;
-      const targets = kind === 'vertex' ? [{ format: 'rgba8unorm' }] : fragTargets(code, entry);
+      const vertex = kind === 'raw' ? { module, entryPoint: 't_vs' } : kind === 'vertex' ? { module, entryPoint: entry, buffers: vertexInputs(code, entry) } : { module, entryPoint: 'probe_vs' };
+      const fsEntry = kind === 'raw' ? 't_fs2' : kind === 'vertex' ? 'probe_fs' : entry;
+      const targets = kind === 'vertex' || kind === 'raw' ? [{ format: 'rgba8unorm' }] : fragTargets(code, entry);
       const p = await d.createRenderPipelineAsync({
         layout, vertex, primitive: { topology: 'triangle-list', cullMode: 'none' },
         fragment: { module, entryPoint: fsEntry, targets, constants: kind === 'fragment' ? pick(code, consts) : {} },
@@ -378,19 +386,31 @@ async function runTest(kind, src, entry, consts) {
     const c = new Uint32Array(rb.getMappedRange().slice(0)); rb.unmap();
     let px = null;
     if (rbc) { await timeout(rbc.mapAsync(GPUMapMode.READ), 5000); px = [...new Uint8Array(rbc.getMappedRange().slice(0, 4))]; rbc.unmap(); }
-    const ran = kind === 'vertex' ? c[1] > 0 || (px && px[0] > 40 && px[0] < 90 && px[2] > 160) : c[0] > 0;
+    const ran = kind === 'vertex' ? c[1] > 0 || (px && px[0] > 40 && px[0] < 90 && px[2] > 160) : kind === 'raw' ? c[1] > 0 : c[0] > 0;
+    lastR = c[3] === 1 ? new Float32Array(c.buffer)[2] : undefined;
     return ran ? 'ran' : 'DROPPED' + (px ? ' (px ' + px.join(',') + ')' : '');
   } catch (e) { return 'ERROR readback ' + e.message; }
 }
 
 const results = [];
+let lastR;
+// values r computed by the micro tests on a desktop GPU (tools/draw-probe-ref.json): a different value here
+// means the driver miscompiles the construct (a wrong result instead of a dropped draw)
+const REF = __REF__;
+const same = (a, b) => (Number.isNaN(a) && Number.isNaN(b)) || Math.abs(a - b) <= 1e-4 * Math.max(1, Math.abs(b));
+window.probeValues = {};
 async function test(group, name, kind, src, entry, consts) {
   if (ONLY && !name.includes(ONLY)) return null;
   const t0 = performance.now();
-  const res = await runTest(kind, src, entry, consts);
+  lastR = undefined;
+  let res = await runTest(kind, src, entry, consts);
   const r = { group, name, kind, res, ms: Math.round(performance.now() - t0) };
+  if (lastR !== undefined) {
+    r.r = lastR; window.probeValues[name] = lastR;
+    if (name in REF && !same(lastR, REF[name])) { r.ref = REF[name]; res = r.res = 'WRONG r=' + lastR + ' (desktop ' + REF[name] + ')'; }
+  }
   results.push(r);
-  line((res === 'ran' ? '  ' : res.startsWith('DROPPED') ? '!!' : '??') + ' ' + group.padEnd(7) + name.padEnd(42) + res + '  ' + r.ms + 'ms');
+  line((res === 'ran' ? '  ' : res.startsWith('DROPPED') || res.startsWith('WRONG') ? '!!' : '??') + ' ' + group.padEnd(7) + name.padEnd(42) + res + (res === 'ran' && r.r !== undefined ? ' r=' + r.r : '') + '  ' + r.ms + 'ms');
   post(r);
   return res;
 }
@@ -406,16 +426,35 @@ if (q.get('micro') !== '0') {
   line('\\n-- 2. micro constructs (k = 1 at runtime) --');
   for (const [name, decl, body, where] of MICRO) {
     if (where !== 'compute') {
-      const fsrc = decl + '\\n@fragment fn t_fs() -> @location(0) vec4f { let k = u32(probe_u.y); var r = 0.0; ' + body + ' return vec4f(r); }\\n';
+      const fsrc = decl + '\\n@fragment fn t_fs() -> @location(0) vec4f { let k = u32(probe_u.y); var r = 0.0; ' + body + ' atomicStore(&probe_out[2], bitcast<u32>(r)); atomicStore(&probe_out[3], 1u); return vec4f(r); }\\n';
       await test('micro', 'fs:' + name, 'fragment', fsrc, 't_fs');
     }
     if (where !== 'fragment') {
-      const csrc = decl + '\\n@compute @workgroup_size(1) fn t_cs() { let k = u32(probe_u.y); var r = 0.0; ' + body + ' if (r == 12345.0) { atomicAdd(&probe_out[3], 1u); } }\\n';
+      const csrc = decl + '\\n@compute @workgroup_size(1) fn t_cs() { let k = u32(probe_u.y); var r = 0.0; ' + body + ' atomicStore(&probe_out[2], bitcast<u32>(r)); atomicStore(&probe_out[3], 1u); }\\n';
       await test('micro', 'cs:' + name, 'compute', csrc, 't_cs');
+    }
+    // vertex stage, k from vertex_index / instance_index (provoking vertex 0, instance 0: k = 1); r goes to the
+    // fragment as a flat varying, the triangle itself does not depend on r
+    if (!where && !['atomic_min_rt', 'tex_sample_grad'].includes(name)) {
+      for (const [kn, kexpr] of [['vi', 'vi + 1u'], ['ii', 'ii + 1u']]) {
+        const vsrc = decl + '\\nstruct VO { @builtin(position) p: vec4f, @location(0) @interpolate(flat) r: f32, }\\n' +
+          '@vertex fn t_vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VO { let k = ' + kexpr + '; var r = 0.0; ' + body +
+          ' var o: VO; o.p = probe_full(vi); o.r = r; return o; }\\n' +
+          '@fragment fn t_fs2(i: VO) -> @location(0) vec4f { atomicAdd(&probe_out[1], 1u); atomicStore(&probe_out[2], bitcast<u32>(i.r)); atomicStore(&probe_out[3], 1u); return vec4f(0.25, 0.5, 0.75, 1.0); }\\n';
+        await test('micro', 'vs(' + kn + '):' + name, 'raw', vsrc, 't_vs');
+      }
     }
   }
 }
 
+// gputest A/E: the triangle's corners themselves from a runtime index (a wrong value = nothing covered)
+if (q.get('micro') !== '0') {
+  const FS2 = 'struct VO { @builtin(position) p: vec4f, @location(0) @interpolate(flat) r: f32, }\\n@fragment fn t_fs2(i: VO) -> @location(0) vec4f { atomicAdd(&probe_out[1], 1u); return vec4f(1.0); }\\n';
+  await test('micro', 'vs:corners_let_array[vi]', 'raw', FS2 + '@vertex fn t_vs(@builtin(vertex_index) vi: u32) -> VO { let c = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0)); var o: VO; o.p = vec4f(c[vi], 0.5, 1.0); return o; }\\n', 't_vs');
+  await test('micro', 'vs:corners_var_array[vi]', 'raw', FS2 + '@vertex fn t_vs(@builtin(vertex_index) vi: u32) -> VO { var c = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0)); var o: VO; o.p = vec4f(c[vi], 0.5, 1.0); return o; }\\n', 't_vs');
+  await test('micro', 'vs:corners_vec_comp[vi]', 'raw', FS2 + '@vertex fn t_vs(@builtin(vertex_index) vi: u32) -> VO { let x = vec3f(-1.0, 3.0, -1.0); let y = vec3f(-1.0, -1.0, 3.0); var o: VO; o.p = vec4f(x[vi], y[vi], 0.5, 1.0); return o; }\\n', 't_vs');
+  await test('micro', 'vs:corners_bitmath[vi]', 'raw', FS2 + '@vertex fn t_vs(@builtin(vertex_index) vi: u32) -> VO { var o: VO; o.p = probe_full(vi); return o; }\\n', 't_vs');
+}
 const dropped = [];
 // ?force_bisect=pbr:fs_main runs the bisection for that entry even if it ran (checks that every stub compiles)
 for (const fb of (q.get('force_bisect') || '').split(',').filter(Boolean)) {
@@ -462,5 +501,7 @@ const sum = results.filter((r) => r.res !== 'ran').map((r) => r.group + ':' + r.
 line('\\ndone. not ran: ' + (sum.length ? '\\n' + sum.join('\\n') : 'none'));
 post({ done: true, not_ran: sum });
 </script>`;
-writeFileSync(out, page);
+const refPath = join(root, 'tools', 'draw-probe-ref.json');
+const ref = existsSync(refPath) ? readFileSync(refPath, 'utf8').trim() : '{}';
+writeFileSync(out, page.replace('__REF__', ref));
 console.log(`wrote ${out} (${ENGINE.length} engine entries, ${MICRO.length} micro constructs)`);

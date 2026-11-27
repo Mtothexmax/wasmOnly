@@ -52,6 +52,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("overlap", "Entities overlapping a sphere or box. args: {pos, radius?: 1} | {pos, half: [x,y,z]}, sensors?: false"),
     ("trigger", "Spawn a box trigger zone (sensor, reports enter/exit). args: {pos, half?: [1,1,1], name?: 'trigger'}"),
     ("gpu_scene", "GPU-driven scene of the main view: object slots, draw groups, id-buffer layout, last GPU counters (frustum, occluded, visible, shadow instances, LOD levels)"),
+    ("frame_probe", "Reads back one real frame: echoes of the Globals / Instance / cull Params buffers as the GPU reads them (runtime index, constant index, raw) compared word by word with the buffers, centre pixel of the HDR target and (page URL ?frame_probe=1) of the canvas. Arms the next frame; the result arrives a few frames later in `last` (also logged). args: {slot?: instance slot to echo (default 0)}"),
     ("render_texture", "Render textures (portraits, mirrors). args: {id?, render?: true (re-render once), export?: true (PNG blob URL -> url)}"),
     ("animation", "Animators (glTF clips, skinning, morph targets). args: {id?, play?: clip, fade?: 0.2, speed?: 1, looped?: true, stop?: true, morph?: index, weight?: w}"),
     ("particles", "Particle emitters + live counts. args: {preset?: 'fire'|'smoke'|'sparks'|'fireflies'|'dust'|'magic'|'rain'|'splash', pos?: [x,y,z], burst?: n, layer?: 0..31, seed?: n, name?} spawns one (name defaults to the preset); without preset, {name?} filters the list."),
@@ -1077,6 +1078,14 @@ pub(crate) fn handle<G: Game>(
             Ok(json!({"id": e.id()}))
         }
         "animation" => ctx.animation_command(a),
+        "frame_probe" => {
+            if let Some(s) = a["slot"].as_u64() {
+                ctx.renderer.frame_probe_slot = s as u32;
+            }
+            ctx.renderer.frame_probe_armed = true;
+            let last = ctx.renderer.frame_probe_result.borrow().clone();
+            Ok(json!({"armed": true, "canvas_copy": ctx.renderer.frame_probe_canvas, "last": last}))
+        }
         "render_texture" => {
             if let Some(id) = a["id"].as_u64() {
                 let rt = crate::render_texture::RenderTextureId(id as u32);

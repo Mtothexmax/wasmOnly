@@ -58,6 +58,15 @@ normal `cargo` output above it.
   functions it reaches one at a time and names the one holding the construct. Results on the page and POSTed to
   `/__report` + `/__log` (kind `drawprobe`). `?only=<substring>`, `?micro=0`, `?engine=0`, `?bisect=0`,
   `?force_bisect=pbr:fs_main` (checks that every stub compiles).
+  The micro tests also report the value they computed (`r=`) and compare it with desktop values baked in from
+  `tools/draw-probe-ref.json` (`WRONG r=..`: the driver miscompiles instead of dropping), in fragment, compute and
+  vertex stages (index from `vertex_index` / `instance_index`). Refresh the reference on a desktop GPU:
+  `JSON.stringify(window.probeValues)` after a run.
+  In the real game: `call frame_probe` (page URL `?frame_probe=1` adds the canvas pixel and arms it by itself after
+  180 frames) echoes the Globals, one Instance record (`{slot}`) and the cull Params as the GPU reads them
+  (runtime-indexed, constant-indexed, raw) and compares them word by word with the buffers, plus the centre pixel of
+  the HDR target / canvas and that frame's cull counters: `last` of the next call, and log lines `frame probe: ..`
+  / `frame probe result: {..}`. Test: `games/demo/tests/frameprobe.txt`.
   A draw the driver *silently drops* (no validation error, no device loss) is worse: PowerVR B-series (Android 10,
   Chrome 158.0.8127.42, from 2026-11-27) drops every draw *and compute dispatch* whose shader indexes a
   `let`/`var`/`const` array or a **vector component** with a runtime value (`array<vec2f, 3>(..)[vertex_index]`,
