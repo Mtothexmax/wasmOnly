@@ -1513,11 +1513,20 @@ impl Renderer {
             .ok_or("canvas.getContext('webgpu') returned null")?
             .unchecked_into();
         let format = gpu.get_preferred_canvas_format();
+        // A direct-output set that failed on this GPU before (`DIRECT_FAIL_KEY`) is skipped, and the canvas
+        // is then configured exactly as without direct output (no sRGB view format). A PowerVR B-series phone
+        // drew nothing on the remembered-skip path (with the view format configured but never used), while a
+        // fresh canary failure on the same build drew normally.
+        let gpu_key = direct_gpu_key(&adapter);
+        let remembered = samples == 1
+            && config.direct_output
+            && direct_fail.is_empty()
+            && local_storage().and_then(|s| s.get_item(DIRECT_FAIL_KEY).ok().flatten()).is_some_and(|v| v == gpu_key);
         let cfg = GpuCanvasConfiguration::new(&device, format);
         cfg.set_alpha_mode(GpuCanvasAlphaMode::Opaque);
         // direct output draws through an sRGB view of the canvas (hardware encode, linear blending)
         let ldr_format = match format {
-            _ if samples != 1 || !config.direct_output => None,
+            _ if samples != 1 || !config.direct_output || remembered => None,
             GpuTextureFormat::Bgra8unorm => Some(GpuTextureFormat::Bgra8unormSrgb),
             GpuTextureFormat::Rgba8unorm => Some(GpuTextureFormat::Rgba8unormSrgb),
             _ => None,
@@ -1768,10 +1777,6 @@ impl Renderer {
         // A driver that cannot build one of the set usually builds none (PowerVR B-series: all
         // VK_ERROR_UNKNOWN, ~300 ms each). So one canary is built and awaited first, and a failure is
         // remembered per GPU + browser (`DIRECT_FAIL_KEY`): the next start skips the set.
-        let gpu_key = direct_gpu_key(&adapter);
-        let remembered = ldr_format.is_some()
-            && direct_fail.is_empty()
-            && local_storage().and_then(|s| s.get_item(DIRECT_FAIL_KEY).ok().flatten()).is_some_and(|v| v == gpu_key);
         if remembered {
             crate::log_info!("direct output: skipped, its pipelines failed on this GPU before (localStorage {DIRECT_FAIL_KEY})");
             ldr_check.failed.borrow_mut().push("remembered".into());

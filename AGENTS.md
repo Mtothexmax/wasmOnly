@@ -205,8 +205,9 @@ normal `cargo` output above it.
   one is never drawn; its prewarm waits for that too). A driver that fails one usually fails all (PowerVR B-series:
   every LDR pipeline, ~300 ms each), so a canary (`pbr-opaque-ldr`) is built and awaited first and the rest only if
   it works; a failure is remembered in localStorage `wasmonly.direct_output_failed` per GPU + user agent, and the
-  next start skips the set (log `direct output: skipped ...`; a new Chrome version retries; remove the key to retry by
-  hand). Tests: `?msaa=1&direct=1&direct_fail=1` builds `pbr-opaque-eq-2s-ldr` invalid (late failure, not remembered,
+  next start skips the set and configures the canvas without the sRGB view format, exactly as with direct output off
+  (log `direct output: skipped ...`; a new Chrome version retries; remove the key to retry by hand; a PowerVR phone
+  drew nothing on this path while the view format was still configured). Tests: `?msaa=1&direct=1&direct_fail=1` builds `pbr-opaque-eq-2s-ldr` invalid (late failure, not remembered,
   `games/demo/tests/directfail.txt`), `direct_fail=2` the canary (remembered). Costs ~20 pipelines at
   startup (prewarmed with the rest; `first use: direct output` in the log). Pixels match the composite (title
   screen: mean diff 0.8/255) except semi-transparent surfaces, which blend after the tonemap (a 50 % red cube over
