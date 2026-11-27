@@ -1514,9 +1514,7 @@ impl Renderer {
             .unchecked_into();
         let format = gpu.get_preferred_canvas_format();
         // A direct-output set that failed on this GPU before (`DIRECT_FAIL_KEY`) is skipped, and the canvas
-        // is then configured exactly as without direct output (no sRGB view format). A PowerVR B-series phone
-        // drew nothing on the remembered-skip path (with the view format configured but never used), while a
-        // fresh canary failure on the same build drew normally.
+        // is then configured exactly as without direct output (no sRGB view format, nothing unused configured).
         let gpu_key = direct_gpu_key(&adapter);
         let remembered = samples == 1
             && config.direct_output
