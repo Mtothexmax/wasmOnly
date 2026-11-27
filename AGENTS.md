@@ -52,6 +52,12 @@ normal `cargo` output above it.
   skipped so the rest of the frame still renders. To find the construct a device chokes on:
   `node tools/gpu-probe.mjs out.html`, open the page on the device: it compiles PBR/grass variants with parts
   stubbed out and reports each (page + POST `/__log`).
+  For a driver that builds a pipeline but *runs* nothing: `node tools/draw-probe.mjs out.html`, open it on the device.
+  It runs every engine entry point (real sources, zero bindings) plus ~36 single constructs in a fragment and a
+  compute shader and judges each by readback (`ran` / `DROPPED` / `ERROR`); for every dropped entry it stubs the
+  functions it reaches one at a time and names the one holding the construct. Results on the page and POSTed to
+  `/__report` + `/__log` (kind `drawprobe`). `?only=<substring>`, `?micro=0`, `?engine=0`, `?bisect=0`,
+  `?force_bisect=pbr:fs_main` (checks that every stub compiles).
   A draw the driver *silently drops* (no validation error, no device loss) is worse: PowerVR B-series (Android 10,
   Chrome 158.0.8127.42, from 2026-11-27) drops every draw *and compute dispatch* whose shader indexes a
   `let`/`var`/`const` array or a **vector component** with a runtime value (`array<vec2f, 3>(..)[vertex_index]`,
