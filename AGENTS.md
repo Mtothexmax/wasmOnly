@@ -53,11 +53,14 @@ normal `cargo` output above it.
   `node tools/gpu-probe.mjs out.html`, open the page on the device: it compiles PBR/grass variants with parts
   stubbed out and reports each (page + POST `/__log`).
   A draw the driver *silently drops* (no validation error, no device loss) is worse: PowerVR B-series (Android 10,
-  Chrome 158, from 2026-11-27) drops every draw whose shader indexes a `let`/`var`/`const` array with a runtime value
-  (`array<vec2f, 3>(..)[vertex_index]`): white canvas, `stats.render.triangles` 0, no errors. The engine's shaders
-  avoid it (bit maths, `select()` chains, calls with constant indices); `node tools/shader-lint.mjs [paths]` finds it
-  and `dev.mjs build` runs it over the engine shaders and the game's `.wgsl` files first (stage `shader-lint`).
-  Storage/uniform buffer arrays and vector components are not affected as far as known.
+  Chrome 158.0.8127.42, from 2026-11-27) drops every draw *and compute dispatch* whose shader indexes a
+  `let`/`var`/`const` array or a **vector component** with a runtime value (`array<vec2f, 3>(..)[vertex_index]`,
+  `v[k]`, `g.cascade_splits[k]`): white canvas, `stats.render.triangles` 0, `gpu_visible` 0 (cull.wgsl did nothing),
+  no errors. Arrays in uniform/storage buffers (`g.cascades[k]`, `instances[i]`) are fine. The engine's shaders avoid
+  it (bit maths, `select()` chains, calls with constant indices, `comp3`/`comp4(v, k)` from `common.wgsl`);
+  `node tools/shader-lint.mjs [paths]` finds both (vectors only where the type is declared: parameters, struct fields,
+  `let v = vec4f(..)` / `textureLoad(..)`) and `dev.mjs build` runs it over the engine shaders and the game's `.wgsl`
+  files first (stage `shader-lint`).
 - **Z-fighting / flicker:** a screenshot cannot show flicker. Three layers:
   1. debug builds run the z-fighting test automatically after scene changes and log a warning
      (shows up in `bridge reload` / `check`); the first run checks everything within 80 m of the camera, later runs

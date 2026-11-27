@@ -63,14 +63,18 @@ struct DrawArgs {
 // nearest distance of a visible instance per main group (f32 bits; draw order for the next frame)
 @group(0) @binding(6) var<storage, read_write> near: array<atomic<u32>>;
 
+// Element k of (a, b) without `v[k]`: a PowerVR B-series driver (Android 10, Chrome 158) silently does
+// nothing for a shader that indexes a vector with a runtime value (0 visible objects).
 fn pick_u(a: vec4u, b: vec4u, k: u32) -> u32 {
-    if (k < 4u) { return a[k]; }
-    return b[k - 4u];
+    let v = select(b, a, k < 4u);
+    let j = k & 3u;
+    return select(select(select(v.w, v.z, j == 2u), v.y, j == 1u), v.x, j == 0u);
 }
 
 fn pick_f(a: vec4f, b: vec4f, k: u32) -> f32 {
-    if (k < 4u) { return a[k]; }
-    return b[k - 4u];
+    let v = select(b, a, k < 4u);
+    let j = k & 3u;
+    return select(select(select(v.w, v.z, j == 2u), v.y, j == 1u), v.x, j == 0u);
 }
 
 fn occluded(c: vec3f, r: f32) -> bool {

@@ -5,6 +5,17 @@ const CLUSTER_X: u32 = 16u;
 const CLUSTER_Y: u32 = 9u;
 const CLUSTER_Z: u32 = 24u;
 
+// Component k of a vector without `v[k]`: a PowerVR B-series driver (Android 10, Chrome 158) silently drops
+// every draw / dispatch whose shader indexes a vector (or a let/var/const array) with a runtime value.
+// Out-of-range k gives the last component. `node tools/shader-lint.mjs` flags `v[k]` on known vectors.
+fn comp3(v: vec3f, k: u32) -> f32 {
+    return select(select(v.z, v.y, k == 1u), v.x, k == 0u);
+}
+
+fn comp4(v: vec4f, k: u32) -> f32 {
+    return select(select(select(v.w, v.z, k == 2u), v.y, k == 1u), v.x, k == 0u);
+}
+
 struct Light {
     pos_range: vec4f,       // xyz = world position, w = range
     color_intensity: vec4f, // rgb = color, a = intensity

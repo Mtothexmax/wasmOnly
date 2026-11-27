@@ -219,7 +219,7 @@ fn brdf_plastic(n: vec3f, v: vec3f, l: vec3f, albedo: vec3f, metallic: f32, roug
 // p0 / n0: position and normal in cascade 0's light space (current set).
 fn cascade_coord(world: vec3f, n: vec3f, p0: vec3f, n0: vec3f, k: u32, prev: bool) -> vec4f {
     // normal offset scaled by the cascade's texel size (no acne on near cascades, no peter-panning far)
-    let bias = g.cascade_texel[k] * 1.5;
+    let bias = comp4(g.cascade_texel, k) * 1.5;
     var ndc: vec3f;
     if (prev) {
         // previous direction while cross-fading: its own matrices (rare, a few hundred ms)
@@ -266,12 +266,12 @@ fn shadow_factor(world: vec3f, n: vec3f, frag: vec2f) -> f32 {
     let count = g.counts.w;
     var k = 0u;
     loop {
-        if (k >= count || vz <= g.cascade_splits[k]) { break; }
+        if (k >= count || vz <= comp4(g.cascade_splits, k)) { break; }
         k++;
     }
     if (k >= count) { return 1.0; }
-    let start = select(0.0, g.cascade_splits[max(k, 1u) - 1u], k > 0u);
-    let end = g.cascade_splits[k];
+    let start = select(0.0, comp4(g.cascade_splits, max(k, 1u) - 1u), k > 0u);
+    let end = comp4(g.cascade_splits, k);
     let band = mix(start, end, 0.85);
     let t = clamp((vz - band) / max(end - band, 1e-3), 0.0, 1.0);
     // right after a sun step the current set's cascades k > 0 are re-rendered one per frame; until
@@ -433,7 +433,8 @@ fn triplanar(i: VsOut, n: vec3f, v: vec3f, d: Deriv, inst: Instance) -> TriSampl
     var nsum = vec3f(0.0);
     var wsum = 0.0;
     for (var a = 0; a < 3; a++) {
-        if (w[a] < 0.03) { continue; }
+        let wa = comp3(w, u32(a));
+        if (wa < 0.03) { continue; }
         var U = vec3f(sg.y, 0.0, 0.0);
         var V = vec3f(0.0, 0.0, sg.y);
         if (a == 0) {
@@ -449,12 +450,12 @@ fn triplanar(i: VsOut, n: vec3f, v: vec3f, d: Deriv, inst: Instance) -> TriSampl
         if (ps > 0.0) {
             uv = parallax_uv(uv, vec3f(dot(v, U), dot(v, V), dot(v, n)), ps, dd);
         }
-        tex += textureSampleGrad(base_tex, base_sampler, uv, dd.duvx, dd.duvy) * w[a];
+        tex += textureSampleGrad(base_tex, base_sampler, uv, dd.duvx, dd.duvy) * wa;
         if (inst.maps.x != 0.0) {
             let tn = textureSampleGrad(normal_tex, base_sampler, uv, dd.duvx, dd.duvy).xyz * 2.0 - 1.0;
-            nsum += (U * tn.x + V * tn.y) * inst.maps.x * w[a] + n * tn.z * w[a];
+            nsum += (U * tn.x + V * tn.y) * inst.maps.x * wa + n * tn.z * wa;
         }
-        wsum += w[a];
+        wsum += wa;
     }
     tex = tex / max(wsum, 1e-6);
     var r: TriSample;
@@ -474,11 +475,12 @@ fn terrain_albedo(i: VsOut, d: Deriv, inst: Instance) -> vec3f {
     let scale = 0.5 * (1.0 - 2.0 * pad);
     var c = vec3f(0.0);
     for (var k = 0; k < 4; k++) {
-        if (w[k] < 0.002) { continue; } // layer not present here: skip its (anisotropic) tap
-        let tile = max(inst.maps[k], 0.01);
+        let wk = comp4(w, u32(k));
+        if (wk < 0.002) { continue; } // layer not present here: skip its (anisotropic) tap
+        let tile = max(comp4(inst.maps, u32(k)), 0.01);
         let q = vec2f(f32(k % 2), f32(k / 2)) * 0.5 + vec2f(0.5 * pad);
         let uv = q + fract(i.world.xz / tile) * scale;
-        c += textureSampleGrad(base_tex, base_sampler, uv, d.dpx.xz / tile * scale, d.dpy.xz / tile * scale).rgb * w[k];
+        c += textureSampleGrad(base_tex, base_sampler, uv, d.dpx.xz / tile * scale, d.dpy.xz / tile * scale).rgb * wk;
     }
     // large-scale variation against visible tiling
     return c * (0.82 + 0.36 * vnoise(i.world.xz * 0.035));
@@ -729,7 +731,7 @@ fn debug_extra(i: VsOut) -> vec4f {
         let vz = -(g.view * vec4f(i.world, 1.0)).z;
         var k = 0u;
         loop {
-            if (k >= g.counts.w || vz <= g.cascade_splits[k]) { break; }
+            if (k >= g.counts.w || vz <= comp4(g.cascade_splits, k)) { break; }
             k++;
         }
         var col = vec3f(0.35);
@@ -1047,7 +1049,7 @@ fn vs_grass(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) ->
     let res = i32(grass.terrain.w);
     let st = textureLoad(splat_map, vec2i(suv * f32(res - 1) + 0.5), 0);
     let total = max(st.x + st.y + st.z + st.w, 1e-3);
-    let w = st[grass.layer.x] / total;
+    let w = comp4(st, grass.layer.x) / total;
     let full = radius * grass.blade.z;
     let keep = select(1.0, mix(1.0, 0.12, clamp((d - full) / max(radius - full, 1e-3), 0.0, 1.0)), d > full);
     if (r3 > w * keep) { return o; }
