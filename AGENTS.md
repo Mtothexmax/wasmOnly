@@ -52,6 +52,12 @@ normal `cargo` output above it.
   skipped so the rest of the frame still renders. To find the construct a device chokes on:
   `node tools/gpu-probe.mjs out.html`, open the page on the device: it compiles PBR/grass variants with parts
   stubbed out and reports each (page + POST `/__log`).
+  A draw the driver *silently drops* (no validation error, no device loss) is worse: PowerVR B-series (Android 10,
+  Chrome 158, from 2026-11-27) drops every draw whose shader indexes a `let`/`var`/`const` array with a runtime value
+  (`array<vec2f, 3>(..)[vertex_index]`): white canvas, `stats.render.triangles` 0, no errors. The engine's shaders
+  avoid it (bit maths, `select()` chains, calls with constant indices); `node tools/shader-lint.mjs [paths]` finds it
+  and `dev.mjs build` runs it over the engine shaders and the game's `.wgsl` files first (stage `shader-lint`).
+  Storage/uniform buffer arrays and vector components are not affected as far as known.
 - **Z-fighting / flicker:** a screenshot cannot show flicker. Three layers:
   1. debug builds run the z-fighting test automatically after scene changes and log a warning
      (shows up in `bridge reload` / `check`); the first run checks everything within 80 m of the camera, later runs

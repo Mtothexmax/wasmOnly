@@ -96,9 +96,10 @@ fn fs_prefilter(i: VsOut) -> @location(0) vec4f {
     var acc = vec3f(0.0);
     var wsum = 0.0;
     // 4 bilinear taps, Karis-weighted (1 / (1 + luma)) against single bright pixels flickering
-    let offs = array<vec2f, 4>(vec2f(-0.5, -0.5), vec2f(0.5, -0.5), vec2f(-0.5, 0.5), vec2f(0.5, 0.5));
     for (var k = 0; k < 4; k++) {
-        let s = textureSampleLevel(src, samp, i.uv + offs[k] * t * 2.0, 0.0);
+        // offsets (-0.5,-0.5) (0.5,-0.5) (-0.5,0.5) (0.5,0.5) from the index bits (no runtime array index)
+        let off = vec2f(f32(k & 1), f32(k >> 1u)) - 0.5;
+        let s = textureSampleLevel(src, samp, i.uv + off * t * 2.0, 0.0);
         let c = sanitize(s.rgb) * clamp(s.a, 0.0, 1.0);
         let w = 1.0 / (1.0 + luma(c));
         acc += c * w;
@@ -291,10 +292,6 @@ fn vs_composite(@builtin(vertex_index) i: u32) -> CompOut {
     return o;
 }
 
-// 8 ring directions for depth darkening (45 degree steps); rotated per pixel by one angle
-const RING = array<vec2f, 8>(
-    vec2f(1.0, 0.0), vec2f(0.70710678, 0.70710678), vec2f(0.0, 1.0), vec2f(-0.70710678, 0.70710678),
-    vec2f(-1.0, 0.0), vec2f(-0.70710678, -0.70710678), vec2f(0.0, -1.0), vec2f(0.70710678, -0.70710678));
 
 // a = (exposure, bloom intensity, darkening strength, darkening radius in px at 1 m)
 // b = (near, far, bloom on, darkening range in m)
@@ -325,10 +322,11 @@ fn fs_composite(i: CompOut) -> @location(0) vec4f {
             var n = 0.0;
             // rotated per pixel (interleaved gradient noise) so the ring pattern does not show
             let ign = fract(52.9829189 * fract(dot(vec2f(px), vec2f(0.06711056, 0.00583715))));
-            // direction k = RING[k] rotated by ign * 45 degrees (one sin/cos per pixel instead of 8)
-            let rot = vec2f(cos(ign * 0.785398), sin(ign * 0.785398));
+            // direction k = (k + ign) * 45 degrees: start at ign * 45 and turn by 45 degrees per tap
+            // (one sin/cos per pixel, no direction table: PowerVR drops draws that index an array at runtime)
+            var dir = vec2f(cos(ign * 0.785398), sin(ign * 0.785398));
             for (var k = 0; k < 8; k++) {
-                let dir = vec2f(RING[k].x * rot.x - RING[k].y * rot.y, RING[k].x * rot.y + RING[k].y * rot.x);
+                if (k > 0) { dir = vec2f(dir.x - dir.y, dir.x + dir.y) * 0.70710678; }
                 let rr = r * (0.5 + 0.5 * fract(f32(k) * 0.618 + ign));
                 let q = clamp(px + vec2i(dir * rr), vec2i(0), dims - 1);
                 let zq = textureLoad(depth_tex, q, 0);

@@ -22,9 +22,9 @@ struct POut {
 
 @vertex
 fn vs_particle(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> POut {
-    let corners = array<vec2f, 6>(vec2f(-1.0, -1.0), vec2f(1.0, -1.0), vec2f(1.0, 1.0), vec2f(-1.0, -1.0), vec2f(1.0, 1.0), vec2f(-1.0, 1.0));
+    // corners (-1,-1) (1,-1) (1,1) (-1,-1) (1,1) (-1,1) without an array (PowerVR drops draws that index one)
+    let c = vec2f(select(-1.0, 1.0, vi == 1u || vi == 2u || vi == 4u), select(-1.0, 1.0, vi == 2u || vi == 4u || vi == 5u));
     let p = particles[ii];
-    let c = corners[vi];
     let r = p.params.x;
     let rc = vec2f(c.x * cos(r) - c.y * sin(r), c.x * sin(r) + c.y * cos(r));
     var right = g.cam_right.xyz;

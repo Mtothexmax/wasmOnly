@@ -28,6 +28,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import http from 'node:http';
 import { fileURLToPath } from 'node:url';
+import { lint as lintShaders } from './shader-lint.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const args = process.argv.slice(2);
@@ -106,6 +107,14 @@ export function build() {
     targetDir = path.join(PROJECT, 'target', 'threads');
     env.CARGO_TARGET_DIR = targetDir;
     env.CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS = THREAD_RUSTFLAGS;
+  }
+  // driver bugs validation does not catch (PowerVR drops draws that index an array at runtime)
+  const lintHits = lintShaders([path.join(ROOT, 'crates', 'engine', 'src', 'shaders'), GAME_SRC]);
+  if (lintHits.length) {
+    for (const h of lintHits) console.log(`${h.file}:${h.line}: dynamic-array-index: ${h.name}[${h.index}] (PowerVR drops the draw; use select/bit maths)
+    ${h.text}`);
+    console.log(JSON.stringify({ build: 'error', stage: 'shader-lint', game, profile, findings: lintHits.length }));
+    return false;
   }
   console.log(`> cargo ${cargoArgs.join(' ')}`);
   const r = spawnSync('cargo', cargoArgs, { cwd: PROJECT, stdio: 'inherit', env });

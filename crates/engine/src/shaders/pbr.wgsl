@@ -59,6 +59,9 @@ struct Wave {
 
 // Per-wave constants, evaluated when the shader is compiled: direction (wind angle 0.65 + spread),
 // wave number, weight, sqrt(g * wave number) for the dispersion.
+// Never index a let/var/const array with a runtime value in the engine's shaders: a PowerVR B-series
+// driver (Android 10, Chrome 158) silently drops every draw whose shader does that. Use bit maths,
+// select() or calls with constant indices instead (`node tools/shader-lint.mjs` checks it).
 const WAVE_DIR = array<vec2f, 8>(
     vec2f(cos(0.65), sin(0.65)), vec2f(cos(1.07), sin(1.07)), vec2f(cos(0.10), sin(0.10)), vec2f(cos(1.70), sin(1.70)),
     vec2f(cos(-0.55), sin(-0.55)), vec2f(cos(0.87), sin(0.87)), vec2f(cos(0.35), sin(0.35)), vec2f(cos(2.75), sin(2.75)));
@@ -68,29 +71,47 @@ const WAVE_SPEED = array<f32, 8>(
     sqrt(9.81 * 1.0), sqrt(9.81 * 1.37), sqrt(9.81 * 1.83), sqrt(9.81 * 2.6),
     sqrt(9.81 * 3.4), sqrt(9.81 * 4.7), sqrt(9.81 * 6.3), sqrt(9.81 * 8.9));
 
+// one Gerstner wave: displacement and its normal contribution (without the 1 in n.y)
+fn gwave(p: vec2f, ts: f32, amp: f32, scale: f32, chop: f32, fp: f32, d: vec2f, len: f32, wgt: f32, speed: f32, k: f32) -> Wave {
+    var o: Wave;
+    o.disp = vec3f(0.0);
+    o.n = vec3f(0.0);
+    o.crest = 0.0;
+    let f = len * scale;
+    let a = amp * wgt * (1.0 - smoothstep(0.6, 2.2, f * fp));
+    if (a <= 0.0) { return o; }
+    let q = min(chop, 1.0 / (8.0 * f * a + 1e-5)); // no loops at the crests
+    let ph = f * dot(d, p) - speed * ts + k * 1.7;
+    let s = sin(ph);
+    let c = cos(ph);
+    o.disp = vec3f(d.x * q * a * c, a * s, d.y * q * a * c);
+    o.n = vec3f(-d.x * f * a * c, -q * f * a * s, -d.y * f * a * c);
+    return o;
+}
+
+fn gwave_add(a: Wave, b: Wave) -> Wave {
+    var o: Wave;
+    o.disp = a.disp + b.disp;
+    o.n = a.n + b.n;
+    o.crest = 0.0;
+    return o;
+}
+
 fn gerstner(p: vec2f, t: f32, amp: f32, scale: f32, chop: f32, fp: f32) -> Wave {
-    var disp = vec3f(0.0);
-    var nx = 0.0;
-    var nz = 0.0;
-    var ny = 0.0;
     let ts = sqrt(scale) * t; // sqrt(g * len * scale) * t = WAVE_SPEED * sqrt(scale) * t
-    for (var k = 0; k < 8; k++) {
-        let d = WAVE_DIR[k];
-        let f = WAVE_LEN[k] * scale;
-        let a = amp * WAVE_WGT[k] * (1.0 - smoothstep(0.6, 2.2, f * fp));
-        if (a <= 0.0) { continue; }
-        let q = min(chop, 1.0 / (8.0 * f * a + 1e-5)); // no loops at the crests
-        let ph = f * dot(d, p) - WAVE_SPEED[k] * ts + f32(k) * 1.7;
-        let s = sin(ph);
-        let c = cos(ph);
-        disp += vec3f(d.x * q * a * c, a * s, d.y * q * a * c);
-        nx -= d.x * f * a * c;
-        nz -= d.y * f * a * c;
-        ny -= q * f * a * s;
-    }
+    // unrolled with constant indices (const-expressions): no runtime index into the const arrays
+    var acc = gwave(p, ts, amp, scale, chop, fp, WAVE_DIR[0], WAVE_LEN[0], WAVE_WGT[0], WAVE_SPEED[0], 0.0);
+    acc = gwave_add(acc, gwave(p, ts, amp, scale, chop, fp, WAVE_DIR[1], WAVE_LEN[1], WAVE_WGT[1], WAVE_SPEED[1], 1.0));
+    acc = gwave_add(acc, gwave(p, ts, amp, scale, chop, fp, WAVE_DIR[2], WAVE_LEN[2], WAVE_WGT[2], WAVE_SPEED[2], 2.0));
+    acc = gwave_add(acc, gwave(p, ts, amp, scale, chop, fp, WAVE_DIR[3], WAVE_LEN[3], WAVE_WGT[3], WAVE_SPEED[3], 3.0));
+    acc = gwave_add(acc, gwave(p, ts, amp, scale, chop, fp, WAVE_DIR[4], WAVE_LEN[4], WAVE_WGT[4], WAVE_SPEED[4], 4.0));
+    acc = gwave_add(acc, gwave(p, ts, amp, scale, chop, fp, WAVE_DIR[5], WAVE_LEN[5], WAVE_WGT[5], WAVE_SPEED[5], 5.0));
+    acc = gwave_add(acc, gwave(p, ts, amp, scale, chop, fp, WAVE_DIR[6], WAVE_LEN[6], WAVE_WGT[6], WAVE_SPEED[6], 6.0));
+    acc = gwave_add(acc, gwave(p, ts, amp, scale, chop, fp, WAVE_DIR[7], WAVE_LEN[7], WAVE_WGT[7], WAVE_SPEED[7], 7.0));
+    let disp = acc.disp;
     var w: Wave;
     w.disp = disp;
-    w.n = vec3f(nx, 1.0 + ny, nz);
+    w.n = acc.n + vec3f(0.0, 1.0, 0.0);
     w.crest = disp.y / max(amp * 3.6, 1e-5);
     return w;
 }
@@ -711,8 +732,12 @@ fn debug_extra(i: VsOut) -> vec4f {
             if (k >= g.counts.w || vz <= g.cascade_splits[k]) { break; }
             k++;
         }
-        let cols = array<vec3f, 5>(vec3f(1.0, 0.25, 0.2), vec3f(0.25, 1.0, 0.3), vec3f(0.3, 0.45, 1.0), vec3f(1.0, 0.9, 0.2), vec3f(0.35));
-        return vec4f(cols[min(k, 4u)] * 0.6, 0.0);
+        var col = vec3f(0.35);
+        col = select(col, vec3f(1.0, 0.9, 0.2), k == 3u);
+        col = select(col, vec3f(0.3, 0.45, 1.0), k == 2u);
+        col = select(col, vec3f(0.25, 1.0, 0.3), k == 1u);
+        col = select(col, vec3f(1.0, 0.25, 0.2), k == 0u);
+        return vec4f(col * 0.6, 0.0);
     }
     let vz = -(g.view * vec4f(i.world, 1.0)).z;
     let cx = u32(clamp(i.clip.x * g.screen.z * f32(CLUSTER_X), 0.0, f32(CLUSTER_X - 1u)));
@@ -866,11 +891,11 @@ fn water(i: VsOut, d: Deriv) -> vec4f {
     let base = i.uv; // undisplaced world xz (set by vs_main)
     let wv = gerstner(base, t, inst.maps.y, inst.maps.w, inst.maps.z, fp);
     var r = vec2f(0.0);
-    let scales = array<f32, 3>(3.1, 7.3, 15.7);
-    let drift = array<vec2f, 3>(vec2f(0.35, 0.2), vec2f(-0.25, 0.4), vec2f(0.15, -0.45));
     for (var k = 0; k < 3; k++) {
-        let f = scales[k] * inst.maps.w;
-        let q = base * f + drift[k] * t * sqrt(f) * 0.9;
+        // scales 3.1, 7.3, 15.7 and a drift per octave, picked with select (no runtime array index)
+        let f = select(select(15.7, 7.3, k == 1), 3.1, k == 0) * inst.maps.w;
+        let dr = select(select(vec2f(0.15, -0.45), vec2f(-0.25, 0.4), k == 1), vec2f(0.35, 0.2), k == 0);
+        let q = base * f + dr * t * sqrt(f) * 0.9;
         let gr = vnoise_grad(q, 0.05);
         let gx = gr.x;
         let gz = gr.y;
@@ -1028,16 +1053,18 @@ fn vs_grass(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) ->
     if (r3 > w * keep) { return o; }
     // blade: 5 triangles, 3 segments tapering to a tip
     // 15 vertices: (side, level) per vertex — two quads (4 tris) and a tip triangle
-    let sides = array<f32, 15>(-1.0, 1.0, -1.0, 1.0, 1.0, -1.0, -1.0, 1.0, -1.0, 1.0, 1.0, -1.0, -1.0, 1.0, 0.0);
-    let lvls = array<u32, 15>(0u, 0u, 1u, 0u, 1u, 1u, 1u, 1u, 2u, 1u, 2u, 2u, 2u, 2u, 3u);
-    let side = sides[vi];
-    let lvl = lvls[vi];
-    let levels = array<f32, 4>(0.0, 0.4, 0.75, 1.0);
-    let widths = array<f32, 4>(1.0, 0.8, 0.45, 0.0);
-    let t = levels[lvl];
+    // vertices 0..11 = two quads (q6 = vi % 6: sides -1 1 -1 1 1 -1, level offset 0 0 1 0 1 1),
+    // 12..14 = the tip (sides -1 1 0, levels 2 2 3); bit maths + select, no runtime array index
+    let q6 = vi % 6u;
+    let tip = vi - 12u;
+    let side = select(select(-1.0, 1.0, q6 == 1u || q6 == 3u || q6 == 4u), select(select(-1.0, 1.0, tip == 1u), 0.0, tip == 2u), vi >= 12u);
+    let lvl = select(vi / 6u + select(0u, 1u, q6 == 2u || q6 >= 4u), select(2u, 3u, tip == 2u), vi >= 12u);
+    // level heights 0, 0.4, 0.75, 1 and widths 1, 0.8, 0.45, 0
+    let t = select(select(select(1.0, 0.75, lvl == 2u), 0.4, lvl == 1u), 0.0, lvl == 0u);
+    let wl = select(select(select(0.0, 0.45, lvl == 2u), 0.8, lvl == 1u), 1.0, lvl == 0u);
     let thin = 1.0 / sqrt(max(keep, 0.12));
     let h = grass.blade.x * (0.6 + 0.8 * r1) * mix(1.0, 0.85, 1.0 - keep);
-    let width = grass.blade.y * widths[lvl] * min(thin, 2.5);
+    let width = grass.blade.y * wl * min(thin, 2.5);
     let yaw = r2 * 6.2831;
     let across = vec3f(cos(yaw), 0.0, sin(yaw));
     let facing = vec3f(-sin(yaw), 0.0, cos(yaw));
