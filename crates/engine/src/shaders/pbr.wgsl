@@ -322,7 +322,9 @@ fn cluster_lights(i_clip: vec4f, world: vec3f, n: vec3f, v: vec3f, albedo: vec3f
     let cz = u32(clamp(floor(log(max(vz, g.cluster.x) / g.cluster.x) * g.cluster.z), 0.0, f32(CLUSTER_Z - 1u)));
     let cl = clusters[cx + cy * CLUSTER_X + cz * CLUSTER_X * CLUSTER_Y];
     var color = vec3f(0.0);
-    for (var k = 0u; k < cl.y; k++) {
+    // capped at MAX_LIGHTS (2048): a garbage count (draw-probe's patterned buffers read as u32 ~1e9) would hang the GPU
+    let n_lights = min(cl.y, 2048u);
+    for (var k = 0u; k < n_lights; k++) {
         let L = lights[light_indices[cl.x + k]];
         let to_l = L.pos_range.xyz - world;
         let dist = length(to_l);

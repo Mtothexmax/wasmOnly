@@ -65,15 +65,18 @@ normal `cargo` output above it.
   In the real game: `call frame_probe` (page URL `?frame_probe=1` adds the canvas pixel and arms it by itself after
   180 frames) echoes the Globals, one Instance record (`{slot}`) and the cull Params as the GPU reads them
   (runtime-indexed, constant-indexed, raw) and compares them word by word with the buffers, plus the centre pixel of
-  the HDR target / canvas and that frame's cull counters: `last` of the next call, and log lines `frame probe: ..`
+  the HDR target / canvas, a 16x9 grid of samples of each (`hdr_grid` / `canvas_grid`: rows of `rrggbb`, HDR as linear
+  x 255 with `+` above 1, plus min/mean/max luminance: washed out vs empty vs fine) and that frame's cull counters:
+  `last` of the next call, and log lines `frame probe: ..`
   / `frame probe result: {..}`. Test: `games/demo/tests/frameprobe.txt`.
   A draw the driver *silently drops* (no validation error, no device loss) is worse: PowerVR B-series (Android 10,
-  Chrome 158.0.8127.42, from 2026-11-27) drops every draw *and compute dispatch* whose shader indexes a
-  `let`/`var`/`const` array or a **vector component** with a runtime value (`array<vec2f, 3>(..)[vertex_index]`,
-  `v[k]`, `g.cascade_splits[k]`): white canvas, `stats.render.triangles` 0, `gpu_visible` 0 (cull.wgsl did nothing),
+  Chrome 158.0.8127.42, from 2026-11-27) reads **0** wherever a shader indexes a `let`/`var`/`const` array, a
+  **vector component** or a **matrix column** with a runtime value (`array<vec2f, 3>(..)[vertex_index]`, `v[k]`,
+  `g.cascade_splits[k]`, `m[k]`; draw-probe `WRONG r=0` in every stage), so corner tables collapse and culling
+  rejects everything: white canvas, `stats.render.triangles` 0, `gpu_visible` 0 (cull.wgsl did nothing),
   no errors. Arrays in uniform/storage buffers (`g.cascades[k]`, `instances[i]`) are fine. The engine's shaders avoid
   it (bit maths, `select()` chains, calls with constant indices, `comp3`/`comp4(v, k)` from `common.wgsl`);
-  `node tools/shader-lint.mjs [paths]` finds both (vectors only where the type is declared: parameters, struct fields,
+  `node tools/shader-lint.mjs [paths]` finds all three (vectors and matrices only where the type is declared: parameters, struct fields,
   `let v = vec4f(..)` / `textureLoad(..)`) and `dev.mjs build` runs it over the engine shaders and the game's `.wgsl`
   files first (stage `shader-lint`).
 - **Z-fighting / flicker:** a screenshot cannot show flicker. Three layers:

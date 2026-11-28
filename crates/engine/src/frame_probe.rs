@@ -184,12 +184,14 @@ struct EchoRun {
 pub(crate) struct Pending {
     runs: Vec<EchoRun>,
     pixels: Vec<(&'static str, GpuBuffer, GpuTextureFormat)>,
+    /// 16 x 9 grid of samples per texture (one 256-byte row per sample)
+    grids: Vec<(&'static str, GpuBuffer, GpuTextureFormat)>,
     pub info: serde_json::Value,
     errors: Vec<String>,
 }
 
 pub(crate) fn encode(device: &GpuDevice, enc: &GpuCommandEncoder, specs: &[EchoSpec], pixels: &[(&'static str, &GpuTexture, (u32, u32))], info: serde_json::Value) -> Pending {
-    let mut p = Pending { runs: Vec::new(), pixels: Vec::new(), info, errors: Vec::new() };
+    let mut p = Pending { runs: Vec::new(), pixels: Vec::new(), grids: Vec::new(), info, errors: Vec::new() };
     let buf = |size: u32, usage: u32| device.create_buffer(&GpuBufferDescriptor::new(size.max(16), usage)).map_err(|e| format!("{e:?}"));
     for s in specs {
         let Some((fields, size)) = struct_layout(s.prefix, s.struct_name) else {
@@ -251,8 +253,51 @@ pub(crate) fn encode(device: &GpuDevice, enc: &GpuCommandEncoder, specs: &[EchoS
             Ok(()) => p.pixels.push((label, b, tex.format())),
             Err(e) => p.errors.push(format!("pixel {label}: {e:?}")),
         }
+        // the whole picture at a glance: 16 x 9 samples at the cell centres (washed out vs empty vs fine)
+        let (w, h) = (tex.width(), tex.height());
+        let Ok(g) = buf(GRID_W * GRID_H * 256, gpu_buffer_usage::MAP_READ | gpu_buffer_usage::COPY_DST) else { continue };
+        let mut ok = true;
+        for j in 0..GRID_H {
+            for i in 0..GRID_W {
+                let src = GpuTexelCopyTextureInfo::new(tex);
+                src.set_origin(&crate::renderer::nums(&[((2 * i + 1) * w / (2 * GRID_W)).min(w - 1), ((2 * j + 1) * h / (2 * GRID_H)).min(h - 1)]));
+                let dst = GpuTexelCopyBufferInfo::new(&g);
+                dst.set_bytes_per_row(256);
+                dst.set_offset((j * GRID_W + i) * 256);
+                ok &= enc.copy_texture_to_buffer_with_u32_sequence(&src, &dst, &crate::renderer::nums(&[1, 1])).is_ok();
+            }
+        }
+        if ok {
+            p.grids.push((grid_label(label), g, tex.format()));
+        }
     }
     p
+}
+
+const GRID_W: u32 = 16;
+const GRID_H: u32 = 9;
+
+fn grid_label(l: &str) -> &'static str {
+    match l {
+        "hdr_centre" => "hdr_grid",
+        "canvas_centre" => "canvas_grid",
+        _ => "grid",
+    }
+}
+
+/// One sample as `rrggbb` (HDR: linear value x 255 clamped, so 0.5 = `7f`; `+` appended when a channel is > 1).
+fn sample_hex(bytes: &[u8], fmt: &GpuTextureFormat) -> (String, f32) {
+    let (r, g, b) = match fmt {
+        GpuTextureFormat::Rgba16float => {
+            let h = |i: usize| f16(u16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]));
+            (h(0), h(1), h(2))
+        }
+        GpuTextureFormat::Bgra8unorm => (bytes[2] as f32 / 255.0, bytes[1] as f32 / 255.0, bytes[0] as f32 / 255.0),
+        _ => (bytes[0] as f32 / 255.0, bytes[1] as f32 / 255.0, bytes[2] as f32 / 255.0),
+    };
+    let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    let over = if r.max(g).max(b) > 1.0 { "+" } else { "" };
+    (format!("{:02x}{:02x}{:02x}{over}", q(r), q(g), q(b)), 0.2126 * r + 0.7152 * g + 0.0722 * b)
 }
 
 fn f16(h: u16) -> f32 {
@@ -345,6 +390,30 @@ pub(crate) fn finish(p: Pending, out: Rc<RefCell<Option<serde_json::Value>>>) {
                 Err(e) => serde_json::json!({ "error": e }),
             };
             summary.push(format!("{label} {v}"));
+            pixels.insert((*label).into(), v);
+            b.destroy();
+        }
+        for (label, b, fmt) in &p.grids {
+            let v = match map(b).await {
+                Ok(bytes) => {
+                    let (mut rows, mut lum) = (Vec::new(), Vec::new());
+                    for j in 0..GRID_H {
+                        let row: Vec<String> = (0..GRID_W)
+                            .map(|i| {
+                                let (hex, l) = sample_hex(&bytes[((j * GRID_W + i) * 256) as usize..], fmt);
+                                lum.push(l);
+                                hex
+                            })
+                            .collect();
+                        rows.push(row.join(" "));
+                    }
+                    let mean = lum.iter().sum::<f32>() / lum.len() as f32;
+                    let (min, max) = lum.iter().fold((f32::MAX, f32::MIN), |(a, b), &l| (a.min(l), b.max(l)));
+                    summary.push(format!("{label} luminance min {min:.3} mean {mean:.3} max {max:.3}"));
+                    serde_json::json!({ "rows": rows, "luminance": { "min": min, "mean": mean, "max": max } })
+                }
+                Err(e) => serde_json::json!({ "error": e }),
+            };
             pixels.insert((*label).into(), v);
             b.destroy();
         }

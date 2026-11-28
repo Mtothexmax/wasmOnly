@@ -7,7 +7,8 @@
 // a runtime value. A PowerVR B-series driver (Android 10, Chrome 158, 2026-11-27) silently drops
 // every draw whose shader contains that: no validation error, no device loss, nothing drawn.
 // Rule `dynamic-vector-index`: a vector component picked with a runtime value (`v[k]`, also a uniform field
-// `g.splits[k]`): the same driver drops those draws and dispatches too (use `comp4(v, k)` from common.wgsl).
+// `g.splits[k]`) or a matrix column (`m[k]`): the driver reads 0 there (draw-probe `WRONG r=0`), which drops
+// draws and dispatches built on it (use `comp4(v, k)` from common.wgsl).
 // Arrays in storage/uniform buffers (`var<storage>`, array struct fields) are not affected.
 // Constant indices (`WAVE_LEN[3]`) are const-expressions and fine. Fix: bit maths (`(i << 1u) & 2u`),
 // `select()` chains, or calls with constant indices.
@@ -36,9 +37,9 @@ export function lintSource(src, common = '') {
   // vectors: `name: vecN` (parameter, struct field, typed let/var) or `let/var name = vecN(..) / texture*(..)`.
   // Inferred types (`let w = pow(abs(n), ..)`) are not seen; `a.field[k]` is checked by the field name.
   const vecs = new Set();
-  for (const m of code.matchAll(/\b(\w+)\s*:\s*vec[234]/g)) vecs.add(m[1]);
-  for (const m of code.matchAll(/\b(?:let|var)\s+(\w+)\s*=\s*(?:vec[234]\w*\s*\(|vec[234]<|texture(?:Load|Sample\w*)\s*\()/g)) vecs.add(m[1]);
-  for (const m of common.replace(/\/\/[^\n]*/g, '').matchAll(/\b(\w+)\s*:\s*vec[234]/g)) vecs.add(m[1]);
+  for (const m of code.matchAll(/\b(\w+)\s*:\s*(?:vec[234]|mat[234]x[234])/g)) vecs.add(m[1]);
+  for (const m of code.matchAll(/\b(?:let|var)\s+(\w+)\s*=\s*(?:vec[234]\w*\s*\(|vec[234]<|mat[234]x[234]\w*\s*[(<]|texture(?:Load|Sample\w*)\s*\()/g)) vecs.add(m[1]);
+  for (const m of common.replace(/\/\/[^\n]*/g, '').matchAll(/\b(\w+)\s*:\s*(?:vec[234]|mat[234]x[234])/g)) vecs.add(m[1]);
   for (const n of names) vecs.delete(n);
   const out = [];
   for (const [set, rule] of [[names, 'dynamic-array-index'], [vecs, 'dynamic-vector-index']]) for (const name of set) {
