@@ -1,0 +1,17 @@
+{
+  "@name": "Deutsch",
+  "title": {
+    "tagline": "Schieb alle Kisten von der Insel",
+    "card_stats": "Skinning · Morph · Clips",
+    "best": "Rekord: {best} · Siege: {wins}",
+    "rounds": { "zero": "Noch keine Runde", "one": "{n} Runde gespielt", "other": "{n} Runden gespielt" },
+    "play": "Spielen (Enter)",
+    "world": "Offene Welt (O)",
+    "language": "Sprache"
+  },
+  "pause": {
+    "title": "Pause",
+    "resume": "Weiter (P)",
+    "menu": "Hauptmenü"
+  }
+}

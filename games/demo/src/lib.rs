@@ -68,6 +68,15 @@ impl Data {
         }
         self.started = true;
         ctx.save.set_namespace("tumble", 1);
+        // Localisation (engine::i18n): tables built in, one more fetched from assets (partial on
+        // purpose: missing keys fall back to English). The choice is stored per game.
+        ctx.i18n.set_storage_key("tumble.locale");
+        for (code, json) in [("en", include_str!("lang/en.json")), ("de", include_str!("lang/de.json"))] {
+            if let Err(e) = ctx.i18n.add_locale(code, json) {
+                engine::log_error!("{e}");
+            }
+        }
+        ctx.load_locale("fr", "assets/lang/fr.json");
         self.progress = ctx.save.read("progress").unwrap_or_default();
         // Sounds from synth presets (engine::audio::synth) — no asset files. Effects are applied
         // at playback (echo, reverb, filters) so one recipe serves several moods.
@@ -105,18 +114,31 @@ impl Title {
         let url = data.portrait.and_then(|(rt, _)| ctx.renderer.render_texture_url(rt));
         let img = url.map(|u| format!("<img src='{u}' alt='critter'>")).unwrap_or_else(|| "<img alt=''>".into());
         let p = &data.progress;
-        ctx.ui.set(
-            "menu",
-            &format!(
-                "<div class='panel menu'><h1>Tumble</h1><div>Push every crate off the island</div>\
-                 <div style='margin:14px 0 4px'><div class='card'>{img}<div class='name'>Critter</div>\
-                 <div class='stats'>Skinning · Morph · Clips</div></div></div>\
-                 <div class='stats'>Best: {} · Wins: {} · Rounds: {}</div>\
-                 <button data-action='play'>Play (Enter)</button>                 <button data-action='world'>Open world (O)</button></div>",
-                p.best, p.wins, p.plays
-            ),
+        let i = &ctx.i18n;
+        let langs: String = i
+            .available()
+            .iter()
+            .map(|c| {
+                let on = if *c == i.locale() { " class='on'" } else { "" };
+                format!("<button data-action='lang:{c}'{on} style='display:inline-block;width:auto;padding:4px 10px;margin:2px;font-size:14px'>{}</button>", i.name(c).unwrap_or(c))
+            })
+            .collect();
+        let html = format!(
+            "<div class='panel menu'><h1>Tumble</h1><div>{}</div>\
+             <div style='margin:14px 0 4px'><div class='card'>{img}<div class='name'>Critter</div>\
+             <div class='stats'>{}</div></div></div>\
+             <div class='stats'>{} · {}</div>\
+             <button data-action='play'>{}</button> <button data-action='world'>{}</button>\
+             <div class='stats lang'>{}: {langs}</div></div>",
+            i.t("title.tagline"),
+            i.t("title.card_stats"),
+            engine::t!(i, "title.best", best = p.best, wins = p.wins),
+            engine::t!(i, "title.rounds", n = p.plays),
+            i.t("title.play"),
+            i.t("title.world"),
+            i.t("title.language"),
         );
-    }
+        ctx.ui.set("menu", &html);    }
 }
 
 impl Screen<Data> for Title {
@@ -197,6 +219,15 @@ impl Screen<Data> for Title {
             ctx.audio.play_named("click", Play::new().volume(0.5));
             go |= a == "play";
             world |= a == "world";
+            if let Some(code) = a.strip_prefix("lang:") {
+                if let Err(e) = ctx.i18n.set_locale(code) {
+                    engine::log_warn!("{e}");
+                }
+            }
+        }
+        // a locale switch (menu, API) or a table that arrived later: rebuild the text
+        if ctx.i18n.changed() {
+            self.hud(ctx, data);
         }
         if world {
             return Trans::Switch(Box::new(world::WorldScreen::default()));
@@ -224,11 +255,15 @@ impl Screen<Data> for Pause {
     }
     fn enter(&mut self, ctx: &mut Ctx, _data: &mut Data) {
         ctx.exit_pointer_lock();
-        ctx.ui.set(
-            "menu",
-            "<div class='panel menu'><h1>Pause</h1><button data-action='resume'>Resume (P)</button>\
-             <button data-action='menu'>Main menu</button></div>",
+        let i = &ctx.i18n;
+        let html = format!(
+            "<div class='panel menu'><h1>{}</h1><button data-action='resume'>{}</button>\
+             <button data-action='menu'>{}</button></div>",
+            i.t("pause.title"),
+            i.t("pause.resume"),
+            i.t("pause.menu")
         );
+        ctx.ui.set("menu", &html);
     }
     fn exit(&mut self, ctx: &mut Ctx, _data: &mut Data) {
         ctx.ui.set("menu", "");

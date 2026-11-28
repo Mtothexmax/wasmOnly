@@ -106,6 +106,27 @@ normal `cargo` output above it.
 - **Screens / scenes:** `call screens` = stack, history, scenes; `screens {switch|push|reset: name}`, `{pop:true}`.
   `call scenes` = entity count per scene, `{unload: name}`. `game_state` of a `ScreenStack` game is
   `{screen, stack, state}` (the top screen's `debug_state` is in `state`).
+- **Localisation (`crate::i18n`, `ctx.i18n`):** string tables per locale + the player's language. Tables are JSON
+  (`ctx.i18n.add_locale("de", include_str!("lang/de.json"))?` or fetched: `ctx.load_locale("fr", "assets/lang/fr.json")`);
+  nested objects flatten to dotted keys (`{"menu": {"play": ".."}}` = `menu.play`), an object of CLDR plural categories
+  with `other` is a plural entry (`{"one": "{n} coin", "other": "{n} coins"}`, `zero` wins at 0), `"@name": "Deutsch"`
+  = display name. Lookup `ctx.i18n.t("menu.play")`, with placeholders `ctx.i18n.tf(key, &[("name", &hero)])` or the
+  macro `engine::t!(ctx.i18n, "coins", n = 3, name = hero)` (`n` picks the plural form; `tn(key, n, &[..])`); chain:
+  current locale -> its language (`de-at` -> `de`) -> default (`"en"`, `set_default`) -> the key itself; `{{`/`}}` =
+  literal braces, unknown placeholders stay. Plural rules: one/other (en, de, ...), fr/pt (0 and 1 singular),
+  ru/uk/pl/cs (few/many), none (ja, zh, ko, ...). Locale choice: URL `?lang=de` (testing, not stored) > stored choice
+  (localStorage `wasmonly.locale`; per game: `ctx.i18n.set_storage_key("mygame.locale")` first thing in init) >
+  default. `ctx.i18n.set_locale("de")?` stores it, sets `<html lang>`, and `ctx.i18n.changed()` is true for the next
+  frame (also when a table of the current locale arrives or is replaced): rebuild HUD / menus / dialog then
+  (`revision()` for lazy checks). Assets: `ctx.i18n.path("assets/voice/{locale}/x.mp3")` (no existence check),
+  `paths(..)` = candidates in lookup order, `ctx.load_sound_localized(template)` loads the first that fetches (the
+  default locale's file when the locale has none; log `sound ..: using fallback ..`; ids are per resolved path, so
+  load again after a switch). AI API `locale` = current, source (url/stored/default/set), tables, `fell_back` (keys
+  shown from another locale) and `unknown` (keys in no table) since the last switch; `{set}`, `{forget: true}`,
+  `{t, args, n}`, `{missing: code}` (vs the default: `missing`, `extra`, `placeholder_mismatch`, `plural_mismatch`,
+  `complete`; `missing: true` = every locale), `{add: code, table: {..}}` (live edit), `{sound: template}`.
+  Demo: `games/demo/src/lang/{en,de}.json`, partial `assets/lang/fr.json`, language buttons on the title. Test:
+  `games/demo/tests/i18n.txt`.
 - **Save games:** `call save` lists slots (localStorage) + IndexedDB blob count; `{slot}` reads one (with
   version + time), `{op:"set", slot, data}`, `{op:"delete", slot}`, `{op:"blobs"}`.
 - **Animation:** `call animation` lists animators; `{id}` = clips, playing clip + time, crossfade, deformers
@@ -526,6 +547,7 @@ normal `cargo` output above it.
 | `crates/engine/src/audio/music.rs` | streamed music (`<audio>` + range requests), crossfade, prefetch, music bus |
 | `crates/engine/src/audio/synth.rs` | deterministic sfx synthesizer + 16 presets |
 | `crates/engine/src/texgen.rs` | procedural seamless textures (16 presets, `noise` crate) |
+| `crates/engine/src/i18n.rs` | localisation: string tables (JSON, plurals, placeholders), locale choice (localStorage, `?lang=`), `{locale}` asset paths, translation check |
 | `crates/engine/src/jobs.rs` | job system: serial on stable, rayon Web Workers with the `threads` feature |
 | `crates/engine/src/touch.rs` | multi-touch gestures: joystick, look, pinch, tap, hold, swipe |
 | `crates/engine/src/mesh.rs` | primitives, `simplify_cluster` (auto LOD) |

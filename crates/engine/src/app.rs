@@ -164,6 +164,8 @@ pub struct Ctx {
     pub debug_mode: crate::debugmode::DebugMode,
     /// Save slots (localStorage) and blobs (IndexedDB), see [`crate::save`].
     pub save: crate::save::Save,
+    /// Locale choice, string tables, localised asset paths (see [`crate::i18n`]).
+    pub i18n: crate::i18n::I18n,
     /// Scene membership of entities, see [`crate::screens`] (`begin_scene`, `unload_scene`).
     pub scenes: crate::screens::Scenes,
     /// Options for `load_gltf` (automatic LOD on/off, LOD distance factor).
@@ -242,6 +244,31 @@ impl Ctx {
     /// Loads an audio file (any format Chrome decodes). Playable once `audio` reports it ready.
     pub fn load_sound(&mut self, url: &str) -> SoundId {
         crate::audio::request(self, url)
+    }
+
+    /// Loads a localised sound: `{locale}` in the path is the current locale; a missing file
+    /// (HTTP error) falls back to the locale's language, then the default locale
+    /// (`assets/voice/{locale}/intro.mp3`). The id is per resolved path: after a locale switch,
+    /// load again to get the new language's file.
+    pub fn load_sound_localized(&mut self, template: &str) -> SoundId {
+        let c = self.i18n.paths(template);
+        crate::audio::request_any(self, &c)
+    }
+
+    /// Fetches a string table (JSON, see [`crate::i18n`]) and adds it as `code` once it arrives
+    /// (raises `i18n.changed()` when it is the current locale or the default).
+    pub fn load_locale(&mut self, code: &str, url: &str) {
+        let me = self.me.clone();
+        let (code, url) = (code.to_string(), url.to_string());
+        wasm_bindgen_futures::spawn_local(async move {
+            let r = crate::gltf_loader::fetch_bytes(&url).await.and_then(|b| String::from_utf8(b).map_err(|e| e.to_string()));
+            let Some(rc) = me.upgrade() else { return };
+            let Ok(mut c) = rc.try_borrow_mut() else { return };
+            match r.and_then(|s| c.i18n.add_locale(&code, &s)) {
+                Ok(n) => log_info!("locale {code}: {n} keys from {url}"),
+                Err(e) => crate::log_error!("locale {code} ({url}): {e}"),
+            }
+        });
     }
 
     /// Generates a procedural texture (see [`crate::texgen`]) and uploads it with mips.
@@ -692,6 +719,7 @@ async fn start<G: Game>(game: G, mut config: crate::renderer::RenderConfig) -> R
         interp_shown: false,
         trace: None,
         save: Default::default(),
+        i18n: Default::default(),
         scenes: Default::default(),
         gltf_defaults: Default::default(),
         generators: Default::default(),
@@ -1012,6 +1040,7 @@ fn frame<G: Game>(c: &mut Ctx, game: &mut G, dt: f32) {
     let Ctx { ui, world, .. } = c;
     ui.sync_labels(world, vp, cw, ch);
     c.input.end_frame();
+    c.i18n.end_frame();
 
     let ms = (log::now_ms() - t0) as f32;
     let a = 0.1;

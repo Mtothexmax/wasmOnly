@@ -57,6 +57,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("animation", "Animators (glTF clips, skinning, morph targets). args: {id?, play?: clip, fade?: 0.2, speed?: 1, looped?: true, stop?: true, morph?: index, weight?: w}"),
     ("particles", "Particle emitters + live counts. args: {preset?: 'fire'|'smoke'|'sparks'|'fireflies'|'dust'|'magic'|'rain'|'splash', pos?: [x,y,z], burst?: n, layer?: 0..31, seed?: n, name?} spawns one (name defaults to the preset); without preset, {name?} filters the list."),
     ("scenes", "Scenes (entity groups) with counts. args: {unload?: name, begin?: name}"),
+    ("locale", "Localisation (crate::i18n): current locale, source (url/stored/default/set), tables, keys that fell back / are unknown. args: {set?: code, missing?: code (translation check vs the default), t?: key, args?: {name: value}, n?: count, add?: code, table?: {..} (add/replace a table live), forget?: true (drop the stored choice), sound?: 'assets/voice/{locale}/x.mp3' (Ctx::load_sound_localized: first candidate that loads)}"),
     ("save", "Save slots (localStorage) + blobs (IndexedDB). args: {op?: 'list'|'get'|'set'|'delete'|'blobs'|'delete_blob', slot?, data?, key?}"),
     ("stats", "Frame/sim timing, renderer stats, entity and body counts."),
     ("entities", "List entities. args: {name?: substring, limit?: 200, with?: 'mesh'|'body'|'light'|'label'|'camera'}"),
@@ -998,6 +999,12 @@ pub(crate) fn handle<G: Game>(
         }
         "ui" => Ok(json!({"slots": ctx.ui.slots()})),
         "save" => ctx.save.command(a),
+        "locale" if a.get("sound").is_some() => {
+            let t = a["sound"].as_str().ok_or("sound: a path template with {locale}")?;
+            let id = ctx.load_sound_localized(t);
+            Ok(json!({"sound": id.0, "state": ctx.audio.sound_state(id), "candidates": ctx.i18n.paths(t)}))
+        }
+        "locale" => ctx.i18n.command(a),
         "particles" => ctx.particles_command(a),
         "sky" => ctx.sky_command(a),
         "trace" => {

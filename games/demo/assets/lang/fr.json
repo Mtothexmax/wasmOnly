@@ -1,0 +1,8 @@
+{
+  "@name": "Français",
+  "title": {
+    "tagline": "Pousse toutes les caisses hors de l'île",
+    "rounds": { "one": "{n} manche jouée", "other": "{n} manches jouées" },
+    "play": "Jouer (Entrée)"
+  }
+}

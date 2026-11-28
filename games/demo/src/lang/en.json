@@ -1,0 +1,17 @@
+{
+  "@name": "English",
+  "title": {
+    "tagline": "Push every crate off the island",
+    "card_stats": "Skinning · Morph · Clips",
+    "best": "Best: {best} · Wins: {wins}",
+    "rounds": { "zero": "No rounds yet", "one": "{n} round played", "other": "{n} rounds played" },
+    "play": "Play (Enter)",
+    "world": "Open world (O)",
+    "language": "Language"
+  },
+  "pause": {
+    "title": "Pause",
+    "resume": "Resume (P)",
+    "menu": "Main menu"
+  }
+}

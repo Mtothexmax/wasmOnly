@@ -13,6 +13,7 @@ Rust → `wasm32-unknown-unknown` → Chrome (WebGPU). AI-first: every runtime s
 |---|---|
 | Game structure | `ScreenStack` of `Screen`s (title, menus, play, pause overlays), scenes unload with their screen (`screens`) |
 | Saves | `ctx.save` slots (localStorage, versioned JSON) + blobs (IndexedDB) (`save`) |
+| Languages | string tables per locale (JSON, plurals, `{name}` placeholders), the player's choice stored, `changed()` to rebuild text, `{locale}` asset paths with fallback (`ctx.i18n`, `i18n`; AI API `locale {missing}` lists untranslated keys) |
 | Player | `CharacterController` (slopes, steps, jumps incl. against walls, pushes bodies) + `ThirdPersonCamera` (`character`) |
 | Models | glTF `.glb` (static, skinned, morph targets, clips via `Animator`) (`gltf_loader`, `animation`); other formats via `tools/asset-cook` |
 | Procedural content | `MeshBuilder` geometry kit + generator registry, cached + instanced (`geom`); static batching, `Motion` (`batch`) |

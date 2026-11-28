@@ -1,0 +1,60 @@
+# Localisation (engine::i18n): tables, locale switch from the menu and the API, the change event
+# (title menu rebuilt), persistence over a reload, fallback, plurals, placeholders, the translation
+# check, a table fetched from assets, `{locale}` asset paths.
+#   node tools/bridge.mjs run games/demo/tests/i18n.txt
+reload
+call locale {"forget": true}
+reload
+wait 800
+expect locale.current == "en"
+expect locale.source == "default"
+expect locale.locales.length == 3
+expect ui.slots.menu contains Push every crate off the island
+# menu button -> German, title rebuilt in the next frame
+action lang:de
+frames 2
+expect locale.current == "de"
+expect locale.source == "set"
+expect ui.slots.menu contains Schieb alle Kisten von der Insel
+# the choice survives a reload
+reload
+wait 800
+expect locale.current == "de"
+expect locale.source == "stored"
+expect ui.slots.menu contains Spielen (Enter)
+# plurals + placeholders through the API
+expect locale{"t": "title.rounds", "n": 1}.text == "1 Runde gespielt"
+expect locale{"t": "title.rounds", "n": 5}.text == "5 Runden gespielt"
+expect locale{"t": "title.rounds", "n": 0}.text == "Noch keine Runde"
+expect locale{"t": "title.best", "args": {"best": 7, "wins": 2}}.text == "Rekord: 7 · Siege: 2"
+# unknown key -> the key itself, recorded
+expect locale{"t": "no.such.key"}.text == "no.such.key"
+expect locale.unknown.length == 1
+# German is complete, the partial French table (fetched from assets) is not
+expect locale{"missing": "de"}.complete == true
+expect locale{"missing": "fr"}.complete == false
+expect locale{"missing": "fr"}.missing.length > 3
+# French: a missing key falls back to English
+call locale {"set": "fr"}
+frames 2
+expect ui.slots.menu contains Pousse toutes les caisses
+expect ui.slots.menu contains Open world (O)
+expect locale{"t": "title.world"}.text == "Open world (O)"
+expect locale.fell_back_count == 4
+# French plural rule (0 and 1 are singular)
+expect locale{"t": "title.rounds", "n": 0}.text == "0 manche jouée"
+# regional code -> its language
+call locale {"set": "de-AT"}
+expect locale{"t": "title.play"}.text == "Spielen (Enter)"
+# live table edit: placeholder mismatch is reported
+call locale {"add": "de", "table": {"@name": "Deutsch", "title": {"best": "Rekord: {best}"}}}
+expect locale{"missing": "de"}.placeholder_mismatch.length == 1
+# localised asset: there is no German voice file, the English one is loaded instead
+call locale {"set": "de"}
+expect locale{"sound": "assets/voice/{locale}/hello.wav"}.candidates.1 == "assets/voice/en/hello.wav"
+wait_for locale{"sound": "assets/voice/{locale}/hello.wav"}.state == "ready"
+# back to English and forget the choice
+call locale {"set": "en"}
+call locale {"forget": true}
+expect locale.stored == null
+expect logs{"level": "error"}.entries.length == 0

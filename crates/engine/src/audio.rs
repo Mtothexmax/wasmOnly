@@ -1005,6 +1005,13 @@ fn set_panner(pn: &PannerNode, p: Vec3) {
 
 /// Loads and decodes an audio file (fetch + `decodeAudioData`). Registered under its URL.
 pub(crate) fn request(ctx: &mut crate::app::Ctx, url: &str) -> SoundId {
+    request_any(ctx, &[url.to_string()])
+}
+
+/// Loads the first candidate that fetches (HTTP errors try the next one, e.g. a localised file
+/// falling back to the default locale's). The sound is registered under the first candidate.
+pub(crate) fn request_any(ctx: &mut crate::app::Ctx, candidates: &[String]) -> SoundId {
+    let url = candidates.first().map(|s| s.as_str()).unwrap_or("");
     if let Some(id) = ctx.audio.find(url) {
         return id;
     }
@@ -1016,10 +1023,21 @@ pub(crate) fn request(ctx: &mut crate::app::Ctx, url: &str) -> SoundId {
     };
     let me = ctx.me.clone();
     let url = url.to_string();
+    let candidates = candidates.to_vec();
     wasm_bindgen_futures::spawn_local(async move {
         let t0 = crate::log::now_ms();
         let result: Result<AudioBuffer, String> = async {
-            let bytes = crate::gltf_loader::fetch_bytes(&url).await?;
+            let mut bytes = Err(String::from("no candidates"));
+            for (i, c) in candidates.iter().enumerate() {
+                bytes = crate::gltf_loader::fetch_bytes(c).await;
+                if bytes.is_ok() {
+                    if i > 0 {
+                        log_info!("sound {url}: using fallback {c}");
+                    }
+                    break;
+                }
+            }
+            let bytes = bytes?;
             let arr = js_sys::Uint8Array::from(&bytes[..]);
             let promise = actx
                 .decode_audio_data(&arr.buffer())
