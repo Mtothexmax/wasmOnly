@@ -58,7 +58,7 @@ pub use serde_json;
 pub mod prelude {
     pub use crate::animation::{Animator, PlayOpts};
     pub use crate::app::{run, run_with, Ctx, Game, Time};
-    pub use crate::renderer::{RenderConfig, StudRelief, Triplanar};
+    pub use crate::renderer::{RenderConfig, StudRelief, SurfaceShaderId, Triplanar};
     pub use crate::post::Grade;
     pub use crate::batch::Motion;
     pub use crate::geom::{MeshBuilder, Opening};

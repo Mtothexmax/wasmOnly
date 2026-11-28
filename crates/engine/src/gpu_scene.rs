@@ -109,6 +109,8 @@ impl LodKey {
 struct BlendObj {
     meshes: [u32; LEVELS],
     double_sided: bool,
+    /// surface shader set index (`Classified::surface`)
+    surface: u8,
     tex: u32,
     water: bool,
     solid: bool,
@@ -700,7 +702,7 @@ impl GpuScene {
         let mut groups = [NONE; LEVELS];
         let mut tris = 0u64;
         if main {
-            let pipe = (if c.mask || c.ui { 2 } else { 0 }) + c.double_sided as u8;
+            let pipe = (if c.mask || c.ui { 2 } else { 0 }) + c.double_sided as u8 + 4 * c.surface;
             for l in 0..n {
                 if let Some(gm) = valid(ms[l]) {
                     groups[l] = self.main.acquire((pipe, tex, ms[l]));
@@ -730,7 +732,7 @@ impl GpuScene {
             sgroups: if shadow_here { sgroups } else { [NONE; LEVELS] },
             info: [info_x, main as u32 | (shadow_here as u32) << 1, 0, 0],
         };
-        let blend = (c.blend && !c.hidden).then(|| Box::new(BlendObj { meshes: ms, double_sided: c.double_sided, tex, water: c.water, solid: c.solid }));
+        let blend = (c.blend && !c.hidden).then(|| Box::new(BlendObj { meshes: ms, double_sided: c.double_sided, surface: c.surface, tex, water: c.water, solid: c.solid }));
         let mut new_shadow = NONE;
         if let Some(r) = &c.shadow_raw {
             let ss = pool.put((ek, true), r) as usize;
@@ -905,9 +907,9 @@ impl GpuScene {
         p.x.abs() <= half + r && p.y.abs() <= half + r && -p.z >= -r && -p.z <= depth + r
     }
 
-    /// Blended entities in view: (view depth, double_sided, texture, mesh, slot), unsorted; and
+    /// Blended entities in view: (view depth, 2-sided + 2 x surface set, texture, mesh, slot), unsorted; and
     /// whether one of them is water.
-    pub fn blended(&self, planes: &[Vec4; 6], cam: Vec3, fwd: Vec3, lod_bias: f32, layers: u32, meshes: &[GpuMesh]) -> (Vec<(f32, bool, u32, u32, u32, bool)>, bool) {
+    pub fn blended(&self, planes: &[Vec4; 6], cam: Vec3, fwd: Vec3, lod_bias: f32, layers: u32, meshes: &[GpuMesh]) -> (Vec<(f32, u8, u32, u32, u32, bool)>, bool) {
         let mut out = vec![];
         let mut water = false;
         for &s in &self.blend_slots {
@@ -939,7 +941,7 @@ impl GpuScene {
                 continue;
             }
             water |= b.water;
-            out.push(((c - cam).dot(fwd), b.double_sided, b.tex, mesh, s, b.solid));
+            out.push(((c - cam).dot(fwd), b.double_sided as u8 + 2 * b.surface, b.tex, mesh, s, b.solid));
         }
         (out, water)
     }

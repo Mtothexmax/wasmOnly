@@ -42,14 +42,63 @@ pub(crate) const DIRECT_FALLBACK: &str = "direct output is off, the composite pa
 /// direct LDR output. Cloned per frame (JS handles).
 #[derive(Clone)]
 struct ScenePipes {
+    /// [0] = pbr.wgsl, [sid] = surface shader `sid` (`Renderer::add_surface_shader`)
+    pbr: Vec<PbrSet>,
+    sky: GpuRenderPipeline,
+    particle_additive: GpuRenderPipeline,
+    particle_alpha: GpuRenderPipeline,
+}
+
+impl ScenePipes {
+    /// The set of surface shader `sid` (0 = the built-in shading; an unknown id falls back to it).
+    fn of(&self, sid: usize) -> &PbrSet {
+        self.pbr.get(sid).unwrap_or(&self.pbr[0])
+    }
+}
+
+/// Most surface shaders a renderer takes. Pipeline code of an opaque / alpha-tested draw: kind (0 opaque,
+/// 1 opaque 2-sided, 2 mask, 3 mask 2-sided) + 4 x set index; blended draws: 2-sided + 2 x set index
+/// (set index = surface shader id + 1, 0 = built-in shading).
+pub const MAX_SURFACE_SHADERS: u32 = 63;
+
+/// The pipelines of one PBR shader module: [opaque, opaque 2-sided, alpha-test, alpha-test 2-sided, blended,
+/// blended 2-sided]; depth prepass [prepass, prepass 2-sided, opaque after prepass (depth equal), 2-sided];
+/// solid fade [depth only, 2-sided, blended depth-equal, 2-sided].
+#[derive(Clone)]
+struct PbrSet {
     pipelines: [GpuRenderPipeline; 6],
     pipeline_broken: [Rc<Cell<bool>>; 6],
     prepass: [GpuRenderPipeline; 4],
     prepass_broken: [Rc<Cell<bool>>; 4],
     fade: [GpuRenderPipeline; 4],
-    sky: GpuRenderPipeline,
-    particle_additive: GpuRenderPipeline,
-    particle_alpha: GpuRenderPipeline,
+    fade_broken: [Rc<Cell<bool>>; 4],
+}
+
+type Built = (GpuRenderPipeline, Rc<Cell<bool>>);
+
+impl PbrSet {
+    fn from_built(main: [Built; 6], pre: [Built; 4], fade: [Built; 4]) -> Self {
+        PbrSet {
+            pipeline_broken: std::array::from_fn(|i| main[i].1.clone()),
+            pipelines: main.map(|b| b.0),
+            prepass_broken: std::array::from_fn(|i| pre[i].1.clone()),
+            prepass: pre.map(|b| b.0),
+            fade_broken: std::array::from_fn(|i| fade[i].1.clone()),
+            fade: fade.map(|b| b.0),
+        }
+    }
+}
+
+/// Handle of a game surface shader (`Renderer::add_surface_shader`, `Material::surface`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
+pub struct SurfaceShaderId(pub u32);
+
+/// A registered surface shader: its source and pipeline sets (HDR + direct output when that set exists).
+pub(crate) struct SurfaceShader {
+    pub name: String,
+    pub wgsl: String,
+    hdr: PbrSet,
+    ldr: Option<PbrSet>,
 }
 
 const MSAA_PREF_KEY: &str = "wasmonly.msaa";
@@ -233,10 +282,20 @@ struct Classified {
     /// Neither drawn nor casting: needs no GPU record.
     pub skip: bool,
     pub double_sided: bool,
+    /// pipeline-set index of the surface shader (0 = built-in shading; `Material::surface`)
+    pub surface: u8,
     pub ui: bool,
     pub water: bool,
     /// Material textures (base, normal, height) as a bind-group key.
     pub tex_key: (u32, u32, u32),
+}
+
+/// `Material::surface` as the pipeline-set index (0 = none / out of range).
+fn surface_sid(mat: &Material) -> u8 {
+    match mat.surface {
+        Some(s) if s.0 < MAX_SURFACE_SHADERS && !mat.terrain && !mat.water && !mat.ui => s.0 as u8 + 1,
+        _ => 0,
+    }
 }
 
 fn classify(model: &Mat4, mr: &MeshRenderer, mat: &Material, shadows_on: bool) -> Classified {
@@ -290,11 +349,14 @@ fn classify(model: &Mat4, mr: &MeshRenderer, mat: &Material, shadows_on: bool) -
                 mat.bend.max(0.0),
             ]
         },
+        // a surface shader reads its two parameter vectors from the stud slots (studs are off there)
         studs: match (&mat.studs, plastic || mat.unlit) {
+            _ if surface_sid(mat) > 0 => mat.surface_params[0],
             (Some(st), true) if st.pitch_uv > 0.0 => [1.0 / st.pitch_uv, st.height.max(0.0), st.r_base.max(0.0), st.r_top.clamp(0.0, st.r_base.max(0.0))],
             _ => [0.0; 4],
         },
         studs2: match &mat.studs {
+            _ if surface_sid(mat) > 0 => mat.surface_params[1],
             Some(st) => [st.bevel.clamp(0.0, st.height.max(0.0)), st.strength.clamp(0.0, 1.0), st.up_only as u32 as f32, 0.0],
             None => [0.0; 4],
         },
@@ -327,6 +389,7 @@ fn classify(model: &Mat4, mr: &MeshRenderer, mat: &Material, shadows_on: bool) -
         hidden,
         skip: hidden && !mr.cast_shadows,
         double_sided: mat.double_sided,
+        surface: surface_sid(mat),
         ui: mat.ui,
         water: mat.water,
         tex_key: (
@@ -458,6 +521,12 @@ pub struct Material {
     /// also fades where one pixel covers more than ~1/40 of a tile (no shimmer far away or at
     /// grazing angles). `None` = full depth everywhere.
     pub parallax_fade: Option<[f32; 2]>,
+    /// Game surface shader (`Renderer::add_surface_shader`): its WGSL `surface()` function replaces the
+    /// texture / normal-map / parallax / studs / triplanar block of the PBR shading (lighting, shadows,
+    /// fog and tonemap stay the engine's). Ignored on terrain, water and UI materials.
+    pub surface: Option<SurfaceShaderId>,
+    /// Two free parameter vectors for the surface shader (`SurfaceIn::params0` / `params1`).
+    pub surface_params: [[f32; 4]; 2],
 }
 
 /// [`Material::triplanar`]: projection scale and blend.
@@ -562,6 +631,8 @@ impl Default for Material {
             studs: None,
             triplanar: None,
             parallax_fade: None,
+            surface: None,
+            surface_params: [[0.0; 4]; 2],
         }
     }
 }
@@ -1229,6 +1300,116 @@ pub struct GpuMesh {
     pub version: u32,
 }
 
+/// What building a PBR pipeline set needs besides the module: at startup for pbr.wgsl, later for
+/// every surface shader (`Renderer::add_surface_shader`).
+#[derive(Clone)]
+struct PbrBuild {
+    layout: GpuPipelineLayout,
+    layout_t: GpuPipelineLayout,
+    samples: u32,
+    direct_fail: String,
+}
+
+fn pbr_vertex_layout() -> GpuVertexBufferLayout {
+    let attrs = [
+        GpuVertexAttribute::new(GpuVertexFormat::Float32x3, 0, 0),
+        GpuVertexAttribute::new(GpuVertexFormat::Float32x3, 12, 1),
+        GpuVertexAttribute::new(GpuVertexFormat::Float32x2, 24, 2),
+        GpuVertexAttribute::new(GpuVertexFormat::Unorm8x4, 32, 3),
+    ];
+    GpuVertexBufferLayout::new(std::mem::size_of::<Vertex>() as u32, &attrs)
+}
+
+/// One variant of a PBR pipeline set (see `PbrSet`). kind 0 = opaque (no discard -> early-Z), 1 = alpha-test / UI,
+/// 2 = blend. variant: 0 = normal, 1 = depth prepass (depth only), 2 = after a prepass (depth equal, no write),
+/// 3 = blended with depth equal (solid fade colour), 4 = depth only without colour target (solid fade depth).
+/// ldr: Some(canvas view format) = direct-output variant (tonemaps in the shader; optional, its failures go to
+/// `ldr_check`). `name`: label prefix ("pbr", or "surf-<name>").
+#[allow(clippy::too_many_arguments)]
+fn make_pbr_pipeline(device: &GpuDevice, b: &PbrBuild, module: &GpuShaderModule, name: &str, kind: u8, two_sided: bool, variant: u8, ldr: Option<GpuTextureFormat>, ldr_check: &Rc<crate::debug::PipelineSet>) -> Result<(GpuRenderPipeline, Rc<Cell<bool>>), String> {
+        let blend = kind == 2;
+        let vs = GpuVertexState::new(module);
+        vs.set_entry_point("vs_main");
+        vs.set_buffers(&[JsNullable::wrap(pbr_vertex_layout())]);
+        let target = GpuColorTargetState::new(ldr.unwrap_or(crate::post::HDR_FORMAT));
+        if blend {
+            let c = GpuBlendComponent::new();
+            c.set_src_factor(GpuBlendFactor::SrcAlpha);
+            c.set_dst_factor(GpuBlendFactor::OneMinusSrcAlpha);
+            c.set_operation(GpuBlendOperation::Add);
+            let a = GpuBlendComponent::new();
+            a.set_src_factor(GpuBlendFactor::One);
+            a.set_dst_factor(GpuBlendFactor::OneMinusSrcAlpha);
+            a.set_operation(GpuBlendOperation::Add);
+            target.set_blend(&GpuBlendState::new(&a, &c));
+        }
+        if variant == 1 {
+            target.set_write_mask(0);
+        }
+        let fs = GpuFragmentState::new(module, &[JsNullable::wrap(target)]);
+        fs.set_entry_point(if blend { "fs_blend" } else if variant == 1 { "fs_depth" } else { "fs_main" });
+        let consts = js_sys::Object::new();
+        let _ = js_sys::Reflect::set(&consts, &"ALPHA_TEST".into(), &(if kind == 0 { 0.0 } else { 1.0 }).into());
+        if ldr.is_some() {
+            let _ = js_sys::Reflect::set(&consts, &"LDR_OUT".into(), &1.0.into());
+        }
+        fs.set_constants(consts.unchecked_ref());
+        let prim = GpuPrimitiveState::new();
+        prim.set_topology(GpuPrimitiveTopology::TriangleList);
+        prim.set_cull_mode(if two_sided { GpuCullMode::None } else { GpuCullMode::Back });
+        prim.set_front_face(GpuFrontFace::Ccw);
+        let ds = GpuDepthStencilState::new(DEPTH_FORMAT);
+        ds.set_depth_write_enabled(!blend && variant != 2); // blended surfaces test but do not write depth
+        // after the prepass the depth buffer already holds the nearest surface: only it is shaded
+        ds.set_depth_compare(if variant == 2 || variant == 3 { GpuCompareFunction::Equal } else { GpuCompareFunction::Less });
+        let ms = GpuMultisampleState::new();
+        ms.set_count(b.samples);
+        let desc = GpuRenderPipelineDescriptor::new(if blend { &b.layout_t } else { &b.layout }, &vs);
+        let label = match (kind, two_sided) {
+            (0, false) => "pbr-opaque",
+            (0, true) => "pbr-opaque-2s",
+            (1, false) => "pbr-mask",
+            (1, true) => "pbr-mask-2s",
+            (_, false) => "pbr-blend",
+            (_, true) => "pbr-blend-2s",
+        };
+        let label = match variant {
+            1 => if two_sided { "pbr-prepass-2s" } else { "pbr-prepass" },
+            2 => if two_sided { "pbr-opaque-eq-2s" } else { "pbr-opaque-eq" },
+            3 => if two_sided { "pbr-fade-2s" } else { "pbr-fade" },
+            4 => if two_sided { "pbr-fade-depth-2s" } else { "pbr-fade-depth" },
+            _ => label,
+        };
+        let label = if ldr.is_some() { format!("{label}-ldr") } else { label.to_string() };
+        // surface-shader sets: "surf-<name>-opaque", ..
+        let label = if name == "pbr" { label } else { label.replacen("pbr", name, 1) };
+        let label = label.as_str();
+        desc.set_label(label);
+        if variant != 4 {
+            desc.set_fragment(&fs);
+        }
+        desc.set_primitive(&prim);
+        desc.set_depth_stencil(&ds);
+        desc.set_multisample(&ms);
+        if ldr.is_some() {
+            if (b.direct_fail == "1" && label == "pbr-opaque-eq-2s-ldr") || (b.direct_fail == "2" && label == "pbr-opaque-ldr") {
+                ms.set_count(3); // invalid sample count: a validation error, like a driver failure
+            }
+            let p = crate::debug::create_pipeline_optional(device, &desc, label, ldr_check, DIRECT_FALLBACK)?;
+            return Ok((p, Rc::new(Cell::new(false))));
+        }
+        crate::debug::create_pipeline_guarded(device, &desc, label)
+}
+
+/// The 14 pipelines of one PBR module (`ScenePipes`).
+fn build_pbr_set(device: &GpuDevice, b: &PbrBuild, module: &GpuShaderModule, name: &str, ldr: Option<GpuTextureFormat>, ldr_check: &Rc<crate::debug::PipelineSet>) -> Result<PbrSet, String> {
+    let m = |k: u8, ts: bool, v: u8| make_pbr_pipeline(device, b, module, name, k, ts, v, ldr, ldr_check);
+    let main = [m(0, false, 0)?, m(0, true, 0)?, m(1, false, 0)?, m(1, true, 0)?, m(2, false, 0)?, m(2, true, 0)?];
+    let pre = [m(0, false, 1)?, m(0, true, 1)?, m(0, false, 2)?, m(0, true, 2)?];
+    let fade = [m(0, false, 4)?, m(0, true, 4)?, m(2, false, 3)?, m(2, true, 3)?];
+    Ok(PbrSet::from_built(main, pre, fade))
+}
+
 pub struct Renderer {
     pub device: GpuDevice,
     pub queue: GpuQueue,
@@ -1242,6 +1423,11 @@ pub struct Renderer {
     /// Solid fade: [depth only, 2-sided, blended depth-equal, 2-sided] (`settings.solid_fade`).
     fade_pipelines: [GpuRenderPipeline; 4],
     fade_broken: [Rc<Cell<bool>>; 4],
+    /// Game surface shaders (`add_surface_shader`); index = `SurfaceShaderId`
+    pub(crate) surfaces: Vec<SurfaceShader>,
+    /// pbr.wgsl as compiled (common.wgsl prepended, MSAA substitution): the source surface shaders patch
+    pbr_src: String,
+    pbr_build: PbrBuild,
     /// Full-screen copy of the scene depth into `fade_depth` (frag_depth, per sample).
     fade_copy: (GpuRenderPipeline, GpuBindGroupLayout),
     /// Second depth buffer of the canvas size: scene depth + nearest faded surfaces.
@@ -1715,78 +1901,8 @@ impl Renderer {
         // ldr: Some(canvas view format) = direct-output variant (tonemaps in the shader)
         // the direct-output set is optional: a driver failure falls back to the composite path
         let ldr_check = Rc::new(crate::debug::PipelineSet::default());
-        let make_pipeline_f = |kind: u8, two_sided: bool, variant: u8, ldr: Option<GpuTextureFormat>| -> Result<(GpuRenderPipeline, Rc<Cell<bool>>), String> {
-            let blend = kind == 2;
-            let vs = GpuVertexState::new(&pbr_module);
-            vs.set_entry_point("vs_main");
-            vs.set_buffers(&[JsNullable::wrap(vertex_layout())]);
-            let target = GpuColorTargetState::new(ldr.unwrap_or(crate::post::HDR_FORMAT));
-            if blend {
-                let c = GpuBlendComponent::new();
-                c.set_src_factor(GpuBlendFactor::SrcAlpha);
-                c.set_dst_factor(GpuBlendFactor::OneMinusSrcAlpha);
-                c.set_operation(GpuBlendOperation::Add);
-                let a = GpuBlendComponent::new();
-                a.set_src_factor(GpuBlendFactor::One);
-                a.set_dst_factor(GpuBlendFactor::OneMinusSrcAlpha);
-                a.set_operation(GpuBlendOperation::Add);
-                target.set_blend(&GpuBlendState::new(&a, &c));
-            }
-            if variant == 1 {
-                target.set_write_mask(0);
-            }
-            let fs = GpuFragmentState::new(&pbr_module, &[JsNullable::wrap(target)]);
-            fs.set_entry_point(if blend { "fs_blend" } else if variant == 1 { "fs_depth" } else { "fs_main" });
-            let consts = js_sys::Object::new();
-            let _ = js_sys::Reflect::set(&consts, &"ALPHA_TEST".into(), &(if kind == 0 { 0.0 } else { 1.0 }).into());
-            if ldr.is_some() {
-                let _ = js_sys::Reflect::set(&consts, &"LDR_OUT".into(), &1.0.into());
-            }
-            fs.set_constants(consts.unchecked_ref());
-            let prim = GpuPrimitiveState::new();
-            prim.set_topology(GpuPrimitiveTopology::TriangleList);
-            prim.set_cull_mode(if two_sided { GpuCullMode::None } else { GpuCullMode::Back });
-            prim.set_front_face(GpuFrontFace::Ccw);
-            let ds = GpuDepthStencilState::new(DEPTH_FORMAT);
-            ds.set_depth_write_enabled(!blend && variant != 2); // blended surfaces test but do not write depth
-            // after the prepass the depth buffer already holds the nearest surface: only it is shaded
-            ds.set_depth_compare(if variant == 2 || variant == 3 { GpuCompareFunction::Equal } else { GpuCompareFunction::Less });
-            let ms = GpuMultisampleState::new();
-            ms.set_count(samples);
-            let desc = GpuRenderPipelineDescriptor::new(if blend { &layout_t } else { &layout }, &vs);
-            let label = match (kind, two_sided) {
-                (0, false) => "pbr-opaque",
-                (0, true) => "pbr-opaque-2s",
-                (1, false) => "pbr-mask",
-                (1, true) => "pbr-mask-2s",
-                (_, false) => "pbr-blend",
-                (_, true) => "pbr-blend-2s",
-            };
-            let label = match variant {
-                1 => if two_sided { "pbr-prepass-2s" } else { "pbr-prepass" },
-                2 => if two_sided { "pbr-opaque-eq-2s" } else { "pbr-opaque-eq" },
-                3 => if two_sided { "pbr-fade-2s" } else { "pbr-fade" },
-                4 => if two_sided { "pbr-fade-depth-2s" } else { "pbr-fade-depth" },
-                _ => label,
-            };
-            let label = if ldr.is_some() { format!("{label}-ldr") } else { label.to_string() };
-            let label = label.as_str();
-            desc.set_label(label);
-            if variant != 4 {
-                desc.set_fragment(&fs);
-            }
-            desc.set_primitive(&prim);
-            desc.set_depth_stencil(&ds);
-            desc.set_multisample(&ms);
-            if ldr.is_some() {
-                if (direct_fail == "1" && label == "pbr-opaque-eq-2s-ldr") || (direct_fail == "2" && label == "pbr-opaque-ldr") {
-                    ms.set_count(3); // invalid sample count: a validation error, like a driver failure
-                }
-                let p = crate::debug::create_pipeline_optional(&device, &desc, label, &ldr_check, DIRECT_FALLBACK)?;
-                return Ok((p, Rc::new(Cell::new(false))));
-            }
-            crate::debug::create_pipeline_guarded(&device, &desc, label)
-        };
+        let pbr_build = PbrBuild { layout: layout.clone(), layout_t: layout_t.clone(), samples, direct_fail: direct_fail.clone() };
+        let make_pipeline_f = |kind: u8, two_sided: bool, variant: u8, ldr: Option<GpuTextureFormat>| make_pbr_pipeline(&device, &pbr_build, &pbr_module, "pbr", kind, two_sided, variant, ldr, &ldr_check);
         let make_pipeline_v = |kind: u8, two_sided: bool, variant: u8| make_pipeline_f(kind, two_sided, variant, None);
         let make_pipeline = |kind: u8, two_sided: bool| make_pipeline_v(kind, two_sided, 0);
         // direct output: the same variants into the sRGB canvas view (sky + particles come from Post)
@@ -1978,11 +2094,7 @@ impl Renderer {
         let ldr = match (ldr_pbr, &post.sky_ldr, &post.particle_ldr) {
             (Some((main, pre, fade, f)), Some(sky), Some((pa, pb))) => Some((
                 ScenePipes {
-                    pipeline_broken: std::array::from_fn(|i| main[i].1.clone()),
-                    pipelines: main.map(|b| b.0),
-                    prepass_broken: std::array::from_fn(|i| pre[i].1.clone()),
-                    prepass: pre.map(|b| b.0),
-                    fade: fade.map(|b| b.0),
+                    pbr: vec![PbrSet::from_built(main, pre, fade)],
                     sky: sky.clone(),
                     particle_additive: pa.clone(),
                     particle_alpha: pb.clone(),
@@ -2006,6 +2118,9 @@ impl Renderer {
             prepass_broken,
             fade_pipelines,
             fade_broken,
+            surfaces: Vec::new(),
+            pbr_src: pbr_src.clone(),
+            pbr_build: pbr_build.clone(),
             fade_copy,
             fade_depth: None,
             prewarm_pending: true,
@@ -2355,6 +2470,77 @@ impl Renderer {
         self.prewarm_pending = true;
     }
 
+    /// Registers a game surface shader: WGSL that defines `fn surface(s: SurfaceIn) -> SurfaceOut` (plus its own
+    /// helpers, best prefixed) and replaces the texture / normal-map / parallax block of the PBR shading for every
+    /// material with `surface: Some(id)`; lighting, shadows, fog and tonemap stay the engine's (see `SurfaceIn` /
+    /// `SurfaceOut` / `surface_defaults` in shaders/pbr.wgsl). The engine builds a module of pbr.wgsl with the
+    /// snippet in place of the default hook and its full pipeline set (opaque, mask, blend, prepass, solid fade,
+    /// direct output when that set exists), prewarmed on the next frame. The material's three texture slots
+    /// (`base_tex`, `normal_tex`, `height_tex` + `base_sampler`) are free for the snippet. Sample with
+    /// `textureSampleGrad(.., s.duvx, s.duvy)` or `textureSampleLevel` (the blend entry calls it in non-uniform
+    /// control flow). Registering the same name again replaces the shader in place (same id, live reload).
+    /// Compile errors land in the log / error overlay with line numbers of the patched module.
+    pub fn add_surface_shader(&mut self, name: &str, wgsl: &str) -> Result<SurfaceShaderId, String> {
+        let existing = self.surfaces.iter().position(|s| s.name == name);
+        if existing.is_none() && self.surfaces.len() as u32 >= MAX_SURFACE_SHADERS {
+            return Err(format!("surface shader {name}: at most {MAX_SURFACE_SHADERS}"));
+        }
+        let (a, b) = ("// SURFACE_HOOK_BEGIN", "// SURFACE_HOOK_END");
+        let (Some(i), Some(j)) = (self.pbr_src.find(a), self.pbr_src.find(b)) else {
+            return Err("pbr.wgsl has no surface hook markers".into());
+        };
+        let src = format!("{}// surface shader {name}\nconst SURFACE_HOOK: bool = true;\n{wgsl}\n{}", &self.pbr_src[..i], &self.pbr_src[j + b.len()..]);
+        let module = self.device.create_shader_module(&GpuShaderModuleDescriptor::new(&src));
+        let label = format!("surf-{name}");
+        module.set_label(&label);
+        crate::debug::report_shader_errors(&module, &format!("surface shader {name}"));
+        let hdr = build_pbr_set(&self.device, &self.pbr_build, &module, &label, None, &self.ldr_check)?;
+        let ldr = match &self.ldr {
+            Some((_, f)) => Some(build_pbr_set(&self.device, &self.pbr_build, &module, &label, Some(*f), &self.ldr_check)?),
+            None => None,
+        };
+        if ldr.is_some() {
+            self.ldr_warm_pending = true;
+        }
+        let s = SurfaceShader { name: name.to_string(), wgsl: wgsl.to_string(), hdr, ldr };
+        self.prewarm_pending = true;
+        let id = match existing {
+            Some(k) => {
+                self.surfaces[k] = s;
+                k
+            }
+            None => {
+                self.surfaces.push(s);
+                self.surfaces.len() - 1
+            }
+        };
+        crate::log_info!("surface shader {name}: id {id}, {} pipelines{}", 14, if self.ldr.is_some() { " + 14 direct output" } else { "" });
+        Ok(SurfaceShaderId(id as u32))
+    }
+
+    /// `surface_shader` command: id, name, source size, broken pipelines per set.
+    pub(crate) fn surface_shaders_info(&self) -> Vec<serde_json::Value> {
+        let broken = |s: &PbrSet| s.pipeline_broken.iter().chain(s.prepass_broken.iter()).chain(s.fade_broken.iter()).filter(|b| b.get()).count();
+        self.surfaces
+            .iter()
+            .enumerate()
+            .map(|(i, s)| serde_json::json!({"id": i, "name": s.name, "wgsl_bytes": s.wgsl.len(), "broken": broken(&s.hdr), "direct_output": s.ldr.is_some()}))
+            .collect()
+    }
+
+    /// A registered surface shader by name.
+    pub fn surface_shader(&self, name: &str) -> Option<SurfaceShaderId> {
+        self.surfaces.iter().position(|s| s.name == name).map(|i| SurfaceShaderId(i as u32))
+    }
+
+    /// The direct-output set plus every surface shader's (its HDR-free fallback: the built-in LDR set).
+    fn ldr_pipes(&self, p: &ScenePipes) -> ScenePipes {
+        let mut p = p.clone();
+        let base = p.pbr[0].clone();
+        p.pbr.extend(self.surfaces.iter().map(|s| s.ldr.clone().unwrap_or_else(|| base.clone())));
+        p
+    }
+
     /// Notes the first real use of a lazily reached path; logged with the next frame's interval.
     fn first_use(&mut self, bit: u32, name: &'static str) {
         if self.first_use_seen & bit == 0 {
@@ -2371,12 +2557,18 @@ impl Renderer {
 
     /// The HDR pipeline set (see `ScenePipes`).
     fn hdr_pipes(&self) -> ScenePipes {
-        ScenePipes {
+        let builtin = PbrSet {
             pipelines: self.pipelines.clone(),
             pipeline_broken: self.pipeline_broken.clone(),
             prepass: self.prepass_pipelines.clone(),
             prepass_broken: self.prepass_broken.clone(),
             fade: self.fade_pipelines.clone(),
+            fade_broken: self.fade_broken.clone(),
+        };
+        let mut pbr = vec![builtin];
+        pbr.extend(self.surfaces.iter().map(|s| s.hdr.clone()));
+        ScenePipes {
+            pbr,
             sky: self.post.sky_pipeline.clone(),
             particle_additive: self.post.particle_additive.clone(),
             particle_alpha: self.post.particle_alpha.clone(),
@@ -2512,28 +2704,32 @@ impl Renderer {
             pass.draw_indexed_with_instance_count_and_first_index_and_base_vertex_and_first_instance(3, 1, 0, 0, 0);
         };
         pass.set_bind_group(0, Some(&self.bind0));
-        for i in 0..4 {
-            if !lp.pipeline_broken[i].get() {
-                tri(&lp.pipelines[i]);
+        for s in &lp.pbr {
+            for i in 0..4 {
+                if !s.pipeline_broken[i].get() {
+                    tri(&s.pipelines[i]);
+                }
             }
-        }
-        for i in 0..4 {
-            if !lp.prepass_broken[i].get() {
-                tri(&lp.prepass[i]);
+            for i in 0..4 {
+                if !s.prepass_broken[i].get() {
+                    tri(&s.prepass[i]);
+                }
             }
         }
         pass.set_pipeline(&lp.sky);
         pass.draw(3);
         if let Some(b0t) = &self.bind0_t {
             pass.set_bind_group(0, Some(b0t));
-            for i in 4..6 {
-                if !lp.pipeline_broken[i].get() {
-                    tri(&lp.pipelines[i]);
+            for s in &lp.pbr {
+                for i in 4..6 {
+                    if !s.pipeline_broken[i].get() {
+                        tri(&s.pipelines[i]);
+                    }
                 }
-            }
-            if self.settings.solid_fade {
-                tri(&lp.fade[2]);
-                tri(&lp.fade[3]);
+                if self.settings.solid_fade {
+                    tri(&s.fade[2]);
+                    tri(&s.fade[3]);
+                }
             }
             pass.set_bind_group(1, Some(&self.post.particle_group));
             pass.set_pipeline(&lp.particle_additive);
@@ -3804,7 +4000,7 @@ impl Renderer {
         // (pipeline 0..3 << 56 | texture key << 28 | mesh, mi); opaque pipelines sort first
         let mut visible: Vec<(u64, u32)> = Vec::with_capacity(raws.capacity());
         // (view depth, double_sided, texture, mesh, mi)
-        let mut blended: Vec<(f32, bool, u32, u32, u32, bool)> = vec![];
+        let mut blended: Vec<(f32, u8, u32, u32, u32, bool)> = vec![];
         let mut has_water = false;
         // (alpha-tested << 63 | texture key << 32 | mesh, mi)
         let mut casters: Vec<(u64, u32)> = Vec::with_capacity(raws.capacity());
@@ -3903,9 +4099,9 @@ impl Renderer {
             }
             if is_blend {
                 has_water |= mat.water;
-                blended.push(((center - cam_pos).dot(cam_fwd_n), mat.double_sided, tex, mesh_id.0, mi, c.solid));
+                blended.push(((center - cam_pos).dot(cam_fwd_n), mat.double_sided as u8 + 2 * c.surface, tex, mesh_id.0, mi, c.solid));
             } else {
-                let pipe = (if is_mask || mat.ui { 2 } else { 0 }) + mat.double_sided as u64;
+                let pipe = (if is_mask || mat.ui { 2 } else { 0 }) + mat.double_sided as u64 + 4 * c.surface as u64;
                 visible.push((pipe << 56 | (tex as u64) << 28 | mesh_id.0 as u64, mi));
                 scene_min = scene_min.min(center - radius);
                 scene_max = scene_max.max(center + radius);
@@ -4144,10 +4340,10 @@ impl Renderer {
         // Blended runs: only *adjacent* equal keys merge, so the back-to-front order is kept.
         // driven path: the blended ids follow the main + shadow slices the GPU fills
         let blend_base = if gpu { self.scene.id_layout().1 } else { visible.len() as u32 };
-        let mut blend_runs: Vec<(bool, u32, u32, u32, u32)> = vec![];
+        let mut blend_runs: Vec<(u8, u32, u32, u32, u32)> = vec![];
         // solid fade (main view): faded entities drawn as their nearest surface, then blended
-        let solid_on = main && self.settings.solid_fade && self.fade_broken.iter().all(|b| !b.get());
-        let mut solid_runs: Vec<(bool, u32, u32, u32, u32)> = vec![];
+        let solid_on = main && self.settings.solid_fade && self.fade_broken.iter().chain(self.surfaces.iter().flat_map(|s| s.hdr.fade_broken.iter())).all(|b| !b.get());
+        let mut solid_runs: Vec<(u8, u32, u32, u32, u32)> = vec![];
         for (i, b) in blended.iter().enumerate() {
             let runs = if solid_on && b.5 { &mut solid_runs } else { &mut blend_runs };
             let at = blend_base + i as u32;
@@ -4652,7 +4848,7 @@ impl Renderer {
             self.first_use(8, "direct output (LDR pipelines)");
         }
         let sp = match (&direct_view, &self.ldr) {
-            (Some(_), Some((p, _))) => p.clone(),
+            (Some(_), Some((p, _))) => self.ldr_pipes(p),
             _ => self.hdr_pipes(),
         };
         // --- Opaque pass (indirect on the GPU path); keeps colour + depth for the blend pass ---
@@ -4706,17 +4902,17 @@ impl Renderer {
                 let args = self.scene_gpu.as_ref().unwrap().args_buf.clone();
                 let near = rb.as_ref().map(|r| r.1.as_slice()).unwrap_or(&[]);
                 let order = self.scene.draw_order(near, self.settings.reverse_draw_order, &planes, cam_pos, lod_bias);
-                let prepass = self.settings.depth_prepass && sp.prepass_broken.iter().all(|b| !b.get());
+                let prepass = self.settings.depth_prepass && sp.pbr.iter().all(|s| s.prepass_broken.iter().all(|b| !b.get()));
                 if prepass {
                     // depth only for every opaque group (alpha-tested ones are shaded normally below)
                     let mut bound = usize::MAX;
                     for &(pipe, tex, mesh_id, g) in &order {
                         let mesh = &self.meshes[mesh_id as usize];
-                        if pipe > 1 || mesh.index_count == 0 {
+                        if pipe & 3 > 1 || mesh.index_count == 0 {
                             continue;
                         }
                         if pipe as usize != bound {
-                            pass.set_pipeline(&sp.prepass[pipe as usize]);
+                            pass.set_pipeline(&sp.of((pipe >> 2) as usize).prepass[(pipe & 3) as usize]);
                             bound = pipe as usize;
                         }
                         if tex != bound_tex {
@@ -4734,17 +4930,17 @@ impl Renderer {
                     if mesh.index_count == 0 {
                         continue;
                     }
-                    let pi = pipe as usize;
-                    if sp.pipeline_broken[pi].get() {
+                    let (set, pi) = (sp.of((pipe >> 2) as usize), (pipe & 3) as usize);
+                    if set.pipeline_broken[pi].get() {
                         continue;
                     }
-                    if pi != bound_pipe {
+                    if pipe as usize != bound_pipe {
                         if prepass && pi <= 1 {
-                            pass.set_pipeline(&sp.prepass[2 + pi]);
+                            pass.set_pipeline(&set.prepass[2 + pi]);
                         } else {
-                            pass.set_pipeline(&sp.pipelines[pi]);
+                            pass.set_pipeline(&set.pipelines[pi]);
                         }
-                        bound_pipe = pi;
+                        bound_pipe = pipe as usize;
                     }
                     if tex != bound_tex {
                         pass.set_bind_group(1, Some(&groups[tex as usize]));
@@ -4760,14 +4956,14 @@ impl Renderer {
                 stats.triangles += stats.gpu_triangles as u64;
             }
             for &b in &draw_order {
-                let (two_sided, tex, mesh_id, first, count) = batches[b as usize];
-                let pi = two_sided as usize; // pipeline index 0..3
-                if sp.pipeline_broken[pi].get() {
+                let (pipe, tex, mesh_id, first, count) = batches[b as usize];
+                let (set, pi) = (sp.of((pipe >> 2) as usize), (pipe & 3) as usize); // pipeline index 0..3
+                if set.pipeline_broken[pi].get() {
                     continue;
                 }
-                if pi != bound_pipe {
-                    pass.set_pipeline(&sp.pipelines[pi]);
-                    bound_pipe = pi;
+                if pipe as usize != bound_pipe {
+                    pass.set_pipeline(&set.pipelines[pi]);
+                    bound_pipe = pipe as usize;
                 }
                 if tex != bound_tex {
                     pass.set_bind_group(1, Some(&groups[tex as usize]));
@@ -4790,15 +4986,17 @@ impl Renderer {
             }
             if let (Some(m), Some(mg)) = (warm_mesh, warm_mg.as_ref()) {
                 pass.set_bind_group(0, Some(&self.bind0));
-                for i in 0..4 {
-                    if !sp.pipeline_broken[i].get() {
-                        self.warm_draw(&pass, &sp.pipelines[i], mg, m);
+                for s in &sp.pbr {
+                    for i in 0..4 {
+                        if !s.pipeline_broken[i].get() {
+                            self.warm_draw(&pass, &s.pipelines[i], mg, m);
+                        }
                     }
-                }
-                if gpu && self.settings.depth_prepass {
-                    for i in 2..4 {
-                        if !sp.prepass_broken[i].get() {
-                            self.warm_draw(&pass, &sp.prepass[i], mg, m);
+                    if gpu && self.settings.depth_prepass {
+                        for i in 2..4 {
+                            if !s.prepass_broken[i].get() {
+                                self.warm_draw(&pass, &s.prepass[i], mg, m);
+                            }
                         }
                     }
                 }
@@ -4839,11 +5037,10 @@ impl Renderer {
             pass.draw(3);
             pass.set_bind_group(0, Some(&self.bind0));
             let mut bound = usize::MAX;
-            for &(two_sided, tex, mesh_id, first, count) in &solid_runs {
-                let pi = two_sided as usize;
-                if pi != bound {
-                    pass.set_pipeline(&sp.fade[pi]);
-                    bound = pi;
+            for &(code, tex, mesh_id, first, count) in &solid_runs {
+                if code as usize != bound {
+                    pass.set_pipeline(&sp.of((code >> 1) as usize).fade[(code & 1) as usize]);
+                    bound = code as usize;
                 }
                 pass.set_bind_group(1, Some(&groups[tex as usize]));
                 let mesh = &self.meshes[mesh_id as usize];
@@ -4853,8 +5050,10 @@ impl Renderer {
                 stats.draw_calls += 1;
             }
             if let (true, Some(m), Some(mg)) = (warm_solid, warm_mesh, warm_mg.as_ref()) {
-                for i in 0..2 {
-                    self.warm_draw(&pass, &sp.fade[i], mg, m);
+                for s in &sp.pbr {
+                    for i in 0..2 {
+                        self.warm_draw(&pass, &s.fade[i], mg, m);
+                    }
                 }
             }
             pass.end();
@@ -4895,8 +5094,8 @@ impl Renderer {
             let mut bound_tex = u32::MAX;
             let mut bound_pipe = usize::MAX;
             // solid fade first: only the nearest faded surface passes (depth equal), blended once
-            for &(two_sided, tex, mesh_id, first, count) in &solid_runs {
-                pass.set_pipeline(&sp.fade[2 + two_sided as usize]);
+            for &(code, tex, mesh_id, first, count) in &solid_runs {
+                pass.set_pipeline(&sp.of((code >> 1) as usize).fade[2 + (code & 1) as usize]);
                 pass.set_bind_group(1, Some(&groups[tex as usize]));
                 bound_tex = tex;
                 let mesh = &self.meshes[mesh_id as usize];
@@ -4910,14 +5109,14 @@ impl Renderer {
                 stats.triangles += tris;
                 stats.candidate_triangles += tris;
             }
-            for &(two_sided, tex, mesh_id, first, count) in &blend_runs {
-                let pi = 4 + two_sided as usize;
-                if sp.pipeline_broken[pi].get() {
+            for &(code, tex, mesh_id, first, count) in &blend_runs {
+                let (set, pi) = (sp.of((code >> 1) as usize), 4 + (code & 1) as usize);
+                if set.pipeline_broken[pi].get() {
                     continue;
                 }
-                if pi != bound_pipe {
-                    pass.set_pipeline(&sp.pipelines[pi]);
-                    bound_pipe = pi;
+                if code as usize != bound_pipe {
+                    pass.set_pipeline(&set.pipelines[pi]);
+                    bound_pipe = code as usize;
                 }
                 if tex != bound_tex {
                     pass.set_bind_group(1, Some(&groups[tex as usize]));
@@ -4934,14 +5133,16 @@ impl Renderer {
                 stats.candidate_triangles += tris;
             }
             if let (Some(m), Some(mg)) = (warm_mesh, warm_mg.as_ref()) {
-                if fade_depth_view.is_some() {
-                    for i in 2..4 {
-                        self.warm_draw(&pass, &sp.fade[i], mg, m);
+                for s in &sp.pbr {
+                    if fade_depth_view.is_some() {
+                        for i in 2..4 {
+                            self.warm_draw(&pass, &s.fade[i], mg, m);
+                        }
                     }
-                }
-                for i in 4..6 {
-                    if !sp.pipeline_broken[i].get() {
-                        self.warm_draw(&pass, &sp.pipelines[i], mg, m);
+                    for i in 4..6 {
+                        if !s.pipeline_broken[i].get() {
+                            self.warm_draw(&pass, &s.pipelines[i], mg, m);
+                        }
                     }
                 }
             }

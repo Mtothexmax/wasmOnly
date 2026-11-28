@@ -191,7 +191,8 @@ fn brdf(n: vec3f, v: vec3f, l: vec3f, albedo: vec3f, metallic: f32, rough: f32) 
 
 // brdf with Material::subsurface (wrap diffuse: wrap = sss / 2) and Material::clearcoat (second GGX
 // lobe, F0 0.04, over the base, which loses what the coat reflects).
-fn brdf_plastic(n: vec3f, v: vec3f, l: vec3f, albedo: vec3f, metallic: f32, rough: f32, sss: f32, coat: f32, coat_rough: f32) -> vec3f {
+// coat_n: normal of the coat lobe (a surface shader may give a smooth coat over a bumpy base).
+fn brdf_plastic(n: vec3f, coat_n: vec3f, v: vec3f, l: vec3f, albedo: vec3f, metallic: f32, rough: f32, sss: f32, coat: f32, coat_rough: f32) -> vec3f {
     let h = normalize(v + l);
     let nl_raw = dot(n, l);
     let n_l = max(nl_raw, 0.0);
@@ -209,7 +210,10 @@ fn brdf_plastic(n: vec3f, v: vec3f, l: vec3f, albedo: vec3f, metallic: f32, roug
     if (coat > 0.0) {
         let ac = coat_rough * coat_rough;
         let fc = f_schlick(vec3f(0.04), v_h).x * coat;
-        c = c * (1.0 - fc) + d_ggx(n_h, ac) * v_smith(n_v, n_l, ac) * fc * n_l;
+        let c_l = max(dot(coat_n, l), 0.0);
+        let c_v = max(dot(coat_n, v), 1e-4);
+        let c_h = max(dot(coat_n, h), 0.0);
+        c = c * (1.0 - fc) + d_ggx(c_h, ac) * v_smith(c_v, c_l, ac) * fc * c_l;
     }
     return c;
 }
@@ -599,6 +603,62 @@ struct Surface {
     shadow: f32,
 }
 
+// --- Surface shader hook (`Renderer::add_surface_shader`, `Material::surface`) ---------------------
+// A game's `fn surface(s: SurfaceIn) -> SurfaceOut` replaces the texture / normal-map / parallax / studs /
+// triplanar block of `shade`; lighting, shadows, clustered lights, fog and tonemapping stay the engine's.
+// The engine builds one module per surface shader with the block between the markers below replaced.
+struct SurfaceIn {
+    uv: vec2f,
+    world: vec3f,      // world position
+    n: vec3f,          // interpolated normal (back faces of double-sided materials mirrored)
+    t: vec3f,          // tangent frame: +u direction
+    b: vec3f,          //                +v direction
+    v: vec3f,          // unit vector towards the camera
+    dpx: vec3f,        // screen-space derivatives of world (x, y) and uv: textureSampleGrad(.., uv, duvx, duvy)
+    dpy: vec3f,
+    duvx: vec2f,
+    duvy: vec2f,
+    color: vec4f,      // linear vertex colour (white = none)
+    base_color: vec4f, // Material::base_color (alpha includes MeshRenderer::opacity)
+    params0: vec4f,    // Material::surface_params[0]
+    params1: vec4f,    // Material::surface_params[1]
+    front: bool,
+    dist: f32,         // distance to the camera
+    time: f32,         // seconds (simulation clock)
+    roughness: f32,    // the material's values (SurfaceOut starts with them in surface_defaults)
+    metallic: f32,
+    emissive: vec3f,
+    clearcoat: f32,
+    clearcoat_roughness: f32,
+    subsurface: f32,
+}
+
+struct SurfaceOut {
+    albedo: vec3f,
+    alpha: f32,            // alpha test (AlphaMode::Mask) and blending use it
+    normal: vec3f,         // shading normal (world space) of the base lobe
+    coat_normal: vec3f,    // normal of the clear-coat lobe and its ambient specular
+    roughness: f32,
+    metallic: f32,
+    emissive: vec3f,
+    clearcoat: f32,
+    clearcoat_roughness: f32,
+    subsurface: f32,
+}
+
+// The material as the built-in shading would see it without maps: base texture x base colour x vertex
+// colour, the interpolated normal, the material's roughness / metallic / emissive / coat / subsurface.
+fn surface_defaults(s: SurfaceIn) -> SurfaceOut {
+    let tex = textureSampleGrad(base_tex, base_sampler, s.uv, s.duvx, s.duvy);
+    return SurfaceOut(tex.rgb * s.base_color.rgb * s.color.rgb, tex.a * s.base_color.a * s.color.a, s.n, s.n,
+        s.roughness, s.metallic, s.emissive, s.clearcoat, s.clearcoat_roughness, s.subsurface);
+}
+
+// SURFACE_HOOK_BEGIN
+const SURFACE_HOOK: bool = false;
+fn surface(s: SurfaceIn) -> SurfaceOut { return surface_defaults(s); }
+// SURFACE_HOOK_END
+
 fn shade(i: VsOut, front: bool, d: Deriv, face_n: vec3f) -> Surface {
     let inst = instances[i.inst];
     // Double-sided back faces: mirror the shading normal at the triangle plane (equals flipping for
@@ -616,47 +676,76 @@ fn shade(i: VsOut, front: bool, d: Deriv, face_n: vec3f) -> Surface {
     let tbn = mat3x3f(tbn0[0] * fs, tbn0[1] * fs, tbn0[2]);
 
     let is_terrain = inst.params.z < -0.5;
-    var uv = i.uv;
-    let tri_on = inst.tri.x > 0.0 && !is_terrain;
-    let ps = parallax_scale(inst, i.world, d.duvx, d.duvy);
-    if (ps > 0.0 && !is_terrain && !tri_on) { // parallax occlusion mapping
-        let view_ts = vec3f(dot(v, tbn[0]), dot(v, tbn[1]), dot(v, tbn[2]));
-        uv = parallax_uv(uv, view_ts, ps, d);
-    }
-    // Material::studs (render.stud_relief = quality, 0 = off)
-    var stud = StudHit(vec3f(0.0, 0.0, 1.0), uv, 1.0, 0.0);
-    let stud_tbn = tbn;
-    if (inst.studs.x > 0.0 && g.shadow_sets.w > 0.5 && !is_terrain && !tri_on && (inst.studs2.z < 0.5 || n_geo.y > 0.5)) {
-        let view_ts = vec3f(dot(v, stud_tbn[0]), dot(v, stud_tbn[1]), dot(v, stud_tbn[2]));
-        stud = stud_relief(uv, view_ts, inst.studs, inst.studs2, g.shadow_sets.w > 1.5, d);
-        uv = mix(uv, stud.uv, step(0.5, stud.w)); // the colour map follows the stud (no half shift)
-    }
-    var tex = textureSampleGrad(base_tex, base_sampler, uv, d.duvx, d.duvy);
-    if (is_terrain) {
-        tex = vec4f(terrain_albedo(i, d, inst), 1.0);
-    }
-    if (tri_on) {
-        let t = triplanar(i, n, v, d, inst);
-        tex = t.tex;
-        n = t.n;
-    } else if (inst.maps.x != 0.0 && !is_terrain) { // tangent-space normal map
-        var tn = textureSampleGrad(normal_tex, base_sampler, uv, d.duvx, d.duvy).xyz * 2.0 - 1.0;
-        tn = vec3f(tn.xy * inst.maps.x, tn.z);
-        n = normalize(tbn * tn);
-    }
-    if (stud.w > 0.0) { // the stud normal replaces the surface (and normal-map) normal
-        n = normalize(mix(n, normalize(stud_tbn * stud.n), stud.w * inst.studs2.y));
+    // material values (a surface shader may replace them)
+    var metallic = select(inst.emissive_metallic.a, 0.0, is_terrain);
+    var rough = clamp(inst.params.x, 0.04, 1.0);
+    var coat = select(0.0, inst.normal[0].w, !is_terrain);   // Material::clearcoat
+    var coat_rough = inst.normal[1].w;
+    var sss = select(0.0, inst.normal[3].w, !is_terrain);    // Material::subsurface
+    var emissive = inst.emissive_metallic.rgb;
+    var albedo: vec3f;
+    var alpha: f32;
+    var tex_a = 1.0; // base texture alpha (UI cut-out)
+    var coat_n = n;
+    if (SURFACE_HOOK) {
+        let so = surface(SurfaceIn(i.uv, i.world, n, tbn[0], tbn[1], v, d.dpx, d.dpy, d.duvx, d.duvy, i.color,
+            inst.base_color, inst.studs, inst.studs2, front, length(g.camera_pos.xyz - i.world), g.time.x,
+            rough, metallic, emissive, coat, coat_rough, sss));
+        n = safe_normal(so.normal, n);
+        coat_n = safe_normal(so.coat_normal, n);
+        albedo = so.albedo;
+        alpha = so.alpha;
+        rough = clamp(so.roughness, 0.04, 1.0);
+        metallic = clamp(so.metallic, 0.0, 1.0);
+        emissive = so.emissive;
+        coat = clamp(so.clearcoat, 0.0, 1.0);
+        coat_rough = clamp(so.clearcoat_roughness, 0.02, 1.0);
+        sss = clamp(so.subsurface, 0.0, 1.0);
+    } else {
+        var uv = i.uv;
+        let tri_on = inst.tri.x > 0.0 && !is_terrain;
+        let ps = parallax_scale(inst, i.world, d.duvx, d.duvy);
+        if (ps > 0.0 && !is_terrain && !tri_on) { // parallax occlusion mapping
+            let view_ts = vec3f(dot(v, tbn[0]), dot(v, tbn[1]), dot(v, tbn[2]));
+            uv = parallax_uv(uv, view_ts, ps, d);
+        }
+        // Material::studs (render.stud_relief = quality, 0 = off)
+        var stud = StudHit(vec3f(0.0, 0.0, 1.0), uv, 1.0, 0.0);
+        let stud_tbn = tbn;
+        if (inst.studs.x > 0.0 && g.shadow_sets.w > 0.5 && !is_terrain && !tri_on && (inst.studs2.z < 0.5 || n_geo.y > 0.5)) {
+            let view_ts = vec3f(dot(v, stud_tbn[0]), dot(v, stud_tbn[1]), dot(v, stud_tbn[2]));
+            stud = stud_relief(uv, view_ts, inst.studs, inst.studs2, g.shadow_sets.w > 1.5, d);
+            uv = mix(uv, stud.uv, step(0.5, stud.w)); // the colour map follows the stud (no half shift)
+        }
+        var tex = textureSampleGrad(base_tex, base_sampler, uv, d.duvx, d.duvy);
+        if (is_terrain) {
+            tex = vec4f(terrain_albedo(i, d, inst), 1.0);
+        }
+        if (tri_on) {
+            let t = triplanar(i, n, v, d, inst);
+            tex = t.tex;
+            n = t.n;
+        } else if (inst.maps.x != 0.0 && !is_terrain) { // tangent-space normal map
+            var tn = textureSampleGrad(normal_tex, base_sampler, uv, d.duvx, d.duvy).xyz * 2.0 - 1.0;
+            tn = vec3f(tn.xy * inst.maps.x, tn.z);
+            n = normalize(tbn * tn);
+        }
+        if (stud.w > 0.0) { // the stud normal replaces the surface (and normal-map) normal
+            n = normalize(mix(n, normalize(stud_tbn * stud.n), stud.w * inst.studs2.y));
+        }
+        coat_n = n;
+        tex_a = tex.a;
+        alpha = inst.base_color.a * tex.a * i.color.a;
+        albedo = tex.rgb * inst.base_color.rgb * i.color.rgb * stud.shade;
     }
 
     let alpha_mode = inst.params.w;
-    var alpha = inst.base_color.a * tex.a * i.color.a;
     if (alpha_mode > 0.0) {            // mask (alpha test)
         if (ALPHA_TEST && alpha < alpha_mode) { discard; }
         alpha = 1.0;
     } else if (alpha_mode == 0.0) {    // opaque
         alpha = 1.0;
     }
-    var albedo = tex.rgb * inst.base_color.rgb * i.color.rgb * stud.shade;
     let checker = inst.params.y;
     if (checker > 0.0) {
         let c = floor(i.world.x * checker) + floor(i.world.z * checker);
@@ -665,26 +754,21 @@ fn shade(i: VsOut, front: bool, d: Deriv, face_n: vec3f) -> Surface {
     // The sun term is brdf * n_l * shadow: surfaces facing away from the sun (n_l = 0) and unlit / UI
     // surfaces never use the shadow term, so they skip the shadow-map taps (debug view 2 shows it).
     let l_sun = normalize(-g.sun_dir.xyz);
-    let sss = select(0.0, inst.normal[3].w, !is_terrain); // Material::subsurface
     var shadow = 1.0;
     if (g.counts.y == 1u && ((dot(n, l_sun) > -0.5 * sss && inst.params.z < 0.5) || g.counts.z == 2u)) {
         shadow = shadow_factor(i.world, n, i.clip.xy);
     }
 
     if (inst.params.z > 1.5) { // ui surface (world panels): texture as-is, alpha-tested
-        if (ALPHA_TEST && tex.a < 0.5) { discard; }
+        if (ALPHA_TEST && tex_a < 0.5) { discard; }
         return Surface(vec4f(albedo, 0.0), n, shadow); // alpha 0: not tonemapped
     }
     // one call of finish (fog) for lit and unlit (see shadow_factor: one call site per sampling helper)
-    var color = albedo + inst.emissive_metallic.rgb; // unlit
+    var color = albedo + emissive; // unlit
     if (inst.params.z <= 0.5) {
-        let metallic = select(inst.emissive_metallic.a, 0.0, is_terrain);
-        let rough = clamp(inst.params.x, 0.04, 1.0);
-        let coat = select(0.0, inst.normal[0].w, !is_terrain);   // Material::clearcoat
-        let coat_rough = inst.normal[1].w;
         let sun = g.sun_color.rgb * g.sun_dir.w;
         if (sss > 0.0 || coat > 0.0) {
-            color = brdf_plastic(n, v, l_sun, albedo, metallic, rough, sss, coat, coat_rough) * sun * shadow;
+            color = brdf_plastic(n, coat_n, v, l_sun, albedo, metallic, rough, sss, coat, coat_rough) * sun * shadow;
             if (sss > 0.0) { // thin back-light translucency (unshadowed: back faces would self-shadow)
                 let sc = select(inst.normal[3].rgb, albedo, inst.normal[3].r < 0.0);
                 let back = pow(clamp(dot(v, -normalize(l_sun + n * 0.3)), 0.0, 1.0), 4.0) * sss * 0.25;
@@ -698,9 +782,9 @@ fn shade(i: VsOut, front: bool, d: Deriv, face_n: vec3f) -> Surface {
         color += hemi * albedo * (1.0 - metallic * 0.6);
         if (g.push.w > 0.0) {
             color += ambient_specular(n, n_geo, v, albedo, metallic, rough) * g.push.w;
-            if (coat > 0.0) { color += ambient_specular(n, n_geo, v, vec3f(0.04), 0.0, coat_rough) * g.push.w * coat; }
+            if (coat > 0.0) { color += ambient_specular(coat_n, n_geo, v, vec3f(0.04), 0.0, coat_rough) * g.push.w * coat; }
         }
-        if (!is_terrain) { color += inst.emissive_metallic.rgb; }
+        if (!is_terrain) { color += emissive; }
     }
     return Surface(vec4f(finish(color, i.world), alpha), n, shadow);
 }

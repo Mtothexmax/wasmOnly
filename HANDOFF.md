@@ -52,6 +52,9 @@ auto_lod: false, ..Default::default() })`, `ctx.gltf_defaults.auto_lod = false`,
 Some(Hlod { distance, cluster }))`; a far clip that fades into the fog: `render.view_distance`.
 LEGO baseplates without stud geometry: `Material::studs = Some(StudRelief::lego(pitch_uv))` (analytic per-pixel
 studs, quality `render.stud_relief` 0/1/2).
+Custom material looks (ice crystals, holograms, animated patterns): a game surface shader, `ctx.renderer.add_surface_shader(name,
+include_str!("x.wgsl"))` + `Material::surface` / `surface_params`; the WGSL `fn surface(s: SurfaceIn) -> SurfaceOut` replaces
+only the material-map block, the engine keeps lighting, shadows, fog and every pipeline variant (AGENTS.md "Surface shaders").
 
 ## 3. Working rules (they prevented real bugs)
 

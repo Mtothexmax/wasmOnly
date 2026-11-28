@@ -1,0 +1,41 @@
+# Game surface shader hook (Renderer::add_surface_shader, Material::surface): the demo's stripes.wgsl on a cube,
+# opaque (+ depth prepass), alpha-tested, blended (opacity), solid fade, live replacement, direct output.
+#   node tools/bridge.mjs run games/demo/tests/surface.txt
+reload
+screen play
+wait 1000
+pause
+call surface_demo {"pos": [0, 2, 0], "size": 3, "name": "stripecube"}
+expect surface_shader.surface_shaders.length == 1
+expect surface_shader.surface_shaders.0.name == "stripes"
+expect surface_shader.surface_shaders.0.broken == 0
+expect material{"entity": "stripecube"}.surface == 0
+call spawn {"camera": true, "pos": [3.2, 4.2, 4.2], "look_at": [0, 2, 0], "main": true}
+frames 4
+expect logs{"level": "error"}.entries.length == 0
+screenshot out/surface-stripes.png
+# drawn through the GPU-driven path
+expect stats.render.gpu_visible > 0
+# live replacement under the same name keeps the id; a plain red surface
+call surface_shader {"name": "stripes", "wgsl": "fn surface(s: SurfaceIn) -> SurfaceOut { var o = surface_defaults(s); o.albedo = vec3f(0.8, 0.05, 0.05); return o; }"}
+expect surface_shader.surface_shaders.length == 1
+frames 3
+screenshot out/surface-red.png
+expect logs{"level": "error"}.entries.length == 0
+# back to the stripes; a second cube alpha-tested + two-sided, a faded one (blend pass)
+call surface_demo {"pos": [-3.5, 2, 0], "size": 2, "name": "stripemask", "alpha": 0.5, "double_sided": true}
+call surface_demo {"pos": [3.5, 2, -1], "size": 2, "name": "stripefade"}
+call set {"name": "stripefade", "opacity": 0.5}
+call camera {"pos": [0, 4.5, 9], "look_at": [0, 2, 0]}
+frames 4
+screenshot out/surface-three.png
+call render {"solid_fade": true}
+frames 3
+call render {"solid_fade": false}
+call render {"gpu_culling": false}
+frames 3
+call render {"gpu_culling": true}
+frames 2
+expect zfight{"entity": "stripecube"}.pairs == 0
+expect logs{"level": "error"}.entries.length == 0
+expect logs{"level": "warn", "limit": 200}.entries.length >= 0

@@ -9,7 +9,8 @@ wait_for assets.models_pending.length == 0 10000
 pause
 call render {"shadow_cache":true,"particles":false}
 call sky {"time":15.5,"day_length":0}
-frames 20
+# the critter skin keeps settling for up to ~25 frames after its load (also before the surface hook)
+frames 60
 # nothing changes while paused (a morph-weight rounding flip used to re-deform the critter every frame)
 expect gpu_scene.changed.length == 0
 expect stats.render.shadow_passes_cached >= 2

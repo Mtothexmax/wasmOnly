@@ -1,0 +1,18 @@
+# Surface shader hook with direct output: a surface shader gets its own LDR pipelines. Open the page with
+# ?msaa=1&direct=1 first (title screen: the play screen has water, which needs the composite):
+#   node tools/bridge.mjs eval "location.href='http://localhost:8080/?msaa=1&direct=1'"
+#   node tools/bridge.mjs run games/demo/tests/surface_direct.txt
+reload
+wait 1000
+call render {"bloom": false, "fxaa": false, "depth_darkening": 0, "lens_flare": 0}
+pause
+call surface_shader {"name": "checks", "wgsl": "fn surface(s: SurfaceIn) -> SurfaceOut { var o = surface_defaults(s); let c = (u32(floor(s.uv.x * s.params0.x)) + u32(floor(s.uv.y * s.params0.x))) & 1u; o.albedo = select(vec3f(0.9, 0.85, 0.2), vec3f(0.1, 0.3, 0.9), c == 1u); o.clearcoat = 1.0; return o; }"}
+expect surface_shader.surface_shaders.0.direct_output == true
+call spawn {"shape": "cube", "pos": [0, 2, 0], "size": 3, "color": "#ffffff", "body": "none", "name": "checkcube"}
+call material {"entity": "checkcube", "surface": "checks", "surface_params": [[4, 0, 0, 0], [0, 0, 0, 0]]}
+expect material{"entity": "checkcube"}.surface == 0
+call spawn {"camera": true, "pos": [3.2, 4.2, 4.2], "look_at": [0, 2, 0], "main": true}
+frames 8
+expect stats.render.direct_output == true
+expect logs{"level": "error"}.entries.length == 0
+screenshot out/surface-direct.png

@@ -80,7 +80,8 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("raycast", "Physics ray cast. args: {origin, dir, max?: 1000, exclude?: id|name|[...] (ignore these bodies, e.g. the caster)}"),
     ("pick", "Entity under a canvas point (CSS px). args: {x, y, mesh?: true = test rendered meshes instead of physics colliders; also returns depth_ties (z-fighting partners)}"),
     ("ui", "HUD slot contents."),
-    ("material", "Materials. Without id: every material (id, name, roughness, metallic, subsurface, clearcoat, bend). args: {id | entity: id|name (its MeshRenderer's material), roughness?, metallic?, subsurface?: 0..1, subsurface_color?: '#rrggbb' | null (= albedo), clearcoat?: 0..1, clearcoat_roughness?, studs?: {pitch_uv, height?: 0.22, r_base?: 0.30, r_top?: 0.272, bevel?: 0.025, strength?: 1, up_only?: true} | null (analytic stud relief, quality render.stud_relief 0/1/2), triplanar?: metres per tile | {tile, sharpness?: 4} | null (world-space projection of colour/normal/parallax), parallax_fade?: [start, end] m | null, parallax?, normal_scale?} sets them and returns the material."),
+    ("material", "Materials. Without id: every material (id, name, roughness, metallic, subsurface, clearcoat, bend). args: {id | entity: id|name (its MeshRenderer's material), roughness?, metallic?, subsurface?: 0..1, subsurface_color?: '#rrggbb' | null (= albedo), clearcoat?: 0..1, clearcoat_roughness?, studs?: {pitch_uv, height?: 0.22, r_base?: 0.30, r_top?: 0.272, bevel?: 0.025, strength?: 1, up_only?: true} | null (analytic stud relief, quality render.stud_relief 0/1/2), triplanar?: metres per tile | {tile, sharpness?: 4} | null (world-space projection of colour/normal/parallax), parallax_fade?: [start, end] m | null, parallax?, normal_scale?, surface?: surface shader name | id | null, surface_params?: [[4], [4]]} sets them and returns the material."),
+    ("surface_shader", "Game surface shaders (Renderer::add_surface_shader: a WGSL `fn surface(s: SurfaceIn) -> SurfaceOut` in place of the PBR texture/normal-map block). Without args: list (id, name, source bytes, broken pipelines). args: {name, wgsl} registers or replaces one live (same id; compile errors in the log/overlay), {name, source: true} returns its WGSL."),
     ("bend", "Pushers that bend Material::bend geometry and GPU grass. args: {pushers?: [[x,y,z,radius], ...] (replaces; [] = none), material?: id, bend?: value (sets Material::bend), wind?: [dir_x, dir_z, strength] (shared with GPU grass; strength 0 = still)}. Returns pushers, wind and every material with bend > 0."),
     ("static_collider", "args: {pos: [x,y,z], half?: [x,y,z]} adds a static box collider to the current scene (physics.add_static) -> {handle: [index, generation]}; {remove: [index, generation]} removes one (physics.remove_static, the scene forgets it) -> {removed}."),
     ("zfight", "args: {radius?: m around the camera or `center` (use in big worlds), center?: [x,y,z] (default radius 10), entity?: id|name|[...] (only pairs involving these and their children; a name matches every entity with it), exclude?: id|name|[...], same_root?: true skips pairs within one hierarchy (parts of one model)}. Entities with the NoZCheck component (and their children) are never checked; `auto` = the automatic check (runs, incremental_runs, last_entities_checked, last_ms). Find z-fighting: coplanar, same-facing, overlapping triangles of different entities (opaque/masked). args: {eps?: 0.002 plane distance, tolerance?: 0.002 overlap, limit?: 50}. Returns pair count and the worst pairs with entities, world point and screen position."),
@@ -1112,6 +1113,17 @@ pub(crate) fn handle<G: Game>(
             }
             Ok(ctx.scenes.describe(&ctx.world))
         }
+        "surface_shader" => {
+            if let (Some(n), Some(w)) = (a["name"].as_str(), a["wgsl"].as_str()) {
+                let id = ctx.renderer.add_surface_shader(n, w)?;
+                return Ok(json!({"id": id.0, "name": n}));
+            }
+            if let (Some(n), true) = (a["name"].as_str(), a["source"].as_bool() == Some(true)) {
+                let s = ctx.renderer.surfaces.iter().find(|s| s.name == n).ok_or_else(|| format!("unknown surface shader {n}"))?;
+                return Ok(json!({"name": n, "wgsl": s.wgsl}));
+            }
+            Ok(json!({"surface_shaders": ctx.renderer.surface_shaders_info()}))
+        }
         "material" => {
             use crate::renderer::MaterialId;
             let by_entity = match a.get("entity") {
@@ -1125,11 +1137,30 @@ pub(crate) fn handle<G: Game>(
             let Some(id) = by_entity.or_else(|| a.get("id").and_then(|v| v.as_u64())) else {
                 let list: Vec<Value> = (0..ctx.renderer.material_count() as u32)
                     .filter_map(|i| ctx.renderer.material(MaterialId(i)).map(|m| json!({"id": i, "name": m.name, "roughness": m.roughness, "metallic": m.metallic,
-                        "subsurface": m.subsurface, "clearcoat": m.clearcoat, "bend": m.bend, "studs": m.studs})))
+                        "subsurface": m.subsurface, "clearcoat": m.clearcoat, "bend": m.bend, "studs": m.studs, "surface": m.surface.map(|s| s.0)})))
                     .collect();
                 return Ok(json!({"materials": list}));
             };
+            let surface = match a.get("surface") {
+                Some(Value::Null) => Some(None),
+                Some(Value::String(n)) => Some(Some(ctx.renderer.surface_shader(n).ok_or_else(|| format!("unknown surface shader {n}"))?)),
+                Some(Value::Number(n)) => Some(Some(crate::renderer::SurfaceShaderId(n.as_u64().unwrap_or(0) as u32))),
+                Some(_) => return Err("surface: name | id | null".into()),
+                None => None,
+            };
             let m = ctx.renderer.material_mut(MaterialId(id as u32)).ok_or("unknown material")?;
+            if let Some(s) = surface {
+                m.surface = s;
+            }
+            if let Some(p) = a.get("surface_params").and_then(|v| v.as_array()) {
+                for (k, row) in p.iter().take(2).enumerate() {
+                    if let Some(row) = row.as_array() {
+                        for (j, v) in row.iter().take(4).enumerate() {
+                            m.surface_params[k][j] = v.as_f64().unwrap_or(0.0) as f32;
+                        }
+                    }
+                }
+            }
             let f = |k: &str| a.get(k).and_then(|v| v.as_f64()).map(|v| v as f32);
             if let Some(v) = f("roughness") { m.roughness = v; }
             if let Some(v) = f("metallic") { m.metallic = v; }

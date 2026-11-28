@@ -860,6 +860,7 @@ impl Screen<Data> for PlayScreen {
             ("teleport", "Move the player. args: {pos: [x,y,z]}"),
             ("shoot_at", "Fire a shot from the camera towards a world point. args: {target: [x,y,z]}"),
             ("step_lab", "Character step-up lab: a low plate (edge at z -7), or a flight of `steps` stairs `depth` m deep, and `lanes` characters walking onto it from start distances spread over `start_spread` m. args: {height?: 0.152, steps?: 1, depth?: 4, radius?: 0.32, half_height?: 0.62, step_height?: 0.3, speed?: 3.2, lanes?: 16, start_spread?: 0.08}. Then step and call characters."),
+            ("surface_demo", "Surface shader example (games/demo/src/stripes.wgsl, Renderer::add_surface_shader): registers `stripes` and spawns a cube using it. args: {pos?: [x,y,z], size?: 2, name?: 'stripes', color?: '#2060c0', stripes?: 6, speed?: 0.5, groove?: 0.5, double_sided?: false, alpha?: mask cutoff}"),
             ("control", "Switch control between the physics ball and the character-controller walker. args: {walker: bool, pos?: [x,y,z] (place the walker, capsule centre)}"),
         ]
     }
@@ -926,6 +927,30 @@ impl Screen<Data> for PlayScreen {
                     ids.push(json!({"id": e.id(), "start_z": z}));
                 }
                 Ok(json!({"plate_top": h, "plate_edge_z": -7.0, "characters": ids}))
+            }
+            "surface_demo" => {
+                let f = |k: &str, d: f32| args.get(k).and_then(|v| v.as_f64()).map(|v| v as f32).unwrap_or(d);
+                let id = match ctx.renderer.add_surface_shader("stripes", include_str!("stripes.wgsl")) {
+                    Ok(id) => id,
+                    Err(e) => return Some(Err(e)),
+                };
+                let p = args.get("pos").and_then(|v| v.as_array()).map(|a| Vec3::new(
+                    a.first().and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+                    a.get(1).and_then(|v| v.as_f64()).unwrap_or(2.0) as f32,
+                    a.get(2).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+                )).unwrap_or(Vec3::new(0.0, 2.0, 0.0));
+                let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("stripes");
+                let e = ctx.spawn_cube(name, p, Vec3::splat(f("size", 2.0)), 0x2060c0);
+                let mat = ctx.world.get::<&MeshRenderer>(e).map(|m| m.material).ok();
+                if let Some(m) = mat.and_then(|m| ctx.renderer.material_mut(m)) {
+                    m.surface = Some(id);
+                    m.surface_params = [[f("stripes", 6.0), f("speed", 0.5), f("groove", 0.5), 0.0], [0.95, 0.75, 0.2, 0.0]];
+                    m.double_sided = args.get("double_sided").and_then(|v| v.as_bool()).unwrap_or(false);
+                    if let Some(c) = args.get("alpha").and_then(|v| v.as_f64()) {
+                        m.alpha_mode = engine::renderer::AlphaMode::Mask(c as f32);
+                    }
+                }
+                Ok(json!({"id": e.id(), "surface": id.0}))
             }
             "control" => {
                 let on = args.get("walker").and_then(|v| v.as_bool()).unwrap_or(!self.walker_mode);

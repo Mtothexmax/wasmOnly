@@ -421,6 +421,35 @@ normal `cargo` output above it.
   normal maps and parallax inverted on front faces; maps tuned by eye before that need 1 - height / -normal xy).
   API `material {entity, triplanar: metres | {tile, sharpness} | null, parallax_fade: [start, end] | null, parallax,
   normal_scale}`; `texgen {preset, apply_to: id|name, normal, parallax}`. Test: `games/demo/tests/triplanar.txt`.
+- **Surface shaders (game WGSL in the PBR shading):** `let id = ctx.renderer.add_surface_shader("ice",
+  include_str!("ice.wgsl"))?` + `Material { surface: Some(id), surface_params: [[..4], [..4]], .. }` (prelude
+  `SurfaceShaderId`). The snippet defines `fn surface(s: SurfaceIn) -> SurfaceOut` (plus its own helpers and consts,
+  best prefixed) and replaces the texture / normal-map / parallax / studs / triplanar block of `shade()` in
+  `shaders/pbr.wgsl`; lighting (sun, shadows, clustered lights, ambient, ambient specular), fog and tonemapping stay
+  the engine's. `SurfaceIn`: `uv`, `world`, `n` (interpolated, back faces mirrored), `t` / `b` (+u / +v tangent frame,
+  three vectors: no matrix column indexing), `v` (to the camera), `dpx`/`dpy`/`duvx`/`duvy` (derivatives), `color`
+  (vertex colour), `base_color`, `params0`/`params1` (= `surface_params`), `front`, `dist`, `time` (simulation s) and
+  the material's `roughness`, `metallic`, `emissive`, `clearcoat`, `clearcoat_roughness`, `subsurface`. `SurfaceOut`:
+  `albedo`, `alpha` (alpha test / blend), `normal` (base lobe), `coat_normal` (clear-coat lobe + its ambient specular:
+  a smooth coat over a bumpy base), `roughness`, `metallic`, `emissive`, `clearcoat`, `clearcoat_roughness`,
+  `subsurface`. `surface_defaults(s)` = what the built-in shading gives without maps (base texture x colours,
+  material values): start from it and change fields. Textures: the material's `texture` / `normal_texture` /
+  `height_texture` are bound as `base_tex` / `normal_tex` / `height_tex` (+ `base_sampler`) with no fixed meaning.
+  Sample with `textureSampleGrad(.., s.duvx, s.duvy)` or `textureSampleLevel` (the blend entry reaches `surface` in
+  non-uniform control flow: plain `textureSample` does not compile there). PowerVR rules apply: no runtime index into
+  let/var arrays, vector components or matrix columns (`dev.mjs build` lints the game's `.wgsl` files).
+  How: the engine compiles pbr.wgsl with the snippet between `// SURFACE_HOOK_BEGIN/END` (default: a pass-through
+  `surface`, `SURFACE_HOOK = false`) into its own module and builds its whole pipeline set (opaque, mask, blend, both
+  2-sided, depth prepass + depth-equal, solid fade, and the direct-output set when it exists: 14 + 14 pipelines,
+  labels `surf-<name>-..`), prewarmed on the next frame. Draw groups / batches carry the set in the pipeline code
+  (`kind + 4 x set`, blended `2-sided + 2 x set`), so GPU culling, LOD, shadows (the shadow pass and the depth prepass
+  use the unchanged vertex shader), the shadow cache and render textures work unchanged. `surface_params` ride in the
+  instance's stud slots (studs are off with a surface shader). Up to 63 shaders; not for terrain, water and UI
+  materials. Registering a name again replaces the shader in place (same id): live iteration through the API
+  `surface_shader {name, wgsl}` (compile errors with line numbers in the log/overlay), `surface_shader` lists them
+  (`broken` pipelines, `direct_output`), `{name, source: true}` returns the WGSL; `material {entity, surface: name|id|null,
+  surface_params: [[..],[..]]}`. Example: `games/demo/src/stripes.wgsl` (demo command `surface_demo`). Tests:
+  `games/demo/tests/surface.txt`, `surface_direct.txt` (page `?msaa=1&direct=1`).
 - **Input lag on a GPU-bound device:** without a limit Chrome queues frames and the screen shows one that is
   up to a second old (desktop repro: 320vw canvas, 7 frames in flight, 1 s latency). The back-pressure of frame pacing
   (`render {max_frames_in_flight}`, default 2; 0 = off; 64 queued = hard cap) prevents it. `stats.render.pacing`:
